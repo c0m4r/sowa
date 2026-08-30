@@ -2,6 +2,7 @@
 /downloads/
 /artifacts/
 /dist/
+__pycache__
 
 # Public release keys belong in keys/. Private keys never do, even when a
 # RELEASE_KEY override accidentally points into the checkout.
