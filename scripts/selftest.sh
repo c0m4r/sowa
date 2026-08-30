@@ -113,6 +113,8 @@ is_directory() { [[ -d "$1" ]]; }
 # shellcheck disable=SC2329
 has_content() { [[ "$(cat "$1")" == "$2" ]]; }
 # shellcheck disable=SC2329
+contains_text() { [[ "$1" == *"$2"* ]]; }
+# shellcheck disable=SC2329
 has_key() { stage_key "$@" > /dev/null; }
 # shellcheck disable=SC2329
 trees_equal() { diff -qr -- "$1" "$2" > /dev/null; }
@@ -1551,6 +1553,68 @@ assert "a dependency can be removed together with what depends on it" \
     remove_probe library consumer
 refute "a dependency something else still needs cannot be removed on its own" \
     remove_probe library
+
+# ----------------------------------------------------- source mirror fallback
+
+checking "source mirror fallback"
+printf '==> source mirror fallback\n'
+
+fetch_root="${SCRATCH}/fetch"
+fetch_work="${fetch_root}/work"
+fetch_downloads="${fetch_root}/downloads"
+fetch_payload="${fetch_root}/payload"
+fetch_lock="${fetch_root}/sources.lock"
+fetch_mirrors="${fetch_root}/mirrors.conf"
+mkdir -p "${fetch_work}/tools/bin" "${fetch_downloads}"
+printf 'the bytes both upstreams are meant to serve\n' > "${fetch_payload}"
+fetch_sha="$(sha256sum "${fetch_payload}" | cut -c1-64)"
+printf 'probe|1.2.3|probe.tar|https://primary.invalid/files/probe.tar|%s|-\n' \
+    "${fetch_sha}" > "${fetch_lock}"
+printf 'prefix|https://primary.invalid/files/|https://mirror.invalid/files/\n' \
+    > "${fetch_mirrors}"
+
+# curl is replaced only inside the scratch tool directory common.sh puts first
+# on PATH. The primary fails, while the mirror returns the locked bytes and the
+# same transfer metadata the real curl --write-out would return.
+cat > "${fetch_work}/tools/bin/curl" <<'FAKE_CURL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+output=
+url="${!#}"
+while (($#)); do
+    if [[ "$1" == --output ]]; then
+        output="$2"
+        shift 2
+    else
+        shift
+    fi
+done
+[[ "${url}" != https://primary.invalid/* ]] || exit 22
+/usr/bin/cp "${FAKE_FETCH_PAYLOAD}" "${output}"
+bytes="$(/usr/bin/stat -c %s "${output}")"
+printf '200|%s|%s|4096|0.01|application/octet-stream' "${url}" "${bytes}"
+FAKE_CURL
+chmod 0755 "${fetch_work}/tools/bin/curl"
+
+fetch_output="$(
+    /usr/bin/env \
+        WORK_DIR="${fetch_work}" \
+        DOWNLOAD_DIR="${fetch_downloads}" \
+        ARTIFACT_DIR="${fetch_root}/artifacts" \
+        LOCK_FILE="${fetch_lock}" \
+        MIRRORS_FILE="${fetch_mirrors}" \
+        FAKE_FETCH_PAYLOAD="${fetch_payload}" \
+        TERM_TITLE=0 \
+    "${SELFTEST_ROOT}/scripts/fetch.sh" 2>&1
+)" || bad "fetch did not recover from the failed primary"
+assert "a failed primary falls back to a mirror" \
+    has_content "${fetch_downloads}/probe.tar" \
+    "the bytes both upstreams are meant to serve"
+assert "fetch output identifies the failed source" \
+    contains_text "${fetch_output}" "source failed with curl status 22"
+assert "fetch output reports transfer details" \
+    contains_text "${fetch_output}" \
+    "response HTTP 200, 0.01s at 4.0 KiB/s, application/octet-stream"
 
 printf '\n'
 if ((failures == 0)); then

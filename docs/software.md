@@ -4,15 +4,19 @@ Sowa is a source-built base system rather than a fixed list copied into the
 root filesystem. Every component has a build stage, a package record, and a
 file manifest.
 
-The source of truth is split between two files:
+The source of truth is split between three files:
 
 - [`config/sources.lock`](../config/sources.lock) pins upstream versions,
   archive URLs, extraction directories, and SHA-256 digests.
 - [`config/packages.conf`](../config/packages.conf) defines package names,
   release counters, dependencies, profiles, and descriptions.
+- [`config/upstreams.conf`](../config/upstreams.conf) links every pinned source
+  to upstream release information and defines automated update discovery.
 
 Consult those files for the complete current inventory. Keeping the inventory
-there avoids a second version list drifting out of date in prose.
+there avoids a second version list drifting out of date in prose. Run
+`make check-updates` to compare those pins with upstream release feeds; see
+[Upstream releases and source mirrors](upstream-releases.md).
 
 ## Foundation
 

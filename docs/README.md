@@ -10,6 +10,7 @@ README. Start with [Building Sowa](building.md) for a local build or
 - [Bootstrap architecture](architecture.md) — toolchain, stages, trust, and reproducibility
 - [Software in Sowa](software.md) — package profiles, core capabilities, and defaults
 - [Adding a package](adding-a-package.md) — recipes, metadata, services, and verification
+- [Upstream releases and mirrors](upstream-releases.md) — update checks, release links, and fetch fallback
 - [Building in a container](../docker/README.md) — isolated host-side build environment
 
 ## Images and installation
@@ -38,6 +39,7 @@ README. Start with [Building Sowa](building.md) for a local build or
 ## Packages and releases
 
 - [Binary packages and updates](packages.md)
+- [Upstream releases and source mirrors](upstream-releases.md)
 - [Optional packages](optional-packages.md)
 - [Release authenticity](releases.md)
 - [Licensing](licensing.md)

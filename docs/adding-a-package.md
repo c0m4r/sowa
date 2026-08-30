@@ -4,29 +4,32 @@ Every stage follows [packages/less.sh](../scripts/stages/packages/less.sh),
 [packages/whois.sh](../scripts/stages/packages/whois.sh) or
 [packages/plocate.sh](../scripts/stages/packages/plocate.sh) as the template —
 for autotools, a bare Makefile, and meson respectively — and touches the same
-eight places:
+nine places:
 
 1. `config/sources.lock` — one row per tarball.
-2. `config/packages.conf` — one row, before the `linux`/`sowa-release` rows.
-3. `config/licenses.conf` — one row, in the same position: the copyright holder
+2. `config/upstreams.conf` — one row per locked source, with a release/changelog
+   page and an automated check where upstream exposes a dependable feed. See
+   [upstream-releases.md](upstream-releases.md).
+3. `config/packages.conf` — one row, before the `linux`/`sowa-release` rows.
+4. `config/licenses.conf` — one row, in the same position: the copyright holder
    (`upstream`, unless you wrote it), an SPDX expression, and where in the
    tarball each licence text lives. The stage installs them into
    `/usr/share/licenses/<name>/` on its own; nothing goes in the stage script
    for this. `make check` rejects a package with no row, and the build rejects a
    row naming a file the tarball does not have. See
    [licensing.md](licensing.md).
-4. `scripts/stages/packages/<name>.sh`, mode 0755 — `prepare_source`,
+5. `scripts/stages/packages/<name>.sh`, mode 0755 — `prepare_source`,
    `reset_build_dir`, `pkg_stage`, `target_configure_env`, configure with
    `--build` **and** `--host`, `make DESTDIR="${pkgdir}" install`,
    self-verification, then `pkg_merge`. There is no number to choose and no
    list to insert it into: a stage is named by its path, `packages/<name>` is
    the name, and when it runs is decided by the function in the next item
    rather than by where the file sorts.
-5. `scripts/build.sh` — a `<name>_package()` function, a call in `rootfs()`, a
+6. `scripts/build.sh` — a `<name>_package()` function, a call in `rootfs()`, a
    `case` arm, the usage string. The function calls what the package needs and
    then `run_rootfs_package_stage packages/<name> <name>`; the stage script is
    found from that name, so it is not passed as well.
-6. **`scripts/build.sh` again** — append `"${STAMP_DIR}/packages/<name>.done"`
+7. **`scripts/build.sh` again** — append `"${STAMP_DIR}/packages/<name>.done"`
    to the invalidation list of *every library stage the package links*, so a
    rebuilt library immediately invalidates what links it. Consumer keys also
    include the recorded keys of dependencies from `packages.conf`; the trailing
@@ -36,8 +39,8 @@ eight places:
    `bzip2`, `xz` and `openssl`. `scripts/lint.sh` now derives the same audit from
    the staged trees' `NEEDED` entries, so `make check` catches a forgotten one —
    but only on a tree that has been built, since it needs those trees to read.
-7. `Makefile` — `.PHONY`, help comment, recipe.
-8. `scripts/stages/image/10-rootfs.sh` — a presence assertion for each new
+8. `Makefile` — `.PHONY`, help comment, recipe.
+9. `scripts/stages/image/10-rootfs.sh` — a presence assertion for each new
    binary. A command anyone would expect a Unix to have goes in the loop as
    well; `/usr/bin` and `/usr/sbin` have one each. Nothing may be installed into
    `/bin`, which holds exactly `bash`, `bashbug`, `sh` and `vi` and is asserted

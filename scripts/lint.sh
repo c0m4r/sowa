@@ -51,6 +51,52 @@ awk -F'|' '
     END { exit bad }
 ' "${ROOT}/config/sources.lock" || status=1
 
+# Release discovery data changes independently of pinned, hashed build inputs,
+# but it is still complete by construction: every source has a review link and
+# most have a machine-readable check. The checker validates field counts,
+# methods, aliases, regular expressions, HTTPS locations and coverage without
+# touching the network.
+python3 "${ROOT}/scripts/check-updates.py" --validate || status=1
+
+# Mirrors are transport alternatives, never alternative identities. Prefix
+# rules rewrite URL beginnings; source rules name exactly one lock row.
+awk -F'|' '
+    FILENAME ~ /sources[.]lock$/ {
+        if ($0 !~ /^[[:space:]]*(#|$)/) { locked[$1] = 1 }
+        next
+    }
+    /^[[:space:]]*(#|$)/ { next }
+    {
+        if (NF != 3) {
+            printf "%s:%d: expected 3 mirror fields, got %d\n", FILENAME, FNR, NF > "/dev/stderr"
+            bad = 1
+            next
+        }
+        if ($1 != "prefix" && $1 != "source") {
+            printf "%s:%d: unknown mirror rule %s\n", FILENAME, FNR, $1 > "/dev/stderr"
+            bad = 1
+        }
+        if ($1 == "source" && !($2 in locked)) {
+            printf "%s:%d: mirror for unknown source %s\n", FILENAME, FNR, $2 > "/dev/stderr"
+            bad = 1
+        }
+        if ($1 == "prefix" && ($2 !~ /^https:\/\// || $3 !~ /^https:\/\//)) {
+            printf "%s:%d: mirror prefixes must use HTTPS\n", FILENAME, FNR > "/dev/stderr"
+            bad = 1
+        }
+        if ($1 == "source" && $3 !~ /^https:\/\//) {
+            printf "%s:%d: source mirror must use HTTPS\n", FILENAME, FNR > "/dev/stderr"
+            bad = 1
+        }
+        key = $1 SUBSEP $2 SUBSEP $3
+        if (seen[key]++) {
+            printf "%s:%d: duplicate mirror rule\n", FILENAME, FNR > "/dev/stderr"
+            bad = 1
+        }
+    }
+    END { exit bad }
+' "${ROOT}/config/sources.lock" "${ROOT}/config/mirrors.conf" || status=1
+
 # The package table has to stay consistent with the lock it draws versions from
 # and with itself: an unknown source or dependency only shows up as a failed
 # build or an unsatisfiable upgrade otherwise.

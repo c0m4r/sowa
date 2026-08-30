@@ -52,9 +52,14 @@ On a prepared x86_64 Linux host:
 
 ```sh
 make check
+make check-updates
 make fetch
 make all
 ```
+
+The update check reports newer upstream releases but does not modify the pinned
+build inputs. Fetching verifies the same locked SHA-256 whether the primary URL
+or a configured mirror answers.
 
 Build outputs are written to `artifacts/`. Set `JOBS=8` to control parallelism;
 `WORK_DIR`, `DOWNLOAD_DIR`, and `ARTIFACT_DIR` can place large outputs on a

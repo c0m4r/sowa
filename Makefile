@@ -2,7 +2,7 @@ SHELL := /bin/bash
 
 .DEFAULT_GOAL := help
 
-.PHONY: help check selftest stage-key fetch toolchain kernel init bash bash-completion ncurses nano openssl ca-certificates vim htop zlib curl python util-linux e2fsprogs dosfstools grub libxcrypt openssh cron iproute2 iptables sowa-monitor custom-installers nginx docker \
+.PHONY: help check selftest stage-key fetch check-updates toolchain kernel init bash bash-completion ncurses nano openssl ca-certificates vim htop zlib curl python util-linux e2fsprogs dosfstools grub libxcrypt openssh cron iproute2 iptables sowa-monitor custom-installers nginx docker \
 	coreutils grep sed gawk findutils diffutils make perl chrony nic shadow tar gzip bzip2 xz zstd zip unzip 7zip procps pciutils lshw gnupg git wget libcap-ng openvpn wireguard less mandoc binutils gcc m4 autoconf pkgconf file inetutils mtr whois libuv liburcu libcap bind which plocate libpcap tcpdump nmap strace landlock ncdu netbase tzdata locales pcre2 glib json-c syslog-ng logrotate haproxy guix \
 	rootfs image iso recovery-image rootfs-tarball disk-image installer-bundle docker-image docker-run docker-push \
 	packages repo-key publish-repo release-key release-manifest verify-release \
@@ -28,6 +28,10 @@ stage-key:
 ## make fetch       - download and SHA-256 verify all pinned sources
 fetch:
 	@./scripts/fetch.sh
+
+## make check-updates - compare pinned versions with upstream releases (networked)
+check-updates:
+	@./scripts/check-updates.py
 
 ## make toolchain   - build binutils, GCC, Linux headers, and glibc
 toolchain:

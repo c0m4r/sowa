@@ -8,6 +8,11 @@ readonly PROJECT_ROOT
 # scripts/selftest.sh points all three at scratch copies so that asserting what
 # a bumped version does to a stage key cannot edit the real ones.
 readonly LOCK_FILE="${LOCK_FILE:-${PROJECT_ROOT}/config/sources.lock}"
+# Download locations are deliberately kept out of sources.lock: changing a
+# mirror does not change the bytes a stage consumes and must not invalidate a
+# build. fetch.sh reads this table while the lock remains the source of the
+# archive name and digest.
+readonly MIRRORS_FILE="${MIRRORS_FILE:-${PROJECT_ROOT}/config/mirrors.conf}"
 # shellcheck disable=SC2034 # read by lib/package.sh, sourced at the end.
 readonly PACKAGES_CONF="${PACKAGES_CONF:-${PROJECT_ROOT}/config/packages.conf}"
 # shellcheck disable=SC2034 # read by lib/license.sh, sourced at the end.

@@ -143,8 +143,11 @@ normal recipes.
 ## Reproducibility and trust
 
 `config/sources.lock` pins archive names, HTTPS upstream URLs, exact versions,
-SHA-256 digests, and extraction directories. Downloads are first written to a
-temporary file, verified, and then atomically renamed. Builds set a stable
+SHA-256 digests, and extraction directories. `config/upstreams.conf` keeps
+release discovery and review links beside rather than inside that immutable
+input, while `config/mirrors.conf` supplies transport fallbacks. Downloads are
+first written to a temporary file, verified against the lock after every
+primary or mirror attempt, and then atomically renamed. Builds set a stable
 locale, timezone, umask, and `SOURCE_DATE_EPOCH`. nic, the one Go program here,
 is built with `-trimpath`; the initramfs uses sorted input, normalized
 ownership, and XZ's timestamp-free stream format without a preset override

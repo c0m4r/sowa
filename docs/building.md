@@ -16,7 +16,9 @@ make all
 
 `make check` validates the host, build metadata, stage graph, package ownership
 rules, and self-tests. `make fetch` downloads every source named in
-[`config/sources.lock`](../config/sources.lock) and verifies its SHA-256.
+[`config/sources.lock`](../config/sources.lock), falls back through configured
+mirrors when needed, and verifies its SHA-256. `make check-updates` compares the
+pins with upstream release feeds without changing them.
 `make all` builds the dependency graph through the live image.
 
 The first build is substantial. Later runs use keyed stamps under
@@ -100,6 +102,9 @@ Common environment overrides include:
 | `SOURCE_DATE_EPOCH` | normalized build timestamp |
 | `TERM_TITLE=0` | disable terminal-title progress updates |
 | `SFS_COMPRESSOR` | live root compression, `xz` by default or `zstd` |
+| `FETCH_CONNECT_TIMEOUT` | connection timeout for each primary or mirror, 20 seconds by default |
+| `FETCH_LOW_SPEED_LIMIT` | minimum sustained fetch rate, 1,024 bytes/s by default |
+| `FETCH_LOW_SPEED_TIME` | seconds below that rate before trying the next mirror, 30 by default |
 
 Architecture and release defaults live in
 [`config/build.conf`](../config/build.conf). Moving an existing checkout after
@@ -109,6 +114,8 @@ location.
 On an interactive terminal, the current stage is mirrored in the title, for
 example `sowa all: toolchain/06-glibc`. A completed build ends with `done`; a
 failure names the failed stage. Fetches display a similar item counter.
+See [Upstream releases and source mirrors](upstream-releases.md) for the release
+checker, detailed transfer output and mirror table.
 
 ## Running artifacts
 
