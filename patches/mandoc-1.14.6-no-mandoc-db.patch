@@ -1,0 +1,26 @@
+mandoc's man(1) falls back to walking the manual tree when the index does not
+answer, and warns "outdated mandoc.db lacks name(sec) entry, run makewhatis
+<path>" whenever that fallback is what found the page. The warning assumes
+there is an index and that it is behind; Sowa ships none, because makewhatis
+is a target binary that cannot run on the build host and any index built there
+would be wrong the moment sowa-pkg installed a package. So the message is
+printed above every manual page in the image, and it is not true.
+
+Warn only when a mandoc.db is actually there, which is exactly the case the
+message describes: an index that exists and does not list the page.
+--- a/main.c
++++ b/main.c
+@@ -822,8 +822,11 @@
+ 	return globres;
+ 
+ found:
+-	warnx("outdated mandoc.db lacks %s(%s) entry, run %s %s",
+-	    name, sec, BINM_MAKEWHATIS, paths->paths[ipath]);
++	mandoc_asprintf(&cp, "%s/%s", paths->paths[ipath], MANDOC_DB);
++	if (stat(cp, &sb) != -1)
++		warnx("outdated mandoc.db lacks %s(%s) entry, run %s %s",
++		    name, sec, BINM_MAKEWHATIS, paths->paths[ipath]);
++	free(cp);
+ 	if (res == NULL)
+ 		free(file);
+ 	else if (file == NULL)

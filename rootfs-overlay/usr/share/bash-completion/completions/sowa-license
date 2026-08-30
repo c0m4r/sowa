@@ -1,0 +1,91 @@
+# bash completion for sowa-license(8)                      -*- shell-script -*-
+# shellcheck shell=bash
+#
+# The package names come from the same two files sowa-license itself reads: the
+# installed database, and the index if one has been fetched. Read as files
+# rather than by running the program, for the reason the sowa-pkg completion
+# gives - a Tab that starts a process is a Tab that can make a terminal wait.
+#
+# A bare package name is a command here, so both are offered in the first
+# position: "sowa-license gcc" is "sowa-license show gcc".
+
+_sowa_comp_license_root()
+{
+    local index
+    for ((index = 1; index < COMP_CWORD; index++)); do
+        if [[ ${COMP_WORDS[index]} == --root ]]; then
+            printf '%s' "${COMP_WORDS[index + 1]%/}"
+            return 0
+        fi
+    done
+}
+
+_sowa_comp_license_packages()
+{
+    local root="$1" entry name rest
+
+    for entry in "${root}"/var/lib/sowa/db/*/desc; do
+        [[ -f ${entry} ]] || continue
+        entry=${entry%/desc}
+        printf '%s\n' "${entry##*/}"
+    done
+    if [[ -r ${root}/var/lib/sowa/repo/index ]]; then
+        while IFS='|' read -r name rest; do
+            [[ -n ${name} && ${name} != \#* ]] && printf '%s\n' "${name}"
+        done < "${root}/var/lib/sowa/repo/index"
+    fi
+}
+
+_sowa_comp_sowa_license()
+{
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    local previous="${COMP_WORDS[COMP_CWORD - 1]}"
+    local root command="" words="" index
+
+    if [[ ${previous} == --root ]]; then
+        compopt -o filenames
+        mapfile -t COMPREPLY < <(compgen -d -- "${current}")
+        return 0
+    fi
+
+    root="$(_sowa_comp_license_root)"
+
+    for ((index = 1; index < COMP_CWORD; index++)); do
+        case "${COMP_WORDS[index]}" in
+            --root) ((index++)) ;;
+            -*) ;;
+            *)
+                command="${COMP_WORDS[index]}"
+                break
+                ;;
+        esac
+    done
+
+    if [[ ${current} == -* ]]; then
+        words="--root --help"
+        [[ ${command} == list ]] && words+=" --installed --available --all"
+        mapfile -t COMPREPLY < <(compgen -W "${words}" -- "${current}")
+        return 0
+    fi
+
+    case "${command}" in
+        "")
+            words="summary list show files sowa
+                   $(_sowa_comp_license_packages "${root}" | sort -u)"
+            ;;
+        show | files)
+            words="$(_sowa_comp_license_packages "${root}" | sort -u)"
+            ;;
+        *)
+            # summary and sowa take nothing, and a bare package name is
+            # already "show", whose remaining arguments are packages.
+            [[ ${command} == summary || ${command} == sowa || ${command} == list ]] \
+                && return 0
+            words="$(_sowa_comp_license_packages "${root}" | sort -u)"
+            ;;
+    esac
+
+    mapfile -t COMPREPLY < <(compgen -W "${words}" -- "${current}")
+}
+
+complete -F _sowa_comp_sowa_license sowa-license

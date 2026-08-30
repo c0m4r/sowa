@@ -1,0 +1,124 @@
+#!/bin/bash
+#
+# chkconfig: - 60 40
+# description: Docker Engine: dockerd, and the containerd it supervises
+#
+# The script itself defaults to off, and runs after the network in every
+# runlevel it is turned on for. The package's first-install hooks enable it and
+# start it immediately; upgrades do not re-enable or start a service an
+# administrator later disabled or stopped. See "sowa-pkg hooks docker".
+#
+# Installing with --no-hooks leaves those two steps to be run by hand:
+#
+#     chkconfig docker on
+#     service docker start
+#
+# One service, two daemons. dockerd starts a containerd of its own unless it is
+# pointed at a socket with --containerd, and that containerd starts a shim per
+# container; the shims outlive dockerd deliberately, so that a daemon can be
+# replaced without killing what it is running. Nothing here supervises them
+# separately, which is why stop below finishes the job by hand: killing dockerd
+# leaves its containerd behind, and a machine on its way to runlevel 0 with a
+# container runtime still holding mounts is a machine that does not finish
+# unmounting.
+#
+# dockerd stays in the foreground - it has no --daemon - which is what the
+# daemon helper wants. It writes its own /run/docker.pid as well; the helper
+# writes the same number there, since setsid runs dockerd directly.
+#
+# Everything the engine says goes to /var/log/docker.log, including the
+# containerd it runs. That is deliberate rather than a lack of anywhere else to
+# put it: the interesting half is what dockerd says before it opens its socket,
+# and "failed to start daemon" and the reason are in there.
+
+. /etc/rc.d/init.d/functions
+
+name=docker
+program=/usr/sbin/dockerd
+containerd=/usr/sbin/containerd
+pidfile=/run/docker.pid
+logfile=/var/log/docker.log
+
+# The two things dockerd cannot start without and cannot fix. Both are the
+# system's business rather than the package's, so they are checked here where
+# the reason can be printed, instead of being read out of a log afterwards.
+check_system() {
+    if ! grep -q ' /sys/fs/cgroup cgroup2 ' /proc/self/mounts; then
+        printf '%s: /sys/fs/cgroup is not a cgroup2 mount; dockerd cannot start\n' \
+            "${name}" >&2
+        return 1
+    fi
+    if [[ ! -x "${containerd}" ]]; then
+        printf '%s: %s is missing; dockerd has no container runtime to supervise\n' \
+            "${name}" "${containerd}" >&2
+        return 1
+    fi
+    return 0
+}
+
+start() {
+    begin "Starting ${name}"
+    if ! check_system; then
+        failed
+        return 1
+    fi
+    # Refuse to start on a daemon.json that will not parse. dockerd --validate
+    # reads the configuration, says what is wrong with it and exits; without
+    # this the service reports success, dockerd exits a moment later, and the
+    # reason is in a log rather than on the console in front of whoever just
+    # edited the file.
+    if ! "${program}" --validate >> "${logfile}" 2>&1; then
+        failed
+        printf '%s: /etc/docker/daemon.json is not valid; see %s\n' \
+            "${name}" "${logfile}" >&2
+        return 1
+    fi
+    daemon --pidfile "${pidfile}" --log "${logfile}" -- \
+        "${program}" --pidfile "${pidfile}"
+    result $?
+}
+
+stop() {
+    begin "Stopping ${name}"
+    killproc --pidfile "${pidfile}" "${program}"
+    local status=$?
+    # The containerd dockerd started, which does not go with it. It is asked
+    # after dockerd rather than instead of it, so that dockerd gets its chance
+    # to stop containers the ordinary way first.
+    if [[ -n "$(pids_running "${containerd}")" ]]; then
+        killproc --name docker-containerd "${containerd}"
+    fi
+    result "${status}"
+}
+
+case "${1:-}" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    reload)
+        # SIGHUP is what dockerd rereads /etc/docker/daemon.json on. Only some
+        # of the configuration can be changed that way - the storage driver and
+        # the bridge cannot - and dockerd says in the log which of it it took.
+        begin "Reloading ${name}"
+        killproc --pidfile "${pidfile}" --signal HUP "${program}"
+        result $?
+        ;;
+    status)
+        status --pidfile "${pidfile}" "${program}"
+        ;;
+    configtest)
+        # What start refuses to start without, asked on its own.
+        "${program}" --validate
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|reload|status|configtest}\n' "$0" >&2
+        exit 2
+        ;;
+esac

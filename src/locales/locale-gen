@@ -1,0 +1,228 @@
+#!/bin/bash
+#
+# locale-gen - compile the locales /etc/locale.gen names into the archive the
+# C library reads.
+#
+# Everything this needs is in the image: the locale sources under
+# /usr/share/i18n/locales, the charmaps beside them, and localedef(1) itself.
+# So a machine that has never been on a network can grow the locale its owner
+# actually speaks, which is the whole reason the image carries 17 MB of locale
+# sources it has not compiled.
+#
+# The archive is rebuilt from scratch every time rather than added to. glibc's
+# archive has no remove operation worth the name, and an archive that is only
+# ever appended to is one that still answers for a locale somebody deleted from
+# /etc/locale.gen a year ago. Rebuilding makes the file say what the
+# configuration says - and it is cheap, because compiling a locale is
+# milliseconds.
+#
+# The new archive is written to a temporary directory on the same filesystem
+# and renamed over the old one, so a run that fails half way through leaves the
+# locales that were working still working, and a process that has the old
+# archive mapped keeps reading a consistent file until it stops.
+
+set -Eeuo pipefail
+
+readonly GEN=/etc/locale.gen
+readonly CONF=/etc/locale.conf
+readonly LOCALE_DIR=/usr/lib/locale
+readonly ARCHIVE="${LOCALE_DIR}/locale-archive"
+readonly LOCALEDEF=/usr/bin/localedef
+
+# A locale name is used to build a file name and to edit /etc/locale.gen with
+# sed, so what it may contain is stated once, here, rather than trusted.
+# glibc's own names are language[_TERRITORY][.codeset][@modifier].
+readonly NAME_PATTERN='^[A-Za-z0-9_@.+-]+$'
+
+self="${0##*/}"
+
+die() {
+    printf '%s: %s\n' "${self}" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+usage: ${self} [locale...]
+       ${self} --list
+       ${self} --help
+
+With no arguments, compile every locale /etc/locale.gen has enabled.
+
+With locale names, enable each of them in /etc/locale.gen first - the name has
+to be one the file lists, which is glibc's own catalogue of supported locales -
+and then compile the whole enabled set:
+
+    ${self} pl_PL.UTF-8 de_DE.UTF-8
+
+--list prints the enabled set without compiling anything. To find a name, grep
+the catalogue: "grep -i portuguese ${GEN}" or "grep '^#pt_' ${GEN}".
+
+The locale a login shell starts in is ${CONF}; a locale compiled here is
+available to every program, but nothing starts using it until something asks
+for it.
+EOF
+}
+
+# Every line of /etc/locale.gen that names a locale, enabled or not. This is
+# glibc's SUPPORTED list, written into the file by the build, and it is what a
+# requested name is checked against: a name that is not in it is not a locale
+# localedef could compile, and finding that out here is better than finding it
+# out from localedef's "cannot open locale definition file".
+catalogue_charset() {
+    local wanted="$1"
+    awk -v wanted="${wanted}" '
+        { sub(/^#/, "") }
+        $1 == wanted { print $2; found = 1; exit }
+        END { exit !found }
+    ' "${GEN}"
+}
+
+enabled_locales() {
+    awk '!/^[[:space:]]*(#|$)/ && NF >= 2 { print $1, $2 }' "${GEN}"
+}
+
+# The input file a locale is compiled from: its name with the codeset taken
+# out and the modifier left on, because the modifier is part of the definition
+# (ca_ES@valencia is a different file from ca_ES) and the codeset never is.
+input_file_of() {
+    local name="$1" modifier=""
+    [[ "${name}" == *.* ]] || { printf '%s\n' "${name}"; return; }
+    [[ "${name}" == *@* ]] && modifier="@${name#*@}"
+    printf '%s%s\n' "${name%%.*}" "${modifier}"
+}
+
+# Uncomment the catalogue line for a locale, or add one if the file has no
+# line for it at all - which happens on a system whose /etc/locale.gen predates
+# a glibc that added the locale, and is worth handling rather than refusing.
+enable_locale() {
+    local name="$1" charset="$2" pattern
+
+    if enabled_locales | awk -v name="${name}" '$1 == name { found = 1 }
+        END { exit !found }'; then
+        return 0
+    fi
+    # The name goes into a regular expression, and locale names carry "." and
+    # "+" - so "en_US.UTF-8" would otherwise match "en_USxUTF-8" as well.
+    pattern="${name//./\\.}"
+    pattern="${pattern//+/\\+}"
+    if grep -qE "^#[[:space:]]*${pattern}[[:space:]]" "${GEN}"; then
+        sed -i -E "s/^#[[:space:]]*(${pattern}[[:space:]].*)$/\1/" "${GEN}"
+    else
+        printf '%s %s\n' "${name}" "${charset}" >> "${GEN}"
+    fi
+    printf '==> enabled %s in %s\n' "${name}" "${GEN}"
+}
+
+# What /etc/locale.conf asks for, so that a run which is about to leave the
+# system's own locale uncompiled says so. This is the mistake that costs an
+# afternoon: every command prints "setlocale: LC_ALL: cannot change locale"
+# and nothing says which file is wrong.
+warn_about_system_locale() {
+    local -n compiled="$1"
+    local variable value name
+
+    [[ -r "${CONF}" ]] || return 0
+    while IFS='=' read -r variable value; do
+        case "${variable}" in
+            LANG | LC_ALL) ;;
+            *) continue ;;
+        esac
+        value="${value%\"}"
+        value="${value#\"}"
+        [[ -n "${value}" ]] || continue
+        for name in "${compiled[@]}"; do
+            [[ "${name}" == "${value}" ]] && continue 2
+        done
+        printf '%s: warning: %s sets %s=%s, which %s does not enable\n' \
+            "${self}" "${CONF}" "${variable}" "${value}" "${GEN}" >&2
+    done < "${CONF}"
+}
+
+generate() {
+    local -a names=() charsets=()
+    local name charset input seen scratch index count=0
+
+    while read -r name charset; do
+        [[ "${name}" =~ ${NAME_PATTERN} ]] \
+            || die "${GEN} names ${name}, which is not a locale name"
+        # A file edited by hand can list the same locale twice; compiling it
+        # twice would work and would make the count below disagree with the
+        # archive, so the second one is dropped here.
+        for seen in "${names[@]}"; do
+            [[ "${seen}" == "${name}" ]] && continue 2
+        done
+        names+=("${name}")
+        charsets+=("${charset}")
+    done < <(enabled_locales)
+
+    ((${#names[@]} > 0)) \
+        || die "${GEN} enables no locales; a system with no compiled locale has no UTF-8"
+
+    [[ -x "${LOCALEDEF}" ]] || die "${LOCALEDEF} is missing; the locales package is incomplete"
+    [[ -d /usr/share/i18n/locales ]] \
+        || die "/usr/share/i18n/locales is missing; there is nothing to compile from"
+
+    install -d -m 0755 "${LOCALE_DIR}"
+    scratch="$(mktemp -d "${LOCALE_DIR}/.locale-gen.XXXXXX")"
+    # shellcheck disable=SC2064 # the path is wanted as it is now, not at exit.
+    trap "rm -rf '${scratch}'" EXIT
+    install -d -m 0755 "${scratch}/usr/lib/locale"
+
+    for ((index = 0; index < ${#names[@]}; index++)); do
+        name="${names[index]}"
+        charset="${charsets[index]}"
+        input="$(input_file_of "${name}")"
+        printf '  %s' "${name}"
+        # --prefix puts the archive under the scratch directory rather than
+        # over the one in use. The warnings localedef prints about locales
+        # upstream has not finished are not this machine's business.
+        "${LOCALEDEF}" --prefix="${scratch}" -i "${input}" -f "${charset}" \
+            "${name}" \
+            || die "localedef could not compile ${name} from ${input}/${charset}"
+        printf ' done\n'
+        count=$((count + 1))
+    done
+
+    [[ -s "${scratch}/usr/lib/locale/locale-archive" ]] \
+        || die "localedef wrote no archive"
+    chmod 0644 "${scratch}/usr/lib/locale/locale-archive"
+    mv -f "${scratch}/usr/lib/locale/locale-archive" "${ARCHIVE}"
+
+    warn_about_system_locale names
+    printf '==> %s: %d locales, %s\n' "${ARCHIVE}" "${count}" \
+        "$(du -h "${ARCHIVE}" | cut -f1)"
+}
+
+main() {
+    local -a requested=()
+    local name charset
+
+    while (($# > 0)); do
+        case "$1" in
+            -h | --help) usage; return 0 ;;
+            --list) enabled_locales; return 0 ;;
+            -*) die "unknown option $1 (try --help)" ;;
+            *) requested+=("$1") ;;
+        esac
+        shift
+    done
+
+    [[ -f "${GEN}" ]] || die "${GEN} is missing; the locales package is incomplete"
+
+    if ((${#requested[@]} > 0)); then
+        ((EUID == 0)) || die "only root can edit ${GEN}"
+        for name in "${requested[@]}"; do
+            [[ "${name}" =~ ${NAME_PATTERN} ]] \
+                || die "${name} is not a locale name"
+            charset="$(catalogue_charset "${name}")" \
+                || die "${name} is not a locale this glibc supports; look for it with \"grep -i ${name%%_*} ${GEN}\""
+            enable_locale "${name}" "${charset}"
+        done
+    fi
+
+    ((EUID == 0)) || die "only root can write ${ARCHIVE}"
+    generate
+}
+
+main "$@"

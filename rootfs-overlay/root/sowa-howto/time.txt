@@ -1,0 +1,23 @@
+Time
+====
+
+chronyd runs from boot and disciplines the clock against pool.ntp.org and
+time.cloudflare.com. It can do nothing until there is a network, and it keeps
+retrying until there is:
+
+    chronyc tracking     # how far off the clock is, and from what
+    chronyc sources -v   # the servers it is using
+    chronyc makestep     # stop waiting and step the clock now
+
+It is configured in /etc/chrony.conf and logs to /var/log/chronyd.log. Replace
+the default time-source lines if the network has a time server of its own, then
+apply it with:
+
+    service chronyd restart
+
+The time zone is /etc/localtime, a symlink into /usr/share/zoneinfo. Point it
+somewhere else to change it:
+
+    ln -sfn /usr/share/zoneinfo/Europe/Warsaw /etc/localtime
+
+See also: network.txt, since chronyd can do nothing until there is a route.

@@ -1,0 +1,106 @@
+#!/bin/bash
+#
+# chkconfig: - 45 55
+# description: ISC BIND DNS server
+#
+# The leading "-" in the chkconfig line is the point: named is in the image
+# because dig is, not because this machine is a name server. It starts only
+# after "chkconfig named on", and /etc/named.conf as shipped answers on the
+# loopback interface alone until somebody widens it.
+#
+# -g keeps named in the foreground and sends everything it has to say to
+# stderr, which the daemon helper appends to /var/log/named.log - a resolver's
+# own log rather than a share of /var/log/messages, which is what named.conf
+# says as well. -u drops to the named account once the sockets are open; that is the one
+# thing in the image that needs libcap, since binding port 53 and then becoming
+# an unprivileged user is exactly what CAP_NET_BIND_SERVICE is for.
+
+. /etc/rc.d/init.d/functions
+
+name=named
+program=/usr/sbin/named
+user=named
+rundir=/run/named
+vardir=/var/named
+pidfile=/run/named/named.pid
+logfile=/var/log/named.log
+config=/etc/named.conf
+keyfile=/etc/rndc.key
+
+# The key rndc authenticates with. It is generated here rather than shipped
+# because a key that every installation of an image shares is not a key. named
+# reads it through the include line in named.conf, so it has to exist before
+# the first start rather than before the first rndc.
+generate_key() {
+    [[ -f "${keyfile}" ]] && return 0
+    /usr/sbin/rndc-confgen -a -c "${keyfile}" || return 1
+    chown root:"${user}" "${keyfile}"
+    chmod 0640 "${keyfile}"
+}
+
+start() {
+    begin "Starting ${name}"
+    # /run is a tmpfs mounted at every boot, so named's directory is made here
+    # rather than shipped in the image. It holds the pid file and the TSIG
+    # session key that nsupdate -l authenticates with, both written after the
+    # switch to the named account.
+    install -d -m 0750 -o "${user}" -g "${user}" "${rundir}"
+    # /var/named ships with the package, but a package here records a mode and
+    # not an owner - every path it installs arrives owned by root. named writes
+    # its managed DNSSEC keys into this directory, so the ownership is settled
+    # at start, where it is also repaired if something has changed it.
+    chown "${user}:${user}" "${vardir}"
+    if ! generate_key >> "${logfile}" 2>&1; then
+        failed
+        return 1
+    fi
+    # Refuse to start on a configuration that will not parse. named would
+    # otherwise exit immediately after the helper has already reported it
+    # started, and the reason would be in the log rather than on the console.
+    if ! /usr/bin/named-checkconf "${config}" >> "${logfile}" 2>&1; then
+        failed
+        return 1
+    fi
+    daemon --pidfile "${pidfile}" --log "${logfile}" -- \
+        "${program}" -g -u "${user}" -c "${config}"
+    result $?
+}
+
+stop() {
+    begin "Stopping ${name}"
+    killproc --pidfile "${pidfile}" "${program}"
+    result $?
+}
+
+case "${1:-}" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    reload)
+        # named rereads its configuration and its zones on SIGHUP. rndc reload
+        # is the better-behaved way to ask and reports what happened, but it
+        # needs the server to be answering on the control channel; the signal
+        # works whenever the process exists.
+        begin "Reloading ${name}"
+        killproc --pidfile "${pidfile}" --signal HUP "${program}"
+        result $?
+        ;;
+    status)
+        status --pidfile "${pidfile}" "${program}"
+        ;;
+    checkconf)
+        # What start refuses to start without, asked on its own.
+        /usr/bin/named-checkconf -z "${config}"
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|reload|status|checkconf}\n' "$0" >&2
+        exit 2
+        ;;
+esac

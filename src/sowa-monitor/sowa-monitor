@@ -1,0 +1,610 @@
+#!/usr/bin/python3
+"""Read-only host telemetry for the Sowa monitoring dashboard."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import grp
+import http.server
+import json
+import logging
+import os
+import platform
+import pwd
+import re
+import signal
+import socket
+import socketserver
+import stat
+import sys
+import threading
+import time
+from pathlib import Path
+
+
+APP_VERSION = "1"
+DEFAULT_SOCKET = "/run/sowa-monitor/sowa-monitor.sock"
+DEFAULT_STATIC_ROOT = "/usr/share/sowa-monitor"
+MAX_FILESYSTEMS = 32
+MAX_INTERFACES = 32
+MAX_PROCESSES = 8
+MOUNT_ESCAPE = re.compile(r"\\([0-7]{3})")
+SAFE_SERVICE_NAME = re.compile(r"^[A-Za-z0-9_.@-]{1,80}$")
+REAL_FILESYSTEMS = {
+    "btrfs",
+    "cifs",
+    "erofs",
+    "ext2",
+    "ext3",
+    "ext4",
+    "f2fs",
+    "fuseblk",
+    "jfs",
+    "nfs",
+    "nfs4",
+    "overlay",
+    "reiserfs",
+    "squashfs",
+    "vfat",
+    "xfs",
+    "zfs",
+}
+
+
+def read_text(path: str, limit: int = 64 * 1024) -> str:
+    """Read a bounded proc/sys text file; disappearing files are normal."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read(limit)
+    except (OSError, UnicodeError):
+        return ""
+
+
+def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    return max(low, min(high, value))
+
+
+def percent(used: int | float, total: int | float) -> float:
+    return round(clamp((used / total) * 100.0) if total else 0.0, 1)
+
+
+def parse_key_values(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        values[key] = value.strip().strip('"')
+    return values
+
+
+def os_identity() -> dict[str, str]:
+    release = parse_key_values(read_text("/etc/os-release", 16 * 1024))
+    return {
+        "name": release.get("NAME", "Sowa Linux"),
+        "version": release.get("VERSION_ID", release.get("VERSION", "unknown")),
+        "kernel": platform.release(),
+        "architecture": platform.machine(),
+    }
+
+
+def cpu_ticks() -> tuple[int, int]:
+    line = read_text("/proc/stat", 4096).splitlines()
+    if not line or not line[0].startswith("cpu "):
+        return (0, 0)
+    try:
+        fields = [int(value) for value in line[0].split()[1:9]]
+    except (ValueError, IndexError):
+        return (0, 0)
+    total = sum(fields)
+    idle = fields[3] + fields[4]
+    return (total, idle)
+
+
+def memory_snapshot() -> dict[str, int | float]:
+    values: dict[str, int] = {}
+    for line in read_text("/proc/meminfo").splitlines():
+        key, separator, remainder = line.partition(":")
+        if not separator:
+            continue
+        try:
+            values[key] = int(remainder.strip().split()[0]) * 1024
+        except (ValueError, IndexError):
+            continue
+
+    total = values.get("MemTotal", 0)
+    available = values.get("MemAvailable", values.get("MemFree", 0))
+    used = max(0, total - available)
+    swap_total = values.get("SwapTotal", 0)
+    swap_free = values.get("SwapFree", 0)
+    swap_used = max(0, swap_total - swap_free)
+    return {
+        "total_bytes": total,
+        "used_bytes": used,
+        "available_bytes": available,
+        "cached_bytes": values.get("Cached", 0) + values.get("SReclaimable", 0),
+        "used_percent": percent(used, total),
+        "swap_total_bytes": swap_total,
+        "swap_used_bytes": swap_used,
+        "swap_used_percent": percent(swap_used, swap_total),
+    }
+
+
+def decode_mount_path(value: str) -> str:
+    return MOUNT_ESCAPE.sub(lambda match: chr(int(match.group(1), 8)), value)
+
+
+def filesystem_snapshot() -> list[dict[str, int | float | str | bool]]:
+    filesystems: list[dict[str, int | float | str | bool]] = []
+    seen: set[str] = set()
+    for line in read_text("/proc/mounts", 256 * 1024).splitlines():
+        fields = line.split()
+        if len(fields) < 4 or fields[2] not in REAL_FILESYSTEMS:
+            continue
+        mountpoint = decode_mount_path(fields[1])
+        if mountpoint in seen:
+            continue
+        seen.add(mountpoint)
+        try:
+            usage = os.statvfs(mountpoint)
+        except OSError:
+            continue
+        total = usage.f_blocks * usage.f_frsize
+        available = usage.f_bavail * usage.f_frsize
+        used = max(0, total - (usage.f_bfree * usage.f_frsize))
+        filesystems.append(
+            {
+                "mountpoint": mountpoint,
+                "type": fields[2],
+                "total_bytes": total,
+                "used_bytes": used,
+                "available_bytes": available,
+                "used_percent": percent(used, total),
+                "read_only": bool(usage.f_flag & getattr(os, "ST_RDONLY", 1)),
+            }
+        )
+        if len(filesystems) >= MAX_FILESYSTEMS:
+            break
+    filesystems.sort(key=lambda item: (item["mountpoint"] != "/", item["mountpoint"]))
+    return filesystems
+
+
+def writable_capacity_peak(filesystems: list[dict[str, object]]) -> float:
+    return max(
+        (float(item["used_percent"]) for item in filesystems if not item["read_only"]),
+        default=0.0,
+    )
+
+
+def network_totals() -> dict[str, tuple[int, int]]:
+    interfaces: dict[str, tuple[int, int]] = {}
+    lines = read_text("/proc/net/dev", 128 * 1024).splitlines()[2:]
+    for line in lines:
+        name, separator, counters = line.partition(":")
+        if not separator:
+            continue
+        fields = counters.split()
+        if len(fields) < 16:
+            continue
+        try:
+            interfaces[name.strip()] = (int(fields[0]), int(fields[8]))
+        except ValueError:
+            continue
+    return interfaces
+
+
+def process_snapshot() -> dict[str, object]:
+    states = {"running": 0, "sleeping": 0, "blocked": 0, "zombie": 0, "other": 0}
+    processes: list[dict[str, int | str]] = []
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return {"total": 0, **states, "top_memory": []}
+
+    with entries:
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            record = read_text(f"/proc/{entry.name}/stat", 16 * 1024).strip()
+            close = record.rfind(")")
+            open_ = record.find("(")
+            if open_ < 0 or close <= open_:
+                continue
+            name = record[open_ + 1 : close].replace("\x00", "")[:64]
+            fields = record[close + 2 :].split()
+            if len(fields) < 22:
+                continue
+            state = fields[0]
+            bucket = {"R": "running", "S": "sleeping", "I": "sleeping", "D": "blocked", "Z": "zombie"}.get(state, "other")
+            states[bucket] += 1
+            try:
+                rss = max(0, int(fields[21]) * page_size)
+                pid = int(entry.name)
+            except ValueError:
+                continue
+            processes.append({"pid": pid, "name": name or "?", "rss_bytes": rss, "state": state})
+
+    processes.sort(key=lambda item: int(item["rss_bytes"]), reverse=True)
+    return {"total": sum(states.values()), **states, "top_memory": processes[:MAX_PROCESSES]}
+
+
+def service_snapshot() -> dict[str, object]:
+    active: list[str] = []
+    try:
+        entries = os.scandir("/run/lock/subsys")
+    except OSError:
+        entries = None
+    if entries is not None:
+        with entries:
+            for entry in entries:
+                if entry.is_file(follow_symlinks=False) and SAFE_SERVICE_NAME.fullmatch(entry.name):
+                    active.append(entry.name)
+    active.sort()
+
+    available = 0
+    try:
+        with os.scandir("/etc/rc.d/init.d") as entries:
+            available = sum(1 for entry in entries if entry.is_file(follow_symlinks=True))
+    except OSError:
+        pass
+    return {"active": active[:64], "active_count": len(active), "available_count": available}
+
+
+def thermal_snapshot() -> list[dict[str, str | float]]:
+    sensors: list[dict[str, str | float]] = []
+    try:
+        zones = sorted(Path("/sys/class/thermal").glob("thermal_zone*"))
+    except OSError:
+        return sensors
+    for zone in zones[:16]:
+        raw = read_text(str(zone / "temp"), 128).strip()
+        try:
+            temperature = float(raw)
+        except ValueError:
+            continue
+        if abs(temperature) >= 1000:
+            temperature /= 1000.0
+        label = read_text(str(zone / "type"), 128).strip() or zone.name
+        sensors.append({"label": label[:64], "celsius": round(temperature, 1)})
+    return sensors
+
+
+def installed_package_count() -> int:
+    try:
+        with os.scandir("/var/lib/sowa/db") as entries:
+            return sum(1 for entry in entries if entry.is_dir(follow_symlinks=False))
+    except OSError:
+        return 0
+
+
+class Collector:
+    """Collect and briefly cache a bounded system snapshot."""
+
+    def __init__(self, minimum_interval: float = 0.5) -> None:
+        self.minimum_interval = minimum_interval
+        self.lock = threading.Lock()
+        self.previous_cpu = cpu_ticks()
+        self.previous_network = network_totals()
+        self.previous_monotonic = time.monotonic()
+        self.cached_at = 0.0
+        self.cached: dict[str, object] = {}
+        self.identity = os_identity()
+
+    def snapshot(self) -> dict[str, object]:
+        with self.lock:
+            now = time.monotonic()
+            if self.cached and now - self.cached_at < self.minimum_interval:
+                return self.cached
+
+            total, idle = cpu_ticks()
+            previous_total, previous_idle = self.previous_cpu
+            total_delta = total - previous_total
+            idle_delta = idle - previous_idle
+            if total_delta > 0:
+                cpu_used = percent(total_delta - max(0, idle_delta), total_delta)
+            else:
+                cpu_used = percent(total - idle, total)
+
+            current_network = network_totals()
+            elapsed = max(0.001, now - self.previous_monotonic)
+            interfaces: list[dict[str, int | float | str]] = []
+            total_rx = total_tx = 0
+            total_rx_rate = total_tx_rate = 0.0
+            for name, (rx, tx) in sorted(current_network.items()):
+                if name == "lo":
+                    continue
+                old_rx, old_tx = self.previous_network.get(name, (rx, tx))
+                rx_rate = max(0.0, (rx - old_rx) / elapsed)
+                tx_rate = max(0.0, (tx - old_tx) / elapsed)
+                total_rx += rx
+                total_tx += tx
+                total_rx_rate += rx_rate
+                total_tx_rate += tx_rate
+                interfaces.append(
+                    {
+                        "name": name[:64],
+                        "rx_bytes": rx,
+                        "tx_bytes": tx,
+                        "rx_bytes_per_second": round(rx_rate, 1),
+                        "tx_bytes_per_second": round(tx_rate, 1),
+                    }
+                )
+                if len(interfaces) >= MAX_INTERFACES:
+                    break
+
+            memory = memory_snapshot()
+            filesystems = filesystem_snapshot()
+            processes = process_snapshot()
+            loads = os.getloadavg()
+            cores = os.cpu_count() or 1
+            try:
+                uptime = float(read_text("/proc/uptime", 256).split()[0])
+            except (ValueError, IndexError):
+                uptime = 0.0
+
+            # A squashfs is full by construction. Show read-only volumes in
+            # storage, but do not turn that expected state into a critical
+            # capacity alarm (most importantly on Sowa's live system).
+            disk_peak = writable_capacity_peak(filesystems)
+            warning = cpu_used >= 85 or float(memory["used_percent"]) >= 85 or disk_peak >= 90
+            critical = cpu_used >= 97 or float(memory["used_percent"]) >= 97 or disk_peak >= 97
+            health = "critical" if critical else "attention" if warning else "healthy"
+
+            self.cached = {
+                "api_version": APP_VERSION,
+                "collected_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                "health": health,
+                "system": {
+                    **self.identity,
+                    "hostname": socket.gethostname()[:253],
+                    "uptime_seconds": round(uptime),
+                    "installed_packages": installed_package_count(),
+                },
+                "cpu": {
+                    "used_percent": cpu_used,
+                    "cores": cores,
+                    "load": [round(value, 2) for value in loads],
+                    "load_percent": percent(loads[0], cores),
+                },
+                "memory": memory,
+                "filesystems": filesystems,
+                "network": {
+                    "rx_bytes": total_rx,
+                    "tx_bytes": total_tx,
+                    "rx_bytes_per_second": round(total_rx_rate, 1),
+                    "tx_bytes_per_second": round(total_tx_rate, 1),
+                    "interfaces": interfaces,
+                },
+                "processes": processes,
+                "services": service_snapshot(),
+                "temperatures": thermal_snapshot(),
+            }
+            self.previous_cpu = (total, idle)
+            self.previous_network = current_network
+            self.previous_monotonic = now
+            self.cached_at = now
+            return self.cached
+
+
+class BoundedThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+    block_on_close = False
+    request_queue_size = 32
+    allow_reuse_address = False
+
+    def __init__(self, socket_path: str, handler: type[http.server.BaseHTTPRequestHandler], collector: Collector, static_root: str) -> None:
+        self.collector = collector
+        self.static_root = Path(static_root)
+        self._slots = threading.BoundedSemaphore(32)
+        super().__init__(socket_path, handler)
+        # Do not leave correctness to the caller's umask. main() widens this to
+        # 0660 only after assigning the explicitly requested owner and group.
+        os.chmod(socket_path, 0o600)
+
+    def process_request(self, request: socket.socket, client_address: object) -> None:
+        if not self._slots.acquire(blocking=False):
+            request.close()
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: object) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+class DashboardHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "Sowa-Monitor"
+    sys_version = ""
+
+    STATIC_ROUTES = {
+        "/": ("index.html", "text/html; charset=utf-8"),
+        "/index.html": ("index.html", "text/html; charset=utf-8"),
+        "/assets/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
+        "/assets/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
+    }
+
+    @property
+    def app_server(self) -> BoundedThreadingUnixServer:
+        return self.server  # type: ignore[return-value]
+
+    def log_message(self, format_: str, *args: object) -> None:
+        logging.info("client: " + format_, *args)
+
+    def version_string(self) -> str:
+        return self.server_version
+
+    def send_security_headers(self, cache_control: str) -> None:
+        self.send_header("Cache-Control", cache_control)
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+
+    def send_body(self, status_code: int, body: bytes, content_type: str, cache_control: str = "no-store") -> None:
+        self.send_response(status_code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_security_headers(cache_control)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def send_error_body(self, status_code: int, message: str) -> None:
+        body = json.dumps({"error": message}, separators=(",", ":")).encode("utf-8")
+        self.send_body(status_code, body, "application/json; charset=utf-8")
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        # Query parameters are harmless cache busters. The path itself is never
+        # decoded, normalized or joined to disk; only exact literals below can
+        # reach a handler or an asset.
+        path = self.path.partition("?")[0]
+        if path == "/api/v1/summary":
+            try:
+                payload = self.app_server.collector.snapshot()
+                body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            except Exception:
+                logging.exception("telemetry collection failed")
+                self.send_error_body(500, "telemetry unavailable")
+                return
+            self.send_body(200, body, "application/json; charset=utf-8")
+            return
+        if path == "/healthz":
+            self.send_body(200, b'{"status":"ok"}', "application/json; charset=utf-8")
+            return
+        route = self.STATIC_ROUTES.get(path)
+        if route is None:
+            self.send_error_body(404, "not found")
+            return
+        filename, content_type = route
+        try:
+            body = (self.app_server.static_root / filename).read_bytes()
+        except OSError:
+            self.send_error_body(500, "dashboard asset unavailable")
+            return
+        self.send_body(200, body, content_type, "public, max-age=300")
+
+    def do_HEAD(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self.do_GET()
+
+    def reject_method(self) -> None:
+        body = b'{"error":"method not allowed"}'
+        self.send_response(405)
+        self.send_header("Allow", "GET, HEAD")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_security_headers("no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_POST = reject_method
+    do_PUT = reject_method
+    do_PATCH = reject_method
+    do_DELETE = reject_method
+    do_OPTIONS = reject_method
+    do_TRACE = reject_method
+    do_CONNECT = reject_method
+
+
+def socket_identity(user_name: str, group_name: str) -> tuple[int, int]:
+    try:
+        user = pwd.getpwnam(user_name)
+        group = grp.getgrnam(group_name)
+    except KeyError as error:
+        raise RuntimeError(f"unknown service identity: {error}") from error
+    return user.pw_uid, group.gr_gid
+
+
+def remove_stale_socket(socket_path: str) -> None:
+    try:
+        metadata = os.lstat(socket_path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(metadata.st_mode):
+        raise RuntimeError(f"refusing to replace non-socket path: {socket_path}")
+    os.unlink(socket_path)
+
+
+def drop_privileges(uid: int, gid: int) -> None:
+    if os.geteuid() != 0:
+        return
+    os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+    if os.geteuid() == 0 or os.getegid() != gid:
+        raise RuntimeError("could not drop service privileges")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="serve the read-only Sowa monitoring dashboard")
+    parser.add_argument("--socket", default=DEFAULT_SOCKET, help="Unix socket to listen on")
+    parser.add_argument("--static-root", default=DEFAULT_STATIC_ROOT, help="dashboard asset directory")
+    parser.add_argument("--user", help="user to become after binding (required when started as root)")
+    parser.add_argument("--group", help="socket group and group to become (required with --user)")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    if bool(args.user) != bool(args.group):
+        raise RuntimeError("--user and --group must be provided together")
+    if os.geteuid() == 0 and not args.user:
+        raise RuntimeError("refusing to serve as root; provide --user and --group")
+    if not Path(args.static_root).is_dir():
+        raise RuntimeError(f"dashboard asset directory does not exist: {args.static_root}")
+
+    parent = os.path.dirname(os.path.abspath(args.socket))
+    if not os.path.isdir(parent):
+        raise RuntimeError(f"socket directory does not exist: {parent}")
+    remove_stale_socket(args.socket)
+
+    uid = gid = None
+    if args.user:
+        uid, gid = socket_identity(args.user, args.group)
+
+    old_umask = os.umask(0o077)
+    try:
+        server = BoundedThreadingUnixServer(args.socket, DashboardHandler, Collector(), args.static_root)
+    finally:
+        os.umask(old_umask)
+
+    try:
+        if uid is not None and gid is not None:
+            os.chown(args.socket, uid, gid)
+            os.chmod(args.socket, 0o660)
+            drop_privileges(uid, gid)
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        logging.info("serving read-only dashboard on %s", args.socket)
+
+        def stop(_signum: int, _frame: object) -> None:
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        try:
+            server.serve_forever(poll_interval=0.25)
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        return 0
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError) as error:
+        print(f"sowa-monitor: {error}", file=sys.stderr)
+        raise SystemExit(1)

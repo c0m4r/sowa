@@ -1,0 +1,140 @@
+.Dd August 17, 2026
+.Dt CHKCONFIG 8
+.Os Sowa
+.Sh NAME
+.Nm chkconfig
+.Nd decide which services a runlevel starts
+.Sh SYNOPSIS
+.Nm
+.Fl -list
+.Op Ar name
+.Nm
+.Fl -add Ar name
+.Nm
+.Fl -del Ar name
+.Nm
+.Op Fl -level Ar levels
+.Ar name Cm on | off | reset
+.Nm
+.Ar name
+.Sh DESCRIPTION
+The
+.Pa /etc/rc.d/rc Ns Ar N Ns Pa .d
+directories are the real configuration.
+A service is started in a runlevel because there is an
+.Pa S Ns Ar NN Ns Ar name
+link for it there, and stopped because there is a
+.Pa K Ns Ar NN Ns Ar name
+link;
+.Pa /etc/rc.d/rc
+runs the K links and then the S links, in the order the two-digit priorities
+give.
+.Nm
+is how those links are made without counting digits by hand.
+.Pp
+The defaults come from the init script's own header, which every Sowa init
+script carries:
+.Bd -literal -offset indent
+# chkconfig: 2345 50 40
+# description: what the service is
+.Ed
+.Pp
+The three fields are the runlevels the service belongs in -
+.Ql -
+for none - and the two-digit start and stop priorities.
+Every runlevel ends up with a link either way: S where the service runs, K
+where it must be stopped if it is running.
+A script with no such header is refused rather than guessed at.
+.Pp
+With a
+.Ar name
+and no action,
+.Nm
+asks whether the service is started in the current runlevel and answers with
+its exit status, which is what a script wants.
+.Sh OPTIONS
+.Bl -tag -width "--level levels"
+.It Fl -list Op Ar name
+Print the state of every service in every runlevel, or of one service.
+.It Fl -add Ar name
+Make the links the script's header asks for: S in the runlevels it names, K in
+all the others.
+This is what a package does when it installs a service.
+.It Fl -del Ar name
+Remove every link for the service, in every runlevel.
+The init script is left alone.
+A service removed this way is neither started nor stopped by a runlevel change,
+which is not the same as
+.Cm off .
+.It Fl -level Ar levels
+Apply
+.Cm on
+or
+.Cm off
+to these runlevels only, written together with no separator:
+.Ql 35 .
+.It Cm on
+Start the service in the runlevels its header names, or in those given by
+.Fl -level ,
+and stop it in the rest.
+A header that names none is taken as 2345.
+.It Cm off
+Do not start it in any runlevel, or in those given by
+.Fl -level .
+The K links stay, so a service started by hand is still stopped on the way to a
+stopped system.
+.It Cm reset
+Put every runlevel back to what the script's header says.
+.El
+.Sh FILES
+.Bl -tag -width "/etc/rc.d/rcN.d" -compact
+.It Pa /etc/rc.d/init.d
+the init scripts, and where the headers are read from.
+.It Pa /etc/rc.d/rc Ns Ar N Ns Pa .d
+the links this command makes, for runlevels 0 to 6.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Nm Ar name
+with no action exits 0 when the service is started in the current runlevel and
+1 when it is not.
+.Sh EXAMPLES
+What starts where:
+.Bd -literal -offset indent
+$ chkconfig --list
+chronyd             0:off 1:off 2:on  3:on  4:on  5:on  6:off
+crond               0:off 1:off 2:on  3:on  4:on  5:on  6:off
+openvpn             0:off 1:off 2:off 3:off 4:off 5:off 6:off
+.Ed
+.Pp
+Turn a shipped-off service on at boot, and start it now -
+.Nm
+does not:
+.Bd -literal -offset indent
+chkconfig wg-quick on
+service wg-quick start
+.Ed
+.Pp
+Stop starting cron at boot, without stopping the one that is running:
+.Pp
+.Dl chkconfig crond off
+.Pp
+Only in the two multi-user runlevels this machine uses:
+.Pp
+.Dl chkconfig --level 35 named on
+.Pp
+Ask, from a script:
+.Bd -literal -offset indent
+if chkconfig sshd; then ...
+.Ed
+.Sh SEE ALSO
+.Xr inittab 5 ,
+.Xr init 8 ,
+.Xr runlevel 8 ,
+.Xr service 8
+.Sh CAVEATS
+.Nm
+changes what the next runlevel change does and nothing about the machine as it
+is now.
+A service is started and stopped with
+.Xr service 8 .

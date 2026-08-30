@@ -1,0 +1,41 @@
+# bash completion for sowa-bootstrap(8)                    -*- shell-script -*-
+# shellcheck shell=bash
+#
+# Two things get completed: the option, and the two kinds of path it and the
+# program take. --from-tarball wants a rootfs tarball, so the file list is
+# narrowed to the current .tar.xz plus the legacy and uncompressed tar forms -
+# directories included, since a tarball is usually somewhere else. The
+# destination is a directory and only ever a directory.
+
+_sowa_comp_sowa_bootstrap()
+{
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    local previous="${COMP_WORDS[COMP_CWORD - 1]}"
+
+    if [[ ${previous} == --from-tarball ]]; then
+        compopt -o filenames
+        # One pattern per suffix rather than one extended-glob alternation:
+        # extglob is on inside a completion loaded by bash-completion and off
+        # in a shell that sourced this file by hand, and a -X filter that is
+        # not being read as an extended glob matches nothing at all.
+        mapfile -t COMPREPLY < <(
+            compgen -f -X '!*.tar.xz' -- "${current}"
+            compgen -f -X '!*.txz' -- "${current}"
+            compgen -f -X '!*.tar.gz' -- "${current}"
+            compgen -f -X '!*.tar' -- "${current}"
+            compgen -f -X '!*.tgz' -- "${current}"
+            compgen -d -- "${current}"
+        )
+        return 0
+    fi
+    if [[ ${current} == -* ]]; then
+        mapfile -t COMPREPLY < <(
+            compgen -W "--from-tarball --help" -- "${current}"
+        )
+        return 0
+    fi
+    compopt -o filenames
+    mapfile -t COMPREPLY < <(compgen -d -- "${current}")
+}
+
+complete -F _sowa_comp_sowa_bootstrap sowa-bootstrap

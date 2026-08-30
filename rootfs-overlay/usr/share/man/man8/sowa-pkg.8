@@ -1,0 +1,448 @@
+.Dd August 23, 2026
+.Dt SOWA-PKG 8
+.Os Sowa
+.Sh NAME
+.Nm sowa-pkg
+.Nd the Sowa binary package manager
+.Sh SYNOPSIS
+.Nm
+.Ar command
+.Op Ar options
+.Op Ar package ...
+.Sh DESCRIPTION
+.Nm
+installs, upgrades and removes the binary packages Sowa is built from and
+published as.
+.Pp
+A package is an XZ-compressed tar archive carrying the files it owns and three
+or four metadata members:
+.Pa .PKGINFO ,
+what the package is,
+.Pa .FILES ,
+the manifest of every path with its mode and its SHA-256,
+.Pa .MESSAGE ,
+a note to show once it is installed, and
+.Pa .HOOKS ,
+the steps that finish an installation the files alone do not.
+.Pp
+A repository is a plain HTTPS directory with no server side: an index, a
+signature over that index, and the archives.
+An update is three GETs and nothing more.
+The index is signed with Ed25519 and pins every archive in it by SHA-256, so
+that one signature covers the whole repository, and it is the signature rather
+than the transport that an update trusts.
+An index that does not verify against
+.Pa /etc/sowa/keys/sowa-repo.pub
+is refused, and a machine with no key refuses every index: it fails closed.
+.Pp
+A signature says who wrote an index.
+It does not say that this is the newest one they wrote, and it does not say the
+index is well formed; see
+.Sx REPOSITORY FRESHNESS
+and
+.Sx WHAT IS CHECKED BEFORE ANYTHING IS WRITTEN .
+.Pp
+Installing never writes through an existing file.
+Each archive is unpacked into a staging directory and its files are then moved
+into place, so every replacement is a
+.Xr rename 2 :
+a running program keeps the inode it started with, a shared library is never
+truncated under the processes that mapped it, and an interrupted install cannot
+leave a half-written binary behind.
+This is also why
+.Nm
+can upgrade itself while it is running.
+.Pp
+Between unpacking and moving, the staged tree is required to be exactly what the
+package's own
+.Pa .FILES
+says it is: the same paths, types, modes, sizes and contents, with no member the
+manifest does not list and nothing that is not a file, a directory or a link.
+.Pp
+Files below
+.Pa /etc
+are treated as configuration.
+One that has been edited since the package placed it is kept, and the packaged
+version is written beside it as
+.Pa <file>.tpknew ,
+with a line saying so.
+.Pp
+An upgrade removes the files the old version owned and the new one does not,
+with one exception, and it applies anywhere in the filesystem: a file whose
+contents are no longer the ones the package installed was written by somebody
+after the package placed it, so it is kept, with a line saying which package
+has stopped shipping it.
+.Ss Steps packages declare
+A package may carry hooks: a small, closed set of actions that run around an
+installation or a removal.
+There is no post-install
+.Em script ,
+and a package cannot ship one.
+Each hook names an event and one of the actions
+.Nm
+implements itself:
+.Bd -literal -offset indent
+post-install|setup|/usr/sbin/sowa-guix-setup
+post-install|service-enable|guix-daemon
+pre-remove|service-stop|sshd
+.Ed
+.Pp
+The events are
+.Cm post-install ,
+.Cm post-upgrade
+and
+.Cm pre-remove ;
+the actions are
+.Cm service-start ,
+.Cm service-stop ,
+.Cm service-restart ,
+.Cm service-enable ,
+.Cm service-disable
+and
+.Cm setup .
+The service actions run an init script that is already on the machine.
+.Cm setup
+runs a program the package itself owns - looked up in that package's own
+manifest first - so a hook cannot name
+.Pa /bin/sh ,
+a path another package placed, or anything that was not in the archive whose
+hash the signed index pinned.
+Every hook that runs is printed before it runs, and
+.Ic sowa-pkg hooks
+prints them all without unpacking anything.
+.Sh COMMANDS
+.Bl -tag -width "upgrade [package...]"
+.It Cm update
+Fetch the repository index and its signature, verify the signature, and replace
+the local copy.
+Says afterwards how many installed packages are out of date and warns when an
+installed package is newer than the repository.
+It also reports packages the repository has
+.Em rebuilt
+at the version this system already has; see
+.Sx BUILD IDENTITY .
+.Pp
+The index has to be well formed and current as well as signed: see
+.Sx WHAT IS CHECKED BEFORE ANYTHING IS WRITTEN
+and
+.Sx REPOSITORY FRESHNESS .
+An index that fails any of that is refused and the one this machine has been
+using is left in place.
+.It Cm list Op Fl -installed
+What is installed and at which version, with the repository's version noted
+where it differs.
+This is the default.
+.It Cm list Fl -upgradable
+Only the packages the repository differs on, labelled as an upgrade, a
+downgrade, or a rebuild.
+.It Cm list Fl -available
+What the repository offers and this system does not have, which is the question
+the word asks.
+.It Cm list Fl -all
+Everything, installed and not, in two version columns.
+.Ql -
+under
+.Em installed
+is a package this system does not have;
+.Ql -
+under
+.Em repository
+is one the index no longer carries.
+.It Cm info Ar package ...
+What a package is, where it came from, how many paths it owns, the steps it
+declares and any note it left.
+Reports the installed side, the repository side, or both.
+.It Cm files Ar package
+Every path the installed package owns, directories excluded.
+.It Cm owns Ar path
+Which installed package owns a path.
+.It Cm install Ar package ...
+Install packages and everything they depend on.
+Prints the plan and the total download and asks before doing anything.
+.Cm add
+is the same command.
+.It Cm upgrade Op Ar package ...
+Bring the named packages, or the whole system, up to what the repository
+offers.
+If the repository has an older version, labels the operation as a downgrade and
+warns before asking for confirmation.
+With no arguments it also says how many packages in the repository are not
+installed.
+.It Cm remove Ar package ...
+Remove packages and the files they own.
+Refuses to remove a package another installed package depends on, or one of the
+base system's own.
+.Cm uninstall
+is the same command.
+.It Cm hooks Op Ar package ...
+Print the steps packages declare, without running any of them.
+.It Cm verify Op Ar package ...
+Re-check installed files against the SHA-256 the manifest recorded: missing
+files, changed symbolic links, and content that no longer matches.
+A modified file under
+.Pa /etc
+is reported as a modified configuration file rather than as a problem, since
+that is what configuration is for.
+.It Cm clean Op Fl -all
+Delete cached archives the index no longer references, or with
+.Fl -all
+the whole cache.
+.It Cm help
+Print the usage summary.
+.El
+.Sh OPTIONS
+.Bl -tag -width "--download-only"
+.It Fl y , Fl -yes
+Do not ask for confirmation.
+.It Fl -reinstall
+Install again even at the version already installed.
+.It Fl -download-only
+Fetch the archives into the cache and stop without installing anything.
+.It Fl -no-hooks
+Do not run the steps packages declare.
+On a removal this also means a package whose
+.Cm pre-remove
+step failed can be removed anyway.
+.It Fl -allow-downgrade
+Install a package the repository has an older version of than the one on this
+machine.
+Without it a downgrade is never done: a package named on the command line is
+refused with this switch quoted, and one reached as a dependency or by a bare
+.Cm upgrade
+is kept at the version it has, with a line saying so.
+A repository going backwards is either somebody rolling a package back on
+purpose or a repository that has been rolled back for them, and only the first
+of those types the package name.
+.It Fl -allow-stale
+Accept a repository index whose serial is behind one this machine has already
+accepted, or whose expiry has passed.
+Both are refused by default; see
+.Sx REPOSITORY FRESHNESS .
+The machine that most needs an update is sometimes the one that has been
+switched off for a year, so the refusal is overridable \(em conspicuously, on
+the command line, and never implied by
+.Fl y .
+.It Fl -root Ar dir
+Operate on another root filesystem: an image being assembled, or a disk mounted
+somewhere.
+The database, the cache and the configuration are all taken from under that
+directory.
+Hooks act on the running system, so they are not run for another root and
+.Nm
+says so rather than running them against the wrong machine.
+.El
+.Sh FILES
+.Bl -tag -width "/var/cache/sowa/staging" -compact
+.It Pa /etc/sowa/pkg.conf
+where the repository is;
+.Xr sowa-pkg.conf 5 .
+.It Pa /etc/sowa/keys/sowa-repo.pub
+the Ed25519 key the index must be signed with.
+.It Pa /var/lib/sowa/db
+the local database: one directory per installed package.
+.It Pa /var/lib/sowa/repo/index
+the verified index, and
+.Pa index.sig
+beside it.
+.It Pa /var/lib/sowa/repo/serial
+the highest index serial this machine has ever accepted.
+It is written only after an index has been accepted whole, and only ever
+upwards.
+.It Pa /var/lib/sowa/lock
+held for the length of a transaction, so two runs cannot overlap.
+.It Pa /var/cache/sowa/pkg
+downloaded archives.
+.It Pa /var/cache/sowa/staging
+where an archive is unpacked before its files are moved into place.
+.It Pa /var/log/sowa-pkg.log
+what was asked for, what the plan was, which package went in or came out, which
+declared step ran, and how it ended.
+Only the commands that change something write to it, and a write that fails is
+allowed to fail: a read-only command still works for somebody who cannot write
+to
+.Pa /var/log .
+With
+.Fl -root
+the record is written inside that root, because it belongs with the system that
+changed.
+It is rotated by
+.Xr logrotate 8
+under
+.Pa /etc/logrotate.d/sowa .
+.El
+.Sh BUILD IDENTITY
+A version says which release a package is.
+It does not say which build: rebuilding a package against a new library,
+correcting its recipe or adding a patch produces different bytes under the same
+version, and comparing versions alone would leave that invisible on a machine
+that already has the package.
+.Pp
+Every package therefore carries a
+.Va pkgbuild
+as well, which the build derives from the manifest and installed metadata
+together with the recipe/input key, compiler/toolchain identity, and dependency
+build keys.
+It therefore identifies the audited build rather than only bytes that happen to
+be identical.
+.Nm
+compares it as well as the version, and plans a
+.Em rebuild
+where the version matches and the build id does not:
+.Bd -literal -offset indent
+  curl               rebuild 8.21.0-1 (build 3f9c1a04be77)
+.Ed
+.Pp
+A repository entry with no build id \(em one published before this field
+existed \(em is treated as matching, so an unknown answer is never a reason to
+reinstall everything on the machine.
+When the repository has an id but an older installed database entry does not,
+one rebuild records the known identity and subsequent runs converge normally.
+.Sh REPOSITORY FRESHNESS
+A signature proves who wrote an index.
+It proves nothing about whether that index is the current one, and anybody who
+can answer for the repository URL \(em a network in between, a caching proxy, a
+mirror, or the server itself once it is somebody else's \(em can hand back last
+year's index and last year's archives indefinitely without forging anything.
+Every signature verifies, every checksum matches, and the machine is simply held
+at a version whose defects are public while
+.Ic sowa-pkg upgrade -y
+reports that there is nothing to do.
+.Pp
+So the index carries two numbers of its own, inside the bytes the signature
+covers:
+.Bl -tag -width serial -compact
+.It Va serial
+when it was published, as seconds since the epoch.
+.It Va expires
+after which it is not to be believed at all.
+.El
+.Pp
+.Nm
+keeps the highest serial it has ever accepted in
+.Pa /var/lib/sowa/repo/serial
+and refuses a lower one.
+It refuses an expired one.
+And once it has seen a serial, it refuses an index that no longer carries one,
+because that is the same replay with the header taken off.
+A repository that has never published a serial is still readable, with a warning
+saying that an old index cannot be told from the current one.
+.Pp
+.Fl -allow-stale
+takes any of those anyway and says so on the terminal.
+.Pp
+The expiry is the reason a repository has to be republished on a schedule rather
+than only when a package changes: if it runs out, every machine reading that
+repository stops updating until it is signed again.
+.Sh WHAT IS CHECKED BEFORE ANYTHING IS WRITTEN
+The index is a document that drives filesystem operations, so a valid signature
+over a malformed one is not enough.
+Before an index replaces the one in use, every entry must have a usable package
+name, version, architecture, archive basename, 64-hex SHA-256 and positive
+bounded size; no package or archive name may appear twice; every dependency must
+be a name the same index offers; the dependency graph must be acyclic; and no
+line may carry a control character.
+.Pp
+Before a package is written into the root, every path in its manifest must be
+relative and normalised \(em no leading slash, no
+.Pa ..
+component, no control character \(em and no path may sit below a path the same
+manifest calls a file or a link.
+Under
+.Fl -root
+the directory each entry will be written into is then resolved and required to
+land below that root, which is what a string
+.Pa ${ROOT}/${path}
+cannot see: a
+.Pa usr/lib
+that is a link to
+.Pa /
+in an image being repaired.
+The manifests already in a root's database are checked the same way before a
+removal, because on another root somebody else wrote them.
+.Pp
+This is name resolution rather than
+.Xr openat2 2
+with
+.Dv RESOLVE_BENEATH ,
+which a shell cannot ask for.
+It closes a tree that already contains the link.
+It is not a defence against something rewriting the tree while
+.Nm
+is running \(em though the lock keeps a second
+.Nm
+out.
+.Sh EXIT STATUS
+.Bl -tag -width 0 -compact
+.It 0
+done.
+.It 1
+nothing was changed, and why is on standard error.
+.It 2
+the packages are installed, but a step one of them declared did not run.
+.El
+.Pp
+The third is its own status on purpose: files in place and a setup step that
+failed is neither a success nor a failed transaction, and answering 0 would let
+.Ic sowa-pkg install foo && use-foo
+go on to use something that was never finished being set up.
+.Sh EXAMPLES
+Fetch the index, then see what is out of date:
+.Bd -literal -offset indent
+sowa-pkg update
+sowa-pkg list --upgradable
+.Ed
+.Pp
+Install something, without being asked:
+.Pp
+.Dl sowa-pkg install -y nginx
+.Pp
+Find out what a file belongs to, and what else that package owns:
+.Bd -literal -offset indent
+sowa-pkg owns /usr/bin/dig
+sowa-pkg files bind | less
+.Ed
+.Pp
+See what a package would do to the machine before installing it:
+.Bd -literal -offset indent
+sowa-pkg info guix
+sowa-pkg hooks guix
+.Ed
+.Pp
+Check the system against its own manifests after a crash or a disk error:
+.Pp
+.Dl sowa-pkg verify
+.Pp
+Install into a disk mounted elsewhere, from a rescue system or after
+.Xr sowa-bootstrap 8 :
+.Pp
+.Dl sowa-pkg --root /mnt install haproxy
+.Sh SEE ALSO
+.Xr sowa-pkg.conf 5 ,
+.Xr chkconfig 8 ,
+.Xr service 8 ,
+.Xr sowa-bootstrap 8 ,
+.Xr sowa-chroot 8
+.Sh CAVEATS
+Changing the running system needs root.
+Another root needs only write access to it, which is what makes
+.Fl -root
+usable without privilege.
+.Pp
+Some packages cannot be removed:
+.Sy sowa-base ,
+.Sy bash ,
+.Sy linux ,
+.Sy sowa-init ,
+.Sy sowa-release ,
+.Sy tar
+and
+.Sy xz .
+Removing any of them would leave a system unable to boot, run a shell, or
+install anything ever again - the last two are on the list because every package
+is an XZ-compressed tar archive, so a system without them could not install
+them back.
+.Pp
+There is no dependency solver worth the name here: dependencies are resolved
+depth first from the index and installed in order.
+Nothing tracks which packages were installed only as a dependency, so nothing
+removes them again.

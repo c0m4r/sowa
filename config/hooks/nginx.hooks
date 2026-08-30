@@ -1,0 +1,28 @@
+# nginx.
+#
+# Nothing here enables or starts it. The package ships an init script - a web
+# server with no way to come back after a reboot is half a package - but
+# installing a web server and publishing one are two decisions, and the second
+# one belongs to the machine. "chkconfig nginx on" answers it, and nothing in
+# an install or an upgrade overrules that answer in either direction.
+#
+# An upgrade replaces /usr/sbin/nginx by renaming the new one over it, so a
+# running master keeps serving from the inode it started with - including from
+# the OpenSSL it was linked against, which is where the reason for the upgrade
+# usually is. The restart is what moves it onto the new program, and it happens
+# only if it is running, so a machine that deliberately has nginx stopped keeps
+# it that way.
+#
+# It is a restart rather than a reload because a reload is exactly what does not
+# help: the master rereads its configuration and forks new workers from the
+# program it is already running. A machine that cannot afford the connections
+# in flight declines with "sowa-pkg upgrade --no-hooks nginx" and restarts when
+# it suits.
+post-upgrade|service-restart|nginx
+# Removing the package does not stop the daemon: an unlinked binary keeps
+# running, and this one holds port 80. Without these, "sowa-pkg remove nginx"
+# leaves a web server answering from a program that is no longer on the disk,
+# and rc links naming an init script the same removal takes away - a service
+# the next boot tries and fails to start.
+pre-remove|service-stop|nginx
+pre-remove|service-disable|nginx

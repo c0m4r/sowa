@@ -1,0 +1,86 @@
+# /etc/inittab - what init starts, and when.
+#
+# Each line is  id:runlevels:action:process
+#
+#   id         up to eight characters, unique in this file. It is how init
+#              tells one entry from another across a reread, so keeping it
+#              stable matters more than what it says.
+#   runlevels  the runlevels the entry belongs to; empty means all of them.
+#   action     sysinit, boot, bootwait, wait, once, respawn, ondemand, off,
+#              initdefault, ctrlaltdel, powerfail, powerwait, powerokwait or
+#              kbrequest. See docs/init.md.
+#   process    the command. It is run directly unless it contains a shell
+#              metacharacter, in which case /bin/sh -c runs it. A leading "@"
+#              is not part of the command: it tells init to hand the process
+#              no terminal at all, which is what a getty needs.
+#
+# The runlevels Sowa uses:
+#
+#   0  halt or power off
+#   1  single user with the rc scripts run: services stopped, console login
+#   2  multi user
+#   3  multi user - the default
+#   4  multi user, free for local use
+#   5  multi user, free for local use (nothing here manages a display)
+#   6  reboot
+#   S  single user without the rc scripts: a root shell and nothing else,
+#      which is what "single" on the kernel command line gets you
+#
+# After editing this file, run "telinit q" to have init reread it.
+
+id:3:initdefault:
+
+# Mount /proc, /sys, /dev and /run, set the hostname, bring the loopback up.
+# Nothing else runs until it has finished.
+si::sysinit:/etc/rc.d/rc.sysinit
+
+# One entry per runlevel. /etc/rc.d/rc runs the K and S links in
+# /etc/rc.d/rc<N>.d, which is where services are turned on and off - with
+# chkconfig(8), or by making the links by hand.
+l0:0:wait:/etc/rc.d/rc 0
+l1:1:wait:/etc/rc.d/rc 1
+l2:2:wait:/etc/rc.d/rc 2
+l3:3:wait:/etc/rc.d/rc 3
+l4:4:wait:/etc/rc.d/rc 4
+l5:5:wait:/etc/rc.d/rc 5
+l6:6:wait:/etc/rc.d/rc 6
+
+# Single user mode. There is no sulogin in the image, so this is a plain login
+# shell on the console: root, no password prompt, everything mounted and
+# nothing else running. "telinit 3" leaves it for the default runlevel.
+su:S:respawn:/bin/sh -l
+
+# A login prompt per console, respawned as each one exits. One getty per device
+# rather than one login on /dev/console is what makes the "console=" arguments
+# on the kernel command line stop deciding where the only prompt in the system
+# lands: the screen and the serial line both have one, at the same time.
+#
+# Each is marked "@" because agetty opens its own device and makes it the
+# controlling terminal of the session it gives login; an entry holding
+# /dev/console could not. "-l /usr/bin/login" names shadow's login, since
+# agetty's built-in default is /bin/login and this image deliberately has no
+# such program. "--noclear" keeps the kernel log on tty1 instead of wiping the
+# screen before the prompt - it is the first thing anyone debugging a boot that
+# went wrong wants to read.
+#
+# The serial line goes through serial-getty rather than straight to agetty,
+# because ttyS0 is the one console that may not exist. See that script: agetty
+# on a port with no UART behind it exits about ten seconds later, every time,
+# and init would spend the life of the machine respawning it.
+#
+# serial-getty takes an optional third argument, the terminal type, and defaults
+# to xterm-256color - what is actually at the far end of this port, which is
+# QEMU or screen or minicom rather than a DEC terminal. Append "vt220" here if
+# it really is one; see the comment in the script for why not vt100.
+1:12345:respawn:@/usr/sbin/agetty --noclear -l /usr/bin/login tty1 38400 linux
+2:12345:respawn:@/usr/sbin/agetty -l /usr/bin/login tty2 38400 linux
+s0:12345:respawn:@/usr/sbin/serial-getty ttyS0 115200
+
+# Ctrl-Alt-Del reaches init as a SIGINT. Comment this out to make the key
+# combination do nothing.
+ca::ctrlaltdel:/sbin/shutdown -r now
+
+# A UPS daemon that signals init with SIGPWR gets these. Nothing in the base
+# image sends them.
+pf::powerfail:/sbin/shutdown -h +2 "power failure; shutting down"
+pr::powerokwait:/sbin/shutdown -c "power restored"

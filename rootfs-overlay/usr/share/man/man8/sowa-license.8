@@ -1,0 +1,158 @@
+.Dd August 24, 2026
+.Dt SOWA-LICENSE 8
+.Os Sowa
+.Sh NAME
+.Nm sowa-license
+.Nd what this system is licensed under, and by whom
+.Sh SYNOPSIS
+.Nm
+.Op Fl -root Ar dir
+.Op Ar command
+.Op Ar package ...
+.Sh DESCRIPTION
+Sowa is a few thousand lines of its own code wrapped around some eighty
+upstream projects.
+Four packages are Sowa's own work -
+.Sy sowa-init
+,
+.Sy sowa-release
+,
+.Sy custom-installers
+and the optional
+.Sy sowa-monitor
+- and all are GPL-3.0-or-later, as is the build system that produced the
+image.
+Everything else belongs to the people who wrote it and is shipped under their
+terms, from unmodified sources.
+.Nm
+is how a machine says which is which, without anyone having to go and read a
+table somewhere else.
+.Pp
+It reads three things, all of them local:
+.Bl -tag -width "/usr/share/licenses/<package>" -offset indent
+.It Pa /var/lib/sowa/db/<package>/desc
+the licence and copyright of every installed package, written when the package
+was installed.
+.It Pa /var/lib/sowa/repo/index
+the same fields for packages the repository offers and this system does not
+have, if an index has been fetched.
+.It Pa /usr/share/licenses/<package>/
+the licence texts themselves, which every package carries as files it owns.
+.El
+.Pp
+Nothing here contacts the network and nothing here needs root: what a system is
+licensed under is something it should be able to state about itself while
+offline and while logged in as anybody.
+.Pp
+With no arguments at all,
+.Cm summary
+is what runs.
+.Sh COMMANDS
+.Bl -tag -width "list --available"
+.It Cm summary
+What this system as a whole is licensed under: how many packages are Sowa's own
+work and how many are other people's, which packages Sowa wrote, and a count of
+every licence identifier in use across the installed system.  It also counts
+the licence classifications of installed packages.
+.It Cm list
+Every installed package with its version, whose copyright it is, and its
+licence, and its licence classification.
+.It Cm list Fl -available
+The same for packages the repository offers and this system does not have.
+Needs an index, so
+.Ic sowa-pkg update
+first.
+.It Cm list Fl -all
+Both, in one table.
+.It Cm show Ar package ...
+Print the licence texts a package carries, in full, through a pager when there
+is somebody to read them.
+.It Cm files Ar package ...
+List the licence files a package carries, without printing them.
+.It Cm sowa
+The parts of this system Sowa itself wrote.
+.It Ar package
+A bare package name is the same as
+.Cm show Ar package ,
+because it is the question people actually ask.
+.El
+.Sh OPTIONS
+.Bl -tag -width "--root dir"
+.It Fl -root Ar dir
+Ask about another root filesystem: a disk mounted somewhere, or an image being
+assembled.
+The database, the index and the licence texts are all taken from under that
+directory.
+.It Fl h , Fl -help
+Print usage and exit.
+.El
+.Sh FILES
+.Bl -tag -width "/var/lib/sowa/repo/index" -compact
+.It Pa /usr/share/licenses
+one directory per package, holding the texts it ships.
+They are files the package owns, so they are listed by
+.Ic sowa-pkg files ,
+checked by
+.Ic sowa-pkg verify ,
+and removed with the package.
+.It Pa /var/lib/sowa/db
+the installed package database.
+.It Pa /var/lib/sowa/repo/index
+the verified repository index.
+.It Pa /etc/os-release
+where the distribution's name and version are read from.
+It is read rather than sourced: the file is shell-shaped by specification, but
+sourcing one to learn a name runs whatever is in it.
+.El
+.Sh EXIT STATUS
+.Ex -std
+A root filesystem with no package database in it is an error, since the answer
+would otherwise be an empty and confident one.
+.Sh EXAMPLES
+What the machine is, in one screen:
+.Pp
+.Dl sowa-license
+.Pp
+The licence of everything installed, and of everything on offer:
+.Bd -literal -offset indent
+sowa-license list
+sowa-license list --all
+.Ed
+.Pp
+The full text of what a package ships:
+.Bd -literal -offset indent
+sowa-license show gcc
+sowa-license gcc          # the same thing
+sowa-license files gcc    # just the paths
+.Ed
+.Pp
+About a disk mounted elsewhere:
+.Pp
+.Dl sowa-license --root /mnt list
+.Sh SEE ALSO
+.Xr sowa-pkg 8
+.Sh CAVEATS
+A licence identifier is what the package's own metadata records, and an
+expression joined with
+.Sy AND
+means every one of the identifiers applies, to different files.
+The counts in
+.Cm summary
+are therefore per identifier: a package under several licences appears under
+each of them.
+.Pp
+A package that records no licence at all is counted and reported as such.
+That is a packaging bug rather than a package without a licence.
+.Pp
+The classification is local and is based on the SPDX identifiers recorded in
+the package metadata.  It is one of
+.Sy osi-approved
+(every applicable licence is on the OSI Approved Licences list),
+.Sy foss
+(free and open source, but not OSI-approved),
+.Sy foss-mixed
+(OSI-approved and other FOSS licences both apply), or
+.Sy source-available-non-free
+(source-available terms that are not free).  An unreviewed identifier is
+reported conservatively as
+.Sy source-available-non-free .

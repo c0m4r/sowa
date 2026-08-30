@@ -1,0 +1,60 @@
+#!/bin/bash
+#
+# chkconfig: 2345 50 50
+# description: OpenSSH server
+#
+# -D keeps sshd in the foreground for the daemon helper. Normal daemon and
+# authentication records go through syslog(3) to syslog-ng and land in
+# /var/log/secure; stderr from host-key generation or an early start failure is
+# still appended to /var/log/sshd.log. Do not add -e here: it redirects all
+# OpenSSH logging away from syslog and would leave /var/log/secure empty.
+
+. /etc/rc.d/init.d/functions
+
+name=sshd
+program=/usr/sbin/sshd
+pidfile=/run/sshd.pid
+logfile=/var/log/sshd.log
+
+start() {
+    begin "Starting ${name}"
+    if ! /usr/sbin/sowa-sshd-keygen >> "${logfile}" 2>&1; then
+        failed
+        return 1
+    fi
+    daemon --pidfile "${pidfile}" --log "${logfile}" -- \
+        "${program}" -D
+    result $?
+}
+
+stop() {
+    begin "Stopping ${name}"
+    killproc --pidfile "${pidfile}" "${program}"
+    result $?
+}
+
+case "${1:-}" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    reload)
+        # sshd rereads its configuration on SIGHUP by re-executing itself.
+        begin "Reloading ${name}"
+        killproc --pidfile "${pidfile}" --signal HUP "${program}"
+        result $?
+        ;;
+    status)
+        status --pidfile "${pidfile}" "${program}"
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|reload|status}\n' "$0" >&2
+        exit 2
+        ;;
+esac

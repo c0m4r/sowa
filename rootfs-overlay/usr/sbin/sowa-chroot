@@ -1,0 +1,154 @@
+#!/bin/bash
+#
+# sowa-chroot - enter an installed Sowa system with its kernel filesystems in place.
+#
+# chroot(8) alone changes the root directory and nothing else, which leaves the
+# new root without /proc, /sys or /dev. Almost everything worth running in there
+# needs at least one of them: grub-install reads /sys and /dev to find the disk
+# it is being pointed at, sowa-pkg wants /dev/urandom, and ps and mount read
+# /proc. This mounts the four of them, runs a shell (or the command given after
+# the destination), and unmounts them again on the way out - in reverse, and
+# whether the shell exited cleanly or not.
+#
+#   sowa-chroot /mnt                 an interactive login shell
+#   sowa-chroot /mnt grub-install ... one command, then leave
+#
+# The destination has to hold a Sowa system - what sowa-setup or sowa-bootstrap
+# leaves behind - because the alternative is bind-mounting /dev over a directory
+# that was a typo. It does not have to be a mount point: a tree bootstrapped
+# into a plain directory is one of the things sowa-bootstrap is for.
+
+set -Eeuo pipefail
+
+# shellcheck source=../lib/sowa/install-functions
+source "${SOWA_INSTALL_LIB:-/usr/lib/sowa}/install-functions"
+
+# The mounts made so far, innermost last, so unwinding is this list backwards.
+# It is filled in as each mount succeeds rather than listed up front, so a
+# failure part way through unmounts what it made and nothing else.
+mounted=()
+
+usage() {
+    printf 'usage: %s DESTINATION [COMMAND [ARGUMENT...]]\n\n' "${0##*/}"
+    printf 'Enter the Sowa system mounted at DESTINATION with /proc, /sys, /dev\n'
+    printf 'and /run mounted inside it. Without a COMMAND, runs a login shell.\n'
+    exit "${1:-1}"
+}
+
+require_tools() {
+    local missing=()
+    mapfile -t missing < <(missing_tools chroot mount umount findmnt)
+    ((${#missing[@]} == 0)) || die "missing required tools: ${missing[*]}"
+}
+
+unmount_all() {
+    # Reverse order: an outer filesystem cannot be unmounted while an inner one
+    # is still on top of it. -R for /dev, which carries devpts and whatever else
+    # the running system has under it.
+    local index
+    for (( index = ${#mounted[@]} - 1; index >= 0; index-- )); do
+        local point="${mounted[index]}"
+        umount -R "${point}" 2>/dev/null && continue
+        # Something in the chroot is still holding it - a daemon the user
+        # started, most often. A lazy unmount detaches it now and lets the
+        # kernel finish when the last user lets go, which is better than
+        # leaving the host's /dev bind-mounted under a directory forever.
+        umount -R -l "${point}" 2>/dev/null \
+            || warn "could not unmount ${point}"
+    done
+    mounted=()
+}
+trap unmount_all EXIT
+
+mount_kernel_filesystems() {
+    local destination="$1"
+
+    # proc and sysfs are mounted fresh rather than bound, because they are the
+    # same filesystem wherever they appear and a second mount of one costs
+    # nothing. /dev is bound instead: a fresh devtmpfs would carry the device
+    # nodes but not /dev/pts, which is a separate filesystem mounted over it,
+    # and without a pty there is no job control in the chroot's shell.
+    # --make-rslave is what keeps the recursive unmount from propagating back
+    # out and unmounting the host's /dev/pts along with the copy.
+    mkdir -p "${destination}"/{proc,sys,dev,run}
+
+    mount -t proc proc "${destination}/proc" || die "cannot mount proc on ${destination}/proc"
+    mounted+=("${destination}/proc")
+
+    mount -t sysfs sys "${destination}/sys" || die "cannot mount sysfs on ${destination}/sys"
+    mounted+=("${destination}/sys")
+
+    mount --rbind /dev "${destination}/dev" || die "cannot bind /dev onto ${destination}/dev"
+    mounted+=("${destination}/dev")
+    mount --make-rslave "${destination}/dev" \
+        || warn "${destination}/dev is not a slave mount; unmounting it may affect the host's /dev"
+
+    # A tmpfs rather than a bind of the host's /run: /run holds the state of the
+    # processes that are running *now*, and the chroot's are not those. This is
+    # also what the installed system gets from rc.sysinit at boot, so anything
+    # run in here sees the /run it would see for real.
+    mount -t tmpfs run "${destination}/run" || die "cannot mount tmpfs on ${destination}/run"
+    mounted+=("${destination}/run")
+
+    # Only when the host booted UEFI, and only then because grub-install writes
+    # a boot entry through it. On a BIOS machine the directory does not exist
+    # and nothing in the chroot will look for it.
+    if [[ -d /sys/firmware/efi/efivars ]] && findmnt -n --mountpoint /sys/firmware/efi/efivars >/dev/null 2>&1; then
+        if mount -t efivarfs efivarfs "${destination}/sys/firmware/efi/efivars" 2>/dev/null; then
+            mounted+=("${destination}/sys/firmware/efi/efivars")
+        else
+            warn "could not mount efivarfs; grub-install will not be able to write an NVRAM boot entry"
+        fi
+    fi
+}
+
+main() {
+    [[ $# -ge 1 ]] || usage
+    case "$1" in
+        -h|--help) usage 0 ;;
+        -*) usage ;;
+    esac
+
+    require_root
+    require_supported_host_kernel
+    require_tools
+
+    [[ -d "$1" ]] || die "not a directory: $1"
+    local destination
+    destination="$(normalize_path "$1")" || die "cannot resolve: $1"
+    shift
+
+    [[ "${destination}" != / ]] || die "refusing to chroot into the running root filesystem"
+    # Holding a Sowa system is the requirement, not being a mount point. Being a
+    # mount point was the first form of this check and it was the wrong one: it
+    # refused exactly the case sowa-bootstrap advertises and its own closing
+    # instructions suggest - a plain directory bootstrapped as a chroot tree -
+    # while doing nothing the check below does not already do better. A typo
+    # does not have a Sowa system in it; that is what makes it safe to bind /dev
+    # onto this path.
+    is_sowa_root "${destination}" \
+        || die "${destination} does not hold a Sowa system; run sowa-bootstrap ${destination} first"
+    is_mount_point "${destination}" \
+        || warn "${destination} is not a mount point; entering it as a plain directory tree"
+
+    mount_kernel_filesystems "${destination}"
+
+    log "entering ${destination} (exit or Ctrl-D to leave)"
+    local status=0
+    if [[ $# -eq 0 ]]; then
+        # -l so the shell reads /etc/profile and comes up as a login shell,
+        # which is what makes PATH and the prompt inside the chroot its own.
+        chroot "${destination}" /bin/bash -l || status=$?
+    else
+        chroot "${destination}" "$@" || status=$?
+    fi
+
+    # Unmounting here as well as from the trap means the "left" line comes after
+    # the filesystems are actually gone rather than before.
+    unmount_all
+    trap - EXIT
+    log "left ${destination}"
+    return "${status}"
+}
+
+main "$@"

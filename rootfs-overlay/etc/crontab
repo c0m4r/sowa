@@ -1,0 +1,6 @@
+# System-wide Cronie schedule for Sowa.
+#
+# Unlike a user's crontab, each active line has a user field:
+# minute hour day-of-month month day-of-week user command
+#
+# Add site-specific schedules here or place one file per schedule in /etc/cron.d.

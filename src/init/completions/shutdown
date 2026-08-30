@@ -1,0 +1,36 @@
+# bash completion for shutdown(8)                          -*- shell-script -*-
+# shellcheck shell=bash
+#
+# The time argument is the interesting one. It is "now", "+MINUTES" or
+# "HH:MM", and only the first of those can be offered as a word - the other two
+# are numbers this file has no business guessing. So "now" is offered, and a
+# "+" or a digit already typed is left alone rather than completed to something
+# wrong.
+
+_sowa_comp_shutdown()
+{
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    local previous="${COMP_WORDS[COMP_CWORD - 1]}"
+    local index
+
+    if [[ ${previous} == -t ]]; then
+        return 0
+    fi
+    if [[ ${current} == -* ]]; then
+        mapfile -t COMPREPLY < <(
+            compgen -W "-r -h -H -P -k -c -t" -- "${current}"
+        )
+        return 0
+    fi
+    # Past the time argument the rest of the line is the message shown on the
+    # console, which is free text.
+    for ((index = 1; index < COMP_CWORD; index++)); do
+        case "${COMP_WORDS[index]}" in
+            -*) continue ;;
+            *) [[ ${COMP_WORDS[index - 1]} == -t ]] || return 0 ;;
+        esac
+    done
+    mapfile -t COMPREPLY < <(compgen -W "now" -- "${current}")
+}
+
+complete -F _sowa_comp_shutdown shutdown

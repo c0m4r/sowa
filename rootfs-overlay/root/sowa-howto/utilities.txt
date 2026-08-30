@@ -1,0 +1,51 @@
+The base utilities
+==================
+
+The commands in /usr/bin are the GNU ones - coreutils, grep, sed, gawk,
+findutils, diffutils, make and perl - plus util-linux, procps-ng, shadow and
+the archivers, so "ls --color", "grep -r", "sed -i", "find -printf", "mount -o",
+"ps aux", "top", "free -h" and "tar xf" all behave the way they do anywhere
+else.
+
+Downloads have two programs, and they are both the real ones: curl fetches a
+URL, and GNU wget walks a site with -r, -m and -np.
+
+Storage has the matching administration suites: e2fsprogs, xfsprogs and
+btrfs-progs for filesystems, mdadm/mdmon for Linux software RAID, and LVM2 plus
+dmsetup for logical volumes. See storage.txt for the boot behavior and first
+commands.
+
+DNS has the real tools: ISC BIND supplies dig, host, nslookup and delv, and the
+same package brings named, so this machine can be a resolver or a name server
+rather than only ask one. named ships switched off - "chkconfig named on" and
+"service named start" turn it on, and /etc/named.conf as installed answers on
+127.0.0.1 alone until you widen it.
+
+    dig anthropic.com                # the whole answer, with flags and timing
+    dig +short anthropic.com         # just the addresses
+    dig @1.1.1.1 example.com MX      # ask a particular server for a record
+    delv anthropic.com               # the same, with DNSSEC validation shown
+    named-checkconf -z /etc/named.conf   # check the config and every zone
+    rndc status                      # ask a running named how it is doing
+
+Three names the image answers with an explanation rather than a program. nc
+explains how to install Nmap for ncat; traceroute points at mtr, and lsof at
+util-linux's lsfd. Typing any of them prints how to reach the real one.
+
+Two more names are gone with nothing in their place: use tar instead of cpio -
+it reads and writes the same archive formats, including the newc an initramfs
+is made of - and "ls -R" or find instead of tree.
+
+/bin holds four names and no others: bash, bashbug, sh and vi. Everything else
+in the image lives under /usr, so nothing shadows anything.
+
+/usr/local/bin and /usr/local/sbin come first on PATH and start out empty. That
+is where something you compile here belongs: no package owns anything under
+/usr/local, so an upgrade cannot touch it and your build wins over the packaged
+program of the same name.
+
+Tab completion is on: bash-completion is installed and loaded from
+/etc/profile.d, and Sowa's own commands - sowa-pkg, service, chkconfig,
+telinit, shutdown and the installers - have completions of their own.
+
+See also: storage.txt, archives.txt, compiling.txt, manuals.txt.

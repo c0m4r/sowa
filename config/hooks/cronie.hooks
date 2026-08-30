@@ -1,0 +1,7 @@
+# Cronie. crond holds no client connections and reloads nothing on its own, so
+# an upgrade moves it onto the new program straight away, and a removal stops it
+# rather than leaving a scheduler running from an unlinked binary and firing
+# jobs for a package that is gone.
+post-upgrade|service-restart|crond
+pre-remove|service-stop|crond
+pre-remove|service-disable|crond

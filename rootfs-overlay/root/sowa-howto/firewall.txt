@@ -1,0 +1,36 @@
+Firewall
+========
+
+iptables is the legacy implementation, and the kernel has the filter, mangle,
+NAT and conntrack pieces built in. Sowa starts with INPUT and FORWARD denied and
+OUTPUT allowed, with exceptions for loopback, established and related traffic,
+and SSH. ICMP is where the two families differ on purpose: IPv4 admits echo
+request and reply only, while IPv6 admits all of ICMPv6, because neighbour
+discovery, router advertisement and path-MTU discovery are how IPv6 works at
+all. IPv6 also admits DHCPv6 replies from a link-local address, which need a
+rule because nic's DHCPv6 client reads them from a UDP socket - unlike DHCPv4,
+whose packet socket is never seen by this chain. The complete inputs are:
+
+    /etc/nic.rules.v4
+    /etc/nic.rules.v6
+
+nic 0.2 restores both files through the directives at the top of
+/etc/nic.conf whenever the network service starts. Check them with:
+
+    iptables -L -n -v
+    ip6tables -L -n -v
+    nic dry-run
+
+Edit the rules files to change the policy. From a local console, apply them
+with "service network restart". Over SSH, use nic's confirmation rollback so
+a bad rule does not make the machine unreachable:
+
+    nic restart --confirm-timeout=30
+    nic confirm
+
+Turning the network service off also turns off replay at the next boot. A
+deployment that wants firewall rules but no configured interface should keep
+the service on and use the firewall-only NIC mode described by sowa-setup.
+
+See also: network.txt, services.txt, and vpn.txt - wg-quick installs rules of
+its own when a peer routes everything.

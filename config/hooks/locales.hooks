@@ -1,0 +1,22 @@
+# The locales.
+#
+# The package carries a compiled archive, and a compiled archive belongs to the
+# machine rather than to the repository: what is in it is whatever
+# /etc/locale.gen says, and /etc/locale.gen is configuration, so a machine that
+# added Polish and Japanese has an archive the package's own copy knows nothing
+# about. Installing or upgrading the package puts the shipped archive in place
+# and would silently take those locales away again - every program on the
+# machine falling back to C at the next login, which is a broken system that
+# nothing has said anything about.
+#
+# So the archive is rebuilt from the file, here, after the files are in place.
+# On a first install that reproduces exactly what the package shipped, which
+# costs a second and settles the question; on an upgrade it puts the machine's
+# own locales back. It also picks up the case worth having: a glibc upgrade
+# whose archive format or locale definitions moved on regenerates every locale
+# from the definitions that came with it.
+#
+# There is no pre-remove counterpart. Removing this package removes the archive
+# with it, which is the intended effect, and there is nothing to stop.
+post-install|setup|/usr/sbin/locale-gen
+post-upgrade|setup|/usr/sbin/locale-gen

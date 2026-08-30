@@ -1,0 +1,52 @@
+.Dd August 17, 2026
+.Dt RUNLEVEL 8
+.Os Sowa
+.Sh NAME
+.Nm runlevel
+.Nd print the previous and current runlevel
+.Sh SYNOPSIS
+.Nm
+.Sh DESCRIPTION
+.Nm
+prints the runlevel the system was in before the current one and the runlevel
+it is in now, separated by a space.
+.Ql N
+stands for
+.Dq there was no previous one ,
+which is what a machine that has been in the same runlevel since it booted
+reports.
+.Pp
+It takes no options.
+.Sh FILES
+.Bl -tag -width "/run/initrunlevel" -compact
+.It Pa /run/initrunlevel
+where
+.Xr init 8
+records the runlevel.
+System V read this out of utmp; glibc 2.42 removed the functions that wrote
+utmp, so nothing on a Sowa system produces that record and
+.Xr init 8
+keeps a file of its own instead.
+The output is unchanged.
+.El
+.Sh EXIT STATUS
+.Ex -std
+A system whose runlevel cannot be read - which means
+.Xr init 8
+has not recorded one yet - prints
+.Ql unknown
+and exits 1.
+.Sh EXAMPLES
+.Bd -literal -offset indent
+$ runlevel
+N 3
+.Ed
+.Pp
+The current runlevel alone, which is what a script wants:
+.Bd -literal -offset indent
+read -r previous current < <(runlevel)
+.Ed
+.Sh SEE ALSO
+.Xr chkconfig 8 ,
+.Xr init 8 ,
+.Xr telinit 8

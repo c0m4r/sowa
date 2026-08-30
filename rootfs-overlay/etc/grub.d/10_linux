@@ -1,0 +1,60 @@
+#!/bin/sh
+set -e
+
+# grub-mkconfig helper script for Sowa.
+#
+# Upstream's 10_linux looks for /boot/vmlinuz-<version> and boots it through an
+# initramfs, remounting the root read-write from there. Sowa has neither: its
+# kernel is /boot/vmlinuz with no version suffix, and it is booted directly -
+# root is mounted read-write on the kernel command line (rw) because there is no
+# initramfs to remount it, and init is named there too. This is the Sowa-shaped
+# replacement for that script.
+
+# pkgdatadir is exported by grub-mkconfig before it runs the scripts in
+# /etc/grub.d; the library itself fills in the rest of the paths it needs.
+# shellcheck disable=SC2154
+. "$pkgdatadir/grub-mkconfig_lib"
+
+CLASS="--class gnu-linux --class gnu --class os"
+
+if [ -z "${GRUB_DISTRIBUTOR:-}" ] ; then
+  OS="Sowa Linux"
+else
+  OS="${GRUB_DISTRIBUTOR}"
+fi
+
+# The name root= carries. Sowa's own installer names the root by the PARTUUID it
+# reads from the MBR or GPT table, which the kernel resolves natively with no
+# initramfs. A filesystem with no PARTUUID (a whole-disk filesystem, say) falls
+# back to the raw device rather than naming nothing.
+if [ -z "${GRUB_DEVICE_PARTUUID:-}" ] ; then
+  LINUX_ROOT_DEVICE=${GRUB_DEVICE}
+else
+  LINUX_ROOT_DEVICE="PARTUUID=${GRUB_DEVICE_PARTUUID}"
+fi
+
+# The guarded serial probe, the way the live ISO's own grub.cfg writes it:
+# GRUB's ns8250 driver only registers a port whose line status register reads
+# back something other than 0xff, so "serial" fails on a machine with no UART
+# and succeeds under QEMU. Naming a terminal GRUB never registered is an error,
+# which is why the terminal lines are inside the test rather than beside it.
+cat << EOF
+if serial --unit=0 --speed=115200; then
+    terminal_input serial console
+    terminal_output serial console
+fi
+EOF
+
+# /boot/vmlinuz is the kernel the image installs; the versioned names are
+# accepted so a kernel dropped into /boot by hand is found too. Sowa boots it
+# directly: rw, because the kernel itself mounts the root read-write, and no
+# initrd line, because there is none.
+for linux in /boot/vmlinuz /boot/vmlinuz-* /boot/kernel-* ; do
+    if grub_file_is_not_garbage "$linux" ; then
+        cat << EOF
+menuentry "${OS}" ${CLASS} {
+    linux ${linux} root=${LINUX_ROOT_DEVICE} rw ${GRUB_CMDLINE_LINUX}
+}
+EOF
+    fi
+done

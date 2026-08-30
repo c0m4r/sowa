@@ -1,0 +1,53 @@
+.Dd August 22, 2026
+.Dt SOWA-MONITOR 8
+.Os Sowa
+.Sh NAME
+.Nm sowa-monitor
+.Nd serve a read-only live system dashboard on a Unix socket
+.Sh SYNOPSIS
+.Nm
+.Op Fl Fl socket Ar path
+.Op Fl Fl static-root Ar directory
+.Op Fl Fl user Ar user Fl Fl group Ar group
+.Sh DESCRIPTION
+.Nm
+collects bounded telemetry from
+.Pa /proc ,
+.Pa /sys ,
+the mounted filesystems and the Sowa package and service state.
+It serves a dashboard and a versioned JSON snapshot on a Unix socket.
+It does not listen on an IP address, execute commands, accept filesystem paths
+from requests, or implement a state-changing HTTP method.
+.Pp
+The packaged service creates
+.Pa /run/sowa-monitor/sowa-monitor.sock
+mode 0660, changes its owner and group to
+.Dq nobody ,
+and permanently drops to that account before accepting a request.
+Use nginx with authentication and TLS to publish it.
+.Sh HTTP INTERFACE
+.Bl -tag -width "/api/v1/summary"
+.It Pa /
+Dashboard.
+.It Pa /api/v1/summary
+Current system telemetry as JSON.
+.It Pa /healthz
+Process liveness as JSON.
+.El
+.Pp
+Only GET and HEAD are accepted.
+.Sh FILES
+.Bl -tag -width "/usr/share/doc/sowa-monitor/nginx.conf.example"
+.It Pa /run/sowa-monitor/sowa-monitor.sock
+Default listening socket.
+.It Pa /usr/share/sowa-monitor
+Dashboard assets.
+.It Pa /usr/share/doc/sowa-monitor/nginx.conf.example
+Authenticated TLS reverse-proxy example.
+.It Pa /var/log/sowa-monitor.log
+Service diagnostics.
+.El
+.Sh SEE ALSO
+.Xr nginx 8 ,
+.Xr service 8 ,
+.Xr chkconfig 8

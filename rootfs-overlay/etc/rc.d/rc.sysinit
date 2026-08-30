@@ -1,0 +1,176 @@
+#!/bin/bash
+#
+# /etc/rc.d/rc.sysinit - the first thing init runs, before any runlevel.
+#
+# It brings the system from "a kernel with a root filesystem" to "a system the
+# rc scripts can run in": the virtual filesystems, /dev, /run, the hostname and
+# the loopback interface. Nothing that belongs to a service goes here - that is
+# what /etc/rc.d/init.d is for.
+#
+# It runs on both of the ways Sowa boots: from the live medium, where liveinit
+# has already mounted the root - a tmpfs overlaid on the squashfs - and moved
+# /proc, /sys, /dev and /run into it before handing over, and from a disk,
+# where the kernel has mounted the root read-write and may have mounted /dev
+# itself. Everything below tests for a mount before making it, which is what
+# lets one script serve both.
+
+set -u
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+# The image builder and installers create /tmp, but an empty directory can be
+# lost from an older or hand-built root filesystem. Restore it before services
+# start, and enforce the sticky mode that lets every account create files
+# without letting one account remove another's.
+mkdir -p /tmp
+chmod 1777 /tmp
+
+mounted() {
+    grep -q " $1 " /proc/self/mounts 2>/dev/null
+}
+
+# /proc has to be first: every other check here reads /proc/self/mounts.
+if ! grep -q ' /proc proc ' /proc/self/mounts 2>/dev/null; then
+    mount -t proc -o nosuid,nodev,noexec proc /proc
+fi
+
+# The function library, for read_uptime_cs and timing_emit. It is sourced here
+# rather than at the top because its clock is /proc/uptime and its record of
+# which boot this is comes from /proc too, and /proc has only just appeared.
+# Sourcing it defines functions and sets a few variables; it does nothing else,
+# and nothing below shares a name with any of them.
+#
+# When this script started is read now rather than at the end, because the point
+# of the number is to cover the mounting below rather than to begin after it.
+sysinit_began=""
+if [[ -r /etc/rc.d/init.d/functions ]]; then
+    # What is sourced at runtime is the installed path; what shellcheck reads is
+    # the source it is installed from, which is src/init/functions in this
+    # repository - so read_uptime_cs and the variables it sets are known here.
+    # shellcheck source-path=SCRIPTDIR
+    # shellcheck source=../../../src/init/functions
+    . /etc/rc.d/init.d/functions
+    read_uptime_cs && sysinit_began="${uptime_cs}"
+fi
+
+mounted /sys || mount -t sysfs -o nosuid,nodev,noexec sysfs /sys
+
+# The unified cgroup hierarchy, which lives inside /sys and so has to come after
+# it. Nothing in the base image asks for cgroups, but every container runtime
+# does: dockerd refuses to start with "Devices cgroup isn't mounted" when it
+# finds none, and runc has nowhere to record a container's limits. The kernel
+# creates /sys/fs/cgroup as an empty mount point whenever CONFIG_CGROUPS is on,
+# which is why the directory is there and unwritable before this runs.
+#
+# Only v2 is mounted, not the v1 controller-per-directory layout: 6.18 has begun
+# gating the v1 controllers behind Kconfig symbols of their own - CONFIG_CPUSETS_V1
+# is already off in this kernel - and v2 is the interface runtimes are written
+# against now. The directory test is for a kernel built without CONFIG_CGROUPS,
+# which should boot quietly rather than fail a mount at every start.
+if [[ -d /sys/fs/cgroup ]] && ! mounted /sys/fs/cgroup; then
+    mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup
+fi
+
+# CONFIG_DEVTMPFS_MOUNT has the kernel mount this one itself when it mounts a
+# real root, so on a disk install it is already there; the initramfs case is
+# what needs it.
+mounted /dev || mount -t devtmpfs -o nosuid,mode=0755 devtmpfs /dev
+
+# Unix98 PTYs. devtmpfs supplies /dev/ptmx, but openpty(3) also needs the slave
+# side under /dev/pts, so sshd cannot allocate a terminal until this is
+# mounted. The mount point is made after devtmpfs so it is not shadowed by it.
+mkdir -p /dev/pts
+mounted /dev/pts || \
+    mount -t devpts -o nosuid,noexec,gid=5,mode=620,ptmxmode=666 devpts /dev/pts
+
+# POSIX shared memory, which CPython and anything using shm_open(3) expect.
+mkdir -p /dev/shm
+mounted /dev/shm || mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /dev/shm
+
+ln -sfn /proc/self/fd /dev/fd
+ln -sfn /proc/self/fd/0 /dev/stdin
+ln -sfn /proc/self/fd/1 /dev/stdout
+ln -sfn /proc/self/fd/2 /dev/stderr
+
+# /run is where every pid file, lock and socket in the system goes, so it has to
+# be empty at every boot. On a disk install it would otherwise be whatever the
+# last boot left on the root filesystem.
+mounted /run || mount -t tmpfs -o nosuid,nodev,mode=0755 tmpfs /run
+mkdir -p /run/lock/subsys
+# Where the init scripts file what each of them cost. Made here, once, so that
+# neither the function library nor a service has to check for it at every record.
+# See sowa-boottime(8).
+mkdir -p /run/sowa
+
+# Assemble software RAID before scanning LVM, because an md array can itself be
+# an LVM physical volume.  Finding no arrays is the ordinary case and mdadm
+# reports it as a non-zero exit, so that result is quiet; an administrator can
+# add stable ARRAY records to /etc/mdadm.conf when automatic discovery is not
+# appropriate for a particular machine.
+if command -v mdadm >/dev/null 2>&1; then
+    mdadm --assemble --scan --auto=yes >/run/sowa/mdadm-assemble.log 2>&1 || true
+fi
+
+# Make logical volumes available before mount -a reaches an /etc/fstab entry
+# backed by one.  --sysinit suppresses background polling and other daemon
+# assumptions during this early, single-threaded part of boot.
+if command -v vgchange >/dev/null 2>&1; then
+    if ! vgchange --activate y --sysinit >/run/sowa/lvm-activate.log 2>&1; then
+        printf 'rc.sysinit: not every LVM volume group could be activated\n'
+    fi
+fi
+
+# Who is logged in, and who has been. login records a session in /run/utmp and
+# appends it to /var/log/wtmp, and neither call creates the file it writes to:
+# with no utmp there, "who" and "w" have nothing to read and login says it
+# could not update the entry. utmp belongs on the tmpfs, because it describes
+# this boot only; wtmp is the history, so it survives on /var/log.
+[[ -f /run/utmp ]] || { : > /run/utmp && chmod 0644 /run/utmp; }
+[[ -f /var/log/wtmp ]] || { : > /var/log/wtmp && chmod 0644 /var/log/wtmp; }
+
+# init created its control FIFO on /run before this script mounted over it.
+# SIGUSR1 is how it is asked to make another one on the tmpfs that is there now.
+kill -USR1 1
+ln -sfn /run/initctl /dev/initctl
+
+# Anything else /etc/fstab asks for. The initramfs carries no fstab at all; an
+# installed system has one, listing a root the kernel has already mounted -
+# mount -a skips what is mounted - and whatever has been added to it since.
+if [[ -f /etc/fstab ]]; then
+    mount -a || printf 'rc.sysinit: not everything in /etc/fstab could be mounted\n'
+    # mount -a walks past every "swap" line without doing anything with it, so a
+    # partition an installer set aside for swap stays unused until this asks for
+    # it. It is separate from the zram service, which needs no fstab entry and
+    # is started later, in the runlevel: a machine can have either, both - zram
+    # takes the higher priority and is filled first - or, as the image ships,
+    # only the compressed one.
+    swapon -a \
+        || printf 'rc.sysinit: not every swap area in /etc/fstab could be enabled\n'
+fi
+
+# The hostname is set through /proc rather than with hostname(1), so that it
+# does not depend on which of the two programs of that name the image has.
+if [[ -r /etc/hostname ]]; then
+    read -r configured_hostname < /etc/hostname || configured_hostname=""
+    if [[ -n "${configured_hostname}" ]]; then
+        printf '%s' "${configured_hostname}" > /proc/sys/kernel/hostname
+    fi
+fi
+
+# Loopback. Everything that talks to 127.0.0.1 - chrony's chronyc among them -
+# needs it, and no network configuration of any kind is required to bring it up.
+ip link set dev lo up 2>/dev/null || true
+
+# What all of the above cost, filed the way a service files its own. It is the
+# first line of the boot's timing record and the only one covering work that
+# happens before any runlevel, which is what makes the gap between the kernel
+# handing over and the first service starting visible rather than inferred.
+#
+# It has to be last: the record goes to /run, which is only a tmpfs a few lines
+# above this, and to /var/log, which "mount -a" may only just have provided.
+if [[ -n "${sysinit_began}" ]]; then
+    timing_emit "${sysinit_began}" ok "Mounting and setting up" || true
+fi
+
+exit 0

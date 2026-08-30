@@ -1,0 +1,202 @@
+#!/bin/bash
+#
+# chkconfig: - 01 99
+# description: grow the root partition and its filesystem into free disk space
+#
+# The leading "-" is the point: this service does nothing on a machine
+# sowa-setup installed, because sowa-setup already gave root every sector the
+# disk had. What it is for is an image that was written onto a disk larger than
+# itself - the prebuilt disk image (see docs/disk-image.md) is deliberately
+# only as large as it has to be, so that the download is small and the dd is
+# short - and that image is the one thing that ships with this service turned
+# on. Everything else has to ask for it with "chkconfig growroot on".
+#
+# It is the first service of the runlevel. Everything started after it that
+# writes to the disk is better off writing into the grown filesystem than into
+# the last few megabytes of the small one.
+#
+# What it does is the procedure in docs/resize.md, with the decisions made by
+# reading sysfs instead of being typed: extend the last partition to the end of
+# the disk, tell the running kernel that the partition changed, then grow the
+# filesystem inside it. Every step is a no-op on a disk that is already full, so
+# leaving it on costs one walk over sysfs per boot after the first - and a disk
+# enlarged later (a VM's virtual disk, most often) is picked up at the next boot
+# rather than needing the manual procedure.
+#
+# It refuses rather than guesses. Root has to be ext2/3/4, XFS or Btrfs, mounted
+# read-write, on a partition that is the last one on its disk. An LVM volume, a
+# whole-disk filesystem with no partition table, and a root that is not the last
+# partition are all reported and left alone: none of them can be grown by moving
+# one end of one partition, and none of them is a thing to improvise about at
+# boot on somebody else's data.
+#
+# What sfdisk, partx and the filesystem grow tool have to say goes to
+# /var/log/growroot.log.
+
+. /etc/rc.d/init.d/functions
+
+name=growroot
+logfile=/var/log/growroot.log
+
+# The free space at the end of the disk that is worth a partition rewrite, in
+# 512-byte sectors. sfdisk aligns a partition end to a 1 MiB boundary, so a disk
+# that is already full can still show a few hundred sectors of tail, and growing
+# into them would rewrite the partition table at every boot to no effect.
+readonly minimum_free_sectors=2048
+
+# Where root is and what it is. findmnt reads the kernel's mount table, so this
+# is the filesystem that is actually mounted rather than what /etc/fstab hoped.
+root_source() { findmnt --noheadings --output SOURCE --mountpoint / ; }
+root_fstype() { findmnt --noheadings --output FSTYPE --mountpoint / ; }
+root_options() { findmnt --noheadings --output OPTIONS --mountpoint / ; }
+
+# The sysfs directory of a block device, by the name the kernel knows it as.
+# /dev/vda2 and /dev/mapper/... both name a device; only the former is a
+# partition of a disk, and this is what tells them apart - a device with no
+# entry of its own under /sys/class/block is one nothing here can reason about.
+sysfs_of() {
+    local sysfs="/sys/class/block/${1##*/}"
+
+    [[ -f "${sysfs}/dev" ]] || return 1
+    printf '%s\n' "${sysfs}"
+}
+
+# Reports the disk a partition belongs to, its number on that disk, and the
+# sectors left after it, as three fields. Everything this service decides is
+# decided from these, and every one of them is read rather than derived from the
+# device's name: /dev/nvme0n1p2 and /dev/sda2 spell the same relationship
+# differently, and sysfs spells it once.
+partition_geometry() {
+    local sysfs="$1"
+    local disk_sysfs disk number start size disk_size free other
+
+    # The parent of a partition's sysfs directory is its disk. A device that is
+    # not a partition has no "partition" file and no disk above it.
+    [[ -f "${sysfs}/partition" ]] || return 1
+    disk_sysfs="$(dirname "$(readlink -f "${sysfs}")")"
+    [[ -f "${disk_sysfs}/size" ]] || return 1
+
+    disk="$(basename "${disk_sysfs}")"
+    number="$(< "${sysfs}/partition")"
+    start="$(< "${sysfs}/start")"
+    size="$(< "${sysfs}/size")"
+    disk_size="$(< "${disk_sysfs}/size")"
+
+    # The last partition, checked rather than assumed. Growing a partition that
+    # something else begins after would hand the filesystem blocks that belong
+    # to another one.
+    for other in "${disk_sysfs}/${disk}"*/start; do
+        [[ -f "${other}" ]] || continue
+        (( $(< "${other}") <= start )) || return 1
+    done
+
+    free=$(( disk_size - start - size ))
+    printf '%s %s %s\n' "${disk}" "${number}" "${free}"
+}
+
+start() {
+    local device fstype options sysfs geometry disk number free
+
+    begin "Starting ${name}"
+    device="$(root_source)"
+    fstype="$(root_fstype)"
+    options="$(root_options)"
+
+    if [[ -z "${device}" || -z "${fstype}" ]]; then
+        failed
+        printf '%s: the kernel does not say what root is mounted from\n' "${name}" >&2
+        return 1
+    fi
+    # Each supported filesystem has a different online-grow interface.
+    case "${fstype}" in
+        ext2 | ext3 | ext4 | xfs | btrfs) ;;
+        *)
+            skipped
+            printf '%s: root is %s, which this service cannot grow\n' "${name}" "${fstype}"
+            return 0
+            ;;
+    esac
+    # An online grow writes to the filesystem it is growing.
+    if [[ ",${options}," == *,ro,* ]]; then
+        skipped
+        printf '%s: root is mounted read-only\n' "${name}"
+        return 0
+    fi
+
+    if ! sysfs="$(sysfs_of "${device}")"; then
+        skipped
+        printf '%s: %s is not a block device this can resize\n' "${name}" "${device}"
+        return 0
+    fi
+    if ! geometry="$(partition_geometry "${sysfs}")"; then
+        skipped
+        printf '%s: %s is not the last partition of a disk\n' "${name}" "${device}"
+        return 0
+    fi
+    read -r disk number free <<< "${geometry}"
+    if (( free <= minimum_free_sectors )); then
+        skipped
+        printf '%s: %s already reaches the end of /dev/%s\n' "${name}" "${device}" "${disk}"
+        return 0
+    fi
+
+    # ", +" is a one-partition sfdisk script: an empty start field leaves the
+    # start where it is, and "+" for the size takes everything available.
+    # --force is what gets past the warning about editing a disk in use, and
+    # partx -u is what makes the kernel notice - rewriting the table does not
+    # change the size it has already registered for the partition, and
+    # resize2fs asks the kernel rather than the disk.
+    if ! { printf ', +\n' | sfdisk --no-reread --force -N "${number}" "/dev/${disk}" \
+        && partx --update "/dev/${disk}" \
+        && case "${fstype}" in
+            ext2|ext3|ext4) resize2fs "${device}" ;;
+            xfs) xfs_growfs / ;;
+            btrfs) btrfs filesystem resize max / ;;
+        esac; } >> "${logfile}" 2>&1; then
+        failed
+        printf '%s: %s could not be grown; see %s\n' "${name}" "${device}" "${logfile}" >&2
+        return 1
+    fi
+    subsys_mark "${name}"
+    ok
+}
+
+# What the disk looks like now, which is the only thing there is to report: this
+# service leaves nothing running behind it.
+report() {
+    local device sysfs geometry disk number free
+
+    device="$(root_source)"
+    [[ -n "${device}" ]] || { printf '%s: root is not mounted from a device\n' "${name}"; return 3; }
+    printf 'root:       %s (%s)\n' "${device}" "$(root_fstype)"
+    printf 'filesystem: %s\n' "$(df -h --output=size,used,avail / | tail -n 1)"
+    if sysfs="$(sysfs_of "${device}")" && geometry="$(partition_geometry "${sysfs}")"; then
+        read -r disk number free <<< "${geometry}"
+        printf 'partition:  %s of /dev/%s, %s MiB unpartitioned after it\n' \
+            "${number}" "${disk}" "$(( free / 2048 ))"
+    else
+        printf 'partition:  not the last partition of a disk; nothing to grow\n'
+    fi
+    return 0
+}
+
+case "${1:-}" in
+    start)
+        start
+        ;;
+    stop)
+        # Nothing to stop. A grown filesystem is not a service that is running,
+        # and shrinking it back would need it unmounted and would lose data.
+        subsys_clear "${name}"
+        ;;
+    restart)
+        start
+        ;;
+    status)
+        report
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|status}\n' "$0" >&2
+        exit 2
+        ;;
+esac

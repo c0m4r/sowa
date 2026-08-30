@@ -1,0 +1,86 @@
+.Dd August 17, 2026
+.Dt HALT 8
+.Os Sowa
+.Sh NAME
+.Nm halt ,
+.Nm poweroff ,
+.Nm reboot
+.Nd stop, power off or restart the machine
+.Sh SYNOPSIS
+.Nm halt
+.Op Fl f
+.Op Fl p
+.Op Fl n
+.Nm poweroff
+.Op Fl f
+.Op Fl n
+.Nm reboot
+.Op Fl f
+.Op Fl n
+.Sh DESCRIPTION
+These are one program, told apart by the name it is run under, exactly as
+System V's were.
+.Pp
+Outside runlevels 0 and 6 they are a polite way of spelling
+.Xr shutdown 8 :
+the command becomes
+.Ic shutdown Fl r Ns | Ns Fl P Ns | Ns Fl H Cm now ,
+so the request goes to
+.Xr init 8 ,
+which stops the services and takes the machine down in order.
+Inside runlevel 0 or 6 the shutdown is already happening - these are what the
+last rc script would call - so the kernel call is made directly.
+.Fl f
+asks for that directly from anywhere, and is what to use when
+.Xr init 8
+is not answering.
+.Pp
+The three names differ in what the machine does once it has stopped:
+.Bl -tag -width poweroff -offset indent
+.It Nm halt
+stop the machine, leaving the power on.
+.It Nm poweroff
+stop it and cut the power.
+.It Nm reboot
+start it again.
+.El
+.Sh OPTIONS
+.Bl -tag -width "-p"
+.It Fl f
+Make the kernel call now, without asking
+.Xr init 8
+to stop anything first.
+Nothing is given a chance to save what it is holding.
+.It Fl p
+Power off rather than halt.
+.Nm halt
+only;
+.Nm poweroff
+is this option with a name.
+.It Fl n
+Do not
+.Xr sync 2
+before the kernel call.
+.El
+.Pp
+.Fl w , Fl d
+and
+.Fl i
+are accepted and ignored: nothing here writes wtmp, and there are no modules to
+unload or interfaces to take down first.
+.Sh EXIT STATUS
+.Ex -std
+A program that has done its work does not return at all.
+.Sh SEE ALSO
+.Xr init 8 ,
+.Xr shutdown 8 ,
+.Xr telinit 8
+.Sh CAVEATS
+Only root can do any of this.
+.Pp
+.Fl f
+is a lost-work switch, not a faster one: filesystems are not unmounted, and a
+daemon holding data in memory is killed with it.
+Without
+.Fl f
+the same command is orderly, and is what to type.

@@ -1,0 +1,143 @@
+.Dd August 23, 2026
+.Dt SOWA-PKG.CONF 5
+.Os Sowa
+.Sh NAME
+.Nm sowa-pkg.conf
+.Nd configuration for the Sowa package manager
+.Sh SYNOPSIS
+.Pa /etc/sowa/pkg.conf
+.Sh DESCRIPTION
+This file is data.
+.Xr sowa-pkg 8
+reads it a line at a time: a setting, an
+.Sq = ,
+and a value with at most one layer of quotes; anything after a
+.Sq #
+is a comment.
+It is read after the command line has been parsed, and the whole of it is five
+settings.
+.Pp
+Nothing in it is executed.
+A key that is not one of the five, a key given twice, a value carrying a
+.Sq $ ,
+a backquote, a backslash, a quote or whitespace, a value outside its own
+setting's grammar, or any control character anywhere in the file, is refused
+with the line named \(em and the file is not partly applied.
+.Pp
+That is not fussiness for its own sake.
+Under
+.Fl -root Ar dir
+the file read is
+.Pa Ar dir Ns Pa /etc/sowa/pkg.conf ,
+which is what lets one machine manage another root with settings of its own \(em
+and that root is an image being assembled, a disk that came from somewhere else,
+or a container root somebody handed over, while
+.Xr sowa-pkg 8
+is running on
+.Em this
+machine, usually as root.
+This file used to be sourced.
+Reading it as data is what keeps repairing such a tree from running that tree's
+configuration file.
+.Bl -tag -width SOWA_REQUIRE_SIGNATURE
+.It Ev SOWA_REPO_URL
+Where the repository is: an
+.Ql http
+or
+.Ql https
+URL of a host, an optional port and a path, and nothing else.
+No credentials, no query and no fragment \(em none of them mean anything to a
+directory of files, and refusing them keeps a configuration file from steering
+.Xr curl 1
+somewhere with a string that still looks like a repository URL.
+Every request appends
+.Pa /name
+to it, so a trailing slash is stripped rather than left to produce
+.Pa //name ,
+which most servers answer and some do not.
+There is no default: a file that leaves this empty, or one still carrying the
+placeholder URL the image is built with, makes
+.Xr sowa-pkg 8
+stop and say so rather than fetch from somewhere unintended.
+.Pp
+Plain
+.Ql http
+works and is warned about once per fetch.
+The signature is what an update trusts, so it does not let anyone on the path
+ship code to this machine; what it does let them do is see what this machine
+asks for.
+.It Ev SOWA_REPO_ARCH
+The architecture this system is.
+.Cm update
+refuses an index offering a package built for anything else, which is the check
+that keeps a mirror for another architecture from being installed one package
+at a time.
+The default is
+.Ql x86_64 .
+.It Ev SOWA_REPO_KEY
+The Ed25519 public key the index must be signed with, as an absolute path.
+The default is
+.Pa /etc/sowa/keys/sowa-repo.pub .
+Its private half never leaves the machine that publishes the repository.
+.It Ev SOWA_REQUIRE_SIGNATURE
+Whether an index must carry a valid signature.
+The default is 1, and leaving it there is the whole of the trust model: the
+signature is what makes a compromised or impersonated server unable to ship
+code to this machine, since nothing else about a plain HTTPS directory can.
+Set to 0 only for a repository you built and cannot sign, and note that
+.Xr sowa-pkg 8
+then warns on every update.
+.Pp
+A signature says who wrote an index, not that it is the newest one they wrote.
+The serial and expiry inside the signed index answer that second question; see
+.Sx REPOSITORY FRESHNESS
+in
+.Xr sowa-pkg 8 .
+.It Ev SOWA_RUN_HOOKS
+Whether to take the steps packages declare - stopping a daemon before its
+program is removed, restarting one an upgrade has replaced, running the setup a
+package needs before it works at all.
+The default is 1.
+Setting it to 0 makes every install and removal purely a matter of files, which
+is what a machine that manages its own services wants; it also means removing a
+package leaves its daemon running.
+.Pp
+.Fl -no-hooks
+on the command line is read first and is not undone by a file that leaves hooks
+on, so the switch always wins.
+.El
+.Sh FILES
+.Bl -tag -width "/etc/sowa/keys" -compact
+.It Pa /etc/sowa/pkg.conf
+this file.
+It is configuration, so
+.Xr sowa-pkg 8
+keeps a locally edited copy across an upgrade and writes the packaged version
+beside it as
+.Pa pkg.conf.tpknew .
+.It Pa /etc/sowa/keys
+where repository keys live.
+.El
+.Sh EXAMPLES
+A repository of your own, signed with a key of your own:
+.Bd -literal -offset indent
+SOWA_REPO_URL="https://packages.example.net/sowa/x86_64"
+SOWA_REPO_ARCH="x86_64"
+SOWA_REPO_KEY="/etc/sowa/keys/local-repo.pub"
+SOWA_REQUIRE_SIGNATURE=1
+SOWA_RUN_HOOKS=1
+.Ed
+.Sh SEE ALSO
+.Xr sowa-pkg 8
+.Sh CAVEATS
+Anyone who can write this file decides where the machine gets its packages and
+which key those packages have to be signed with, which on the running system is
+the same authority as writing
+.Pa /bin
+directly.
+It is
+.Pa 0644
+root-owned for that reason.
+.Pp
+What is no longer true is that reading it runs it: a line here is a setting, not
+a command.

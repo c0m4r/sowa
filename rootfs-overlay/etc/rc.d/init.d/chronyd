@@ -1,0 +1,50 @@
+#!/bin/bash
+#
+# chkconfig: 2345 40 60
+# description: chrony NTP client and server
+#
+# chronyd is started before sshd and crond so that a large clock correction
+# happens before anything schedules work against the clock. -d keeps it in the
+# foreground and sends its log to stderr, which the daemon helper appends to a
+# file of chronyd's own rather than mixing it into syslog's. With no network it
+# simply keeps retrying.
+
+. /etc/rc.d/init.d/functions
+
+name=chronyd
+program=/usr/sbin/chronyd
+rundir=/run/chrony
+pidfile=/run/chrony/chronyd.pid
+logfile=/var/log/chronyd.log
+
+case "${1:-}" in
+    start)
+        begin "Starting ${name}"
+        # /run is a tmpfs mounted at every boot, so chrony's directory is made
+        # here rather than shipped in the image.
+        install -d -m 0750 "${rundir}"
+        daemon --pidfile "${pidfile}" --log "${logfile}" -- \
+            "${program}" -d
+        result $?
+        ;;
+    stop)
+        begin "Stopping ${name}"
+        killproc --pidfile "${pidfile}" "${program}"
+        result $?
+        ;;
+    restart)
+        "$0" stop
+        "$0" start
+        ;;
+    status)
+        status --pidfile "${pidfile}" "${program}"
+        ;;
+    sources)
+        # The question actually worth asking of an NTP client.
+        chronyc sources
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|status|sources}\n' "$0" >&2
+        exit 2
+        ;;
+esac

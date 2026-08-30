@@ -1,0 +1,19 @@
+Accounts
+========
+
+The account tools and console login come from the shadow suite:
+
+    useradd -m -s /bin/bash alice    # and userdel -r alice
+    passwd alice                     # passwords are hashed with yescrypt
+    usermod -aG wheel alice
+    groupadd project                 # and groupmod, groupdel, gpasswd
+    su - alice
+
+Root has no password. "passwd" gives it one; that alone does not open SSH,
+which needs "PermitRootLogin yes" as well.
+
+A new account gets its shell settings from /etc/skel, which useradd copies into
+the new home directory, and from /etc/bash.bashrc, which every interactive
+shell reads first.
+
+See also: ssh.txt, which is the other half of "who can get in".

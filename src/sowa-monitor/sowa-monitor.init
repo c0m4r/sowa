@@ -1,0 +1,134 @@
+#!/bin/bash
+#
+# chkconfig: - 56 44
+# description: read-only Sowa system monitoring dashboard
+#
+# The service is deliberately off until an administrator puts authenticated
+# nginx in front of it. It never opens an IP socket: nginx reaches it through
+# /run/sowa-monitor/sowa-monitor.sock, and the backend drops to nobody after it
+# has created that socket.
+
+. /etc/rc.d/init.d/functions
+
+name=sowa-monitor
+program=/usr/sbin/sowa-monitor
+pidfile=/run/sowa-monitor.pid
+socket=/run/sowa-monitor/sowa-monitor.sock
+logfile=/var/log/sowa-monitor.log
+monitor_poll_interval=0.02
+monitor_poll_interval_cs=2
+monitor_start_timeout_cs=500
+monitor_stop_timeout_cs=1000
+monitor_kill_timeout_cs=200
+
+running_pid() {
+    local pid
+    local -a arguments=()
+
+    [[ -r "${pidfile}" ]] || return 1
+    read -r pid < "${pidfile}" 2>/dev/null || return 1
+    [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+    checkpid "${pid}" || return 1
+    # A script's /proc/PID/exe is its interpreter. Verify argv[1] as well as
+    # the PID instead, so a stale file can never identify another Python job.
+    mapfile -d '' -t arguments < "/proc/${pid}/cmdline" 2>/dev/null || return 1
+    [[ "${arguments[1]:-}" == "${program}" ]] || return 1
+    printf '%s\n' "${pid}"
+}
+
+start() {
+    local pid waited=0
+
+    begin "Starting ${name}"
+    if running_pid > /dev/null; then
+        skipped
+        return 0
+    fi
+    install -d -m 0750 -o root -g nobody /run/sowa-monitor
+    setsid "${program}" --socket "${socket}" --user nobody --group nobody \
+        >> "${logfile}" 2>&1 &
+    pid=$!
+    printf '%s\n' "${pid}" > "${pidfile}"
+
+    # Python's interpreter is the executable /proc reports, so daemon() cannot
+    # identify this shebang program. Wait for the actual socket instead, while
+    # running_pid keeps the PID bound to this exact script.
+    while (( waited < monitor_start_timeout_cs )); do
+        if [[ -S "${socket}" ]] && running_pid > /dev/null; then
+            subsys_mark "${name}"
+            ok
+            return 0
+        fi
+        running_pid > /dev/null || break
+        sleep "${monitor_poll_interval}"
+        waited=$(( waited + monitor_poll_interval_cs ))
+    done
+    if pid="$(running_pid)"; then
+        kill -TERM "${pid}" 2>/dev/null || true
+    fi
+    rm -f "${pidfile}" "${socket}"
+    failed
+}
+
+stop() {
+    local pid waited=0
+
+    begin "Stopping ${name}"
+    if ! pid="$(running_pid)"; then
+        rm -f "${pidfile}" "${socket}"
+        subsys_clear "${name}"
+        skipped
+        return 0
+    fi
+    kill -TERM "${pid}" 2>/dev/null || true
+    while (( waited < monitor_stop_timeout_cs )) && running_pid > /dev/null; do
+        sleep "${monitor_poll_interval}"
+        waited=$(( waited + monitor_poll_interval_cs ))
+    done
+    if pid="$(running_pid)"; then
+        kill -KILL "${pid}" 2>/dev/null || true
+        waited=0
+        while (( waited < monitor_kill_timeout_cs )) && running_pid > /dev/null; do
+            sleep "${monitor_poll_interval}"
+            waited=$(( waited + monitor_poll_interval_cs ))
+        done
+    fi
+    if running_pid > /dev/null; then
+        failed
+        return 1
+    fi
+    rm -f "${pidfile}" "${socket}"
+    subsys_clear "${name}"
+    ok
+}
+
+status_monitor() {
+    local pid
+
+    if pid="$(running_pid)"; then
+        printf '%s is running (pid %s)\n' "${name}" "${pid}"
+        return 0
+    fi
+    printf '%s is stopped\n' "${name}"
+    return 3
+}
+
+case "${1:-}" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    status)
+        status_monitor
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|status}\n' "$0" >&2
+        exit 2
+        ;;
+esac

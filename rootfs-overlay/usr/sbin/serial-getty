@@ -1,0 +1,84 @@
+#!/bin/bash
+#
+# serial-getty - a login prompt on a serial line, once there is a serial line.
+#
+# /etc/inittab runs one getty per console, and a serial port is the one console
+# that may not be there. agetty on a port with no UART behind it does not fail
+# and exit the way a missing device would: it opens fine - serial8250 registers
+# ttyS0 through ttyS3 for the legacy addresses whether or not a chip answers -
+# then blocks writing the prompt, gives up about ten seconds later, and exits.
+# init respawns it, and ten of those inside two minutes is exactly what init
+# calls respawning too fast, so the entry is disabled for five minutes and then
+# starts over, for the life of the machine.
+#
+# Nobody sees any of that. init reports it on /dev/console, which on the
+# machine this happens to - one booted with "console=ttyS0" and no serial port,
+# which is what the ISO's kernel command line does to a laptop - is that same
+# absent port.
+#
+# So ask the kernel first. serial8250 autoconfigures every port it registers
+# and reports what it found in /proc/tty/driver/serial: "uart:16550A" for a
+# port with a chip behind it, "uart:unknown" for one without. That file is the
+# only thing here that knows the difference - /sys/class/tty/console/active
+# lists ttyS0 either way, because it answers "which consoles did the kernel
+# register", and registering a console does not probe for the hardware.
+#
+# With no UART this waits rather than exits, because exiting is what starts the
+# respawn loop this exists to prevent. It rechecks, so a port that appears
+# later - a driver loaded after boot - still gets its prompt.
+
+set -u
+
+readonly SERIAL_PORTS=/proc/tty/driver/serial
+readonly RECHECK=60
+
+# The terminal type agetty puts in TERM for the session it hands login. This is
+# a guess about hardware at the far end of a wire, and the getty has no way to
+# ask, so the only question is which guess is wrong less often.
+#
+# It used to be vt100, which is the safest thing that could possibly be said
+# about a serial line and also the most useless. A real VT100 has no colour at
+# all - terminfo reports "colors: -1" for it, not zero - and no kdch1, the
+# capability that says what the Delete key sends. Everything that reads terminfo
+# believes it: htop draws in monochrome because it is told there are no colour
+# pairs to allocate, readline leaves Delete unbound because nothing claims the
+# sequence, and a pager asked for colour it cannot produce prints the escapes
+# themselves - "^[[93m" in caret notation, down the middle of nix --help.
+#
+# Nothing on the other end of this port has been a VT100 in forty years. It is
+# QEMU forwarding stdio to a terminal emulator, or screen, or minicom, and all
+# of them are xterm-compatible with 256 colours. So say that instead, and let
+# the rare genuine terminal be the case that has to be told:
+#
+#   s0:12345:respawn:@/usr/sbin/serial-getty ttyS0 115200 vt220
+#
+# vt220 is the conservative choice worth knowing about - still no colour, but
+# unlike vt100 it does define kdch1, so Delete works.
+readonly DEFAULT_TERM=xterm-256color
+
+line="${1:-}"
+baud="${2:-115200}"
+term="${3:-${DEFAULT_TERM}}"
+if [[ -z "${line}" ]]; then
+    printf 'usage: serial-getty <line> [baud] [termtype]\n' >&2
+    exit 2
+fi
+
+# Only the legacy 8250 lines can be phantoms. Anything else - a USB adapter, a
+# hypervisor console - exists as a device only when it is real, so there is
+# nothing to check and the getty starts straight away.
+if [[ "${line}" != ttyS[0-9]* || ! -r "${SERIAL_PORTS}" ]]; then
+    exec /usr/sbin/agetty -L -l /usr/bin/login "${baud}" "${line}" "${term}"
+fi
+
+port="${line#ttyS}"
+while :; do
+    # "0: uart:16550A port:000003F8 irq:4 ..." - the word after "uart:" is the
+    # chip the kernel found, or "unknown" when it found none. A port the file
+    # does not mention at all is not there either.
+    uart="$(sed -n "s/^${port}: *uart:\([^ ]*\).*/\1/p" "${SERIAL_PORTS}")"
+    if [[ -n "${uart}" && "${uart}" != unknown ]]; then
+        exec /usr/sbin/agetty -L -l /usr/bin/login "${baud}" "${line}" "${term}"
+    fi
+    sleep "${RECHECK}"
+done

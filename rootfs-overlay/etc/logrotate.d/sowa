@@ -1,0 +1,48 @@
+# The base system's own logs.
+#
+# Two groups, because they are refilled in two different ways.
+#
+# The first is everything the rc framework's daemon helper appends to: the
+# service is holding that file open and writing to the descriptor it was
+# started with, so renaming the file leaves it writing into something with no
+# name. copytruncate is what avoids that without restarting every service -
+# the content is copied out and the original truncated in place, so the
+# descriptor stays valid. The narrow window it leaves, where a message written
+# between the copy and the truncate is lost, is the right trade for logs that
+# are a few lines per boot.
+#
+# sowa-pkg's record is in this group for a different reason: nothing holds it
+# open at all - each run appends and closes - but a package transaction that
+# happened to be running during a rotation would be writing to the old inode,
+# and truncating in place keeps its next line in the file people read.
+/var/log/*.log {
+    weekly
+    rotate 4
+    copytruncate
+    missingok
+    notifempty
+}
+
+# The second is syslog-ng's own destinations. It keeps every destination file
+# open, so a rename is invisible to it until it is told - which is what the
+# postrotate script does. A reload rather than a restart: the daemon reopens
+# its files and keeps the sockets it is listening on, so nothing that logs
+# during the rotation is dropped.
+#
+# None of these four ends in ".log", and that is deliberate rather than
+# incidental: logrotate refuses a file named by two rules, so a syslog-ng
+# destination caught by the pattern above would be an error printed once a day
+# and a log that stopped being rotated.
+/var/log/messages
+/var/log/secure
+/var/log/cron
+/var/log/maillog {
+    weekly
+    rotate 8
+    missingok
+    notifempty
+    sharedscripts
+    postrotate
+        /sbin/service syslog-ng reload > /dev/null 2>&1 || true
+    endscript
+}

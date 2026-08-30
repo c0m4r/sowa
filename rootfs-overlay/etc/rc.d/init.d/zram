@@ -1,0 +1,231 @@
+#!/bin/bash
+#
+# chkconfig: 2345 04 96
+# description: compressed swap in RAM, as /etc/sowa/zram.conf describes it
+#
+# First of the services in every multi-user runlevel and last to be stopped.
+# The ordering is the point: swap that appears after the memory ran out is swap
+# that was not there when it mattered, and taking it away while services are
+# still running would push everything on it back into the memory they are using.
+#
+# zram is not a daemon. It creates a block device, makes swap on it and exits,
+# so there is no pid to track; the subsystem lock is what tells /etc/rc.d/rc
+# that the device is there and can be taken down again. /proc/swaps is the real
+# record, which is why stop and status read it rather than a state file - a
+# device somebody set up by hand and one this script set up are the same thing
+# to both of them.
+#
+# What zramctl, mkswap and swapon have to say goes to /var/log/zram.log. On a
+# machine with no zram in the kernel this service fails at start and says so;
+# nothing else in the system depends on it.
+
+. /etc/rc.d/init.d/functions
+
+name=zram
+config=/etc/sowa/zram.conf
+logfile=/var/log/zram.log
+# /run is the tmpfs rc.sysinit mounts, so a recorded swappiness cannot outlive
+# the boot that recorded it - which is what makes putting it back safe.
+saved_swappiness=/run/zram.swappiness
+
+# The defaults, which are what the shipped /etc/sowa/zram.conf says as well.
+# They are here rather than only there so that a machine whose configuration
+# file was removed still starts with something sensible instead of nothing.
+ZRAM_SIZE=50%
+ZRAM_ALGORITHM=zstd
+ZRAM_PRIORITY=100
+ZRAM_SWAPPINESS=100
+
+if [[ -r "${config}" ]]; then
+    # shellcheck source=/dev/null
+    . "${config}"
+fi
+
+# The zram devices this machine is swapping on.
+active_devices() {
+    awk '$1 ~ /^\/dev\/zram[0-9]+$/ { print $1 }' /proc/swaps
+}
+
+# ZRAM_SIZE as something zramctl will take. A percentage is resolved against
+# MemTotal here, because zramctl has no notion of one; anything else is handed
+# over as written, since --size parses the suffixes already.
+requested_size() {
+    local percent total
+
+    case "${ZRAM_SIZE}" in
+        '')
+            return 1
+            ;;
+        *%)
+            percent="${ZRAM_SIZE%\%}"
+            [[ "${percent}" =~ ^[1-9][0-9]*$ ]] || return 1
+            total="$(awk '$1 == "MemTotal:" { print $2 }' /proc/meminfo)"
+            [[ -n "${total}" ]] || return 1
+            printf '%s\n' "$((total * 1024 * percent / 100))"
+            ;;
+        *)
+            printf '%s\n' "${ZRAM_SIZE}"
+            ;;
+    esac
+}
+
+# Swapping to memory is cheap in a way the kernel's default swappiness does not
+# assume, so the setting is raised for as long as this service is up and put
+# back when it goes. A container has the knob read-only, and a configuration
+# that leaves ZRAM_SWAPPINESS empty is asking for it not to be touched; both
+# are non-events rather than failures.
+apply_swappiness() {
+    local knob=/proc/sys/vm/swappiness
+    local previous
+
+    [[ -n "${ZRAM_SWAPPINESS}" ]] || return 0
+    [[ -w "${knob}" ]] || return 0
+    read -r previous < "${knob}" || return 0
+    printf '%s\n' "${previous}" > "${saved_swappiness}"
+    printf '%s\n' "${ZRAM_SWAPPINESS}" > "${knob}"
+}
+
+restore_swappiness() {
+    local knob=/proc/sys/vm/swappiness
+    local previous
+
+    [[ -f "${saved_swappiness}" ]] || return 0
+    read -r previous < "${saved_swappiness}" || previous=""
+    rm -f "${saved_swappiness}"
+    [[ -n "${previous}" && -w "${knob}" ]] || return 0
+    printf '%s\n' "${previous}" > "${knob}"
+}
+
+# The UUID to write into the swap signature, spelled out rather than left to
+# mkswap.
+#
+# mkswap invents one when it is not given one, and inventing one means waiting
+# for the kernel's random pool to be seeded. This service is the first thing a
+# runlevel starts, several seconds before that happens, so the wait was real: it
+# measured three seconds, which was the single largest cost in a Sowa boot, and
+# it was being paid for an identifier nothing ever reads. A zram device is made
+# again at every boot and is named as /dev/zramN by swapon, by /proc/swaps and by
+# zramctl; no fstab entry and no boot loader refers to one by UUID.
+#
+# "5a52414d" is ZRAM in ASCII, so blkid says where the device came from, and the
+# last field is the device's own number, so two zram devices on one machine
+# cannot claim the same identifier.
+zram_uuid() {
+    local index="${1##*/zram}"
+    local uuid
+
+    [[ "${index}" =~ ^[0-9]+$ ]] || return 1
+    printf -v uuid '5a52414d-0000-4000-8000-%012x' "${index}"
+    printf '%s\n' "${uuid}"
+}
+
+start() {
+    local size device uuid
+    local uuid_argument=()
+
+    begin "Starting ${name}"
+    if [[ -n "$(active_devices)" ]]; then
+        subsys_mark "${name}"
+        skipped
+        return 0
+    fi
+    # A kernel built without CONFIG_ZRAM has neither of these, and no amount of
+    # configuration would help. Say which of the two kinds of failure this is.
+    if [[ ! -d /sys/class/zram-control && ! -b /dev/zram0 ]]; then
+        failed
+        printf '%s: this kernel has no zram\n' "${name}" >&2
+        return 1
+    fi
+    if ! size="$(requested_size)"; then
+        failed
+        printf '%s: ZRAM_SIZE=%s in %s is not a size\n' \
+            "${name}" "${ZRAM_SIZE}" "${config}" >&2
+        return 1
+    fi
+    # --find claims the first device nothing else has and prints its name.
+    if ! device="$(zramctl --find --size "${size}" \
+        --algorithm "${ZRAM_ALGORITHM}" 2>> "${logfile}")"; then
+        failed
+        printf '%s: no zram device could be set up; see %s\n' \
+            "${name}" "${logfile}" >&2
+        return 1
+    fi
+    # A device zramctl named something other than /dev/zramN is one this cannot
+    # derive a UUID for; mkswap is left to its own devices there rather than
+    # given a wrong one.
+    if uuid="$(zram_uuid "${device}")"; then
+        uuid_argument=(-U "${uuid}")
+    fi
+    # No --discard: zram implements the kernel's swap-slot-free notification, so
+    # a freed page releases its compressed memory without being told twice.
+    if ! { mkswap "${uuid_argument[@]}" "${device}" \
+        && swapon --priority "${ZRAM_PRIORITY}" "${device}"; } \
+        >> "${logfile}" 2>&1; then
+        zramctl --reset "${device}" >> "${logfile}" 2>&1 || true
+        failed
+        printf '%s: %s could not be made into swap; see %s\n' \
+            "${name}" "${device}" "${logfile}" >&2
+        return 1
+    fi
+    apply_swappiness
+    subsys_mark "${name}"
+    ok
+}
+
+stop() {
+    local device
+    local status=0
+
+    begin "Stopping ${name}"
+    restore_swappiness
+    while IFS= read -r device; do
+        # swapoff reads every page on the device back into memory before it
+        # returns, so a machine that is short of memory is exactly where this
+        # can fail. It is reported and not insisted on: the pages are in RAM
+        # either way and the device goes with the power.
+        if swapoff "${device}" >> "${logfile}" 2>&1; then
+            zramctl --reset "${device}" >> "${logfile}" 2>&1 || status=1
+        else
+            status=1
+        fi
+    done < <(active_devices)
+    subsys_clear "${name}"
+    result "${status}"
+}
+
+# What the devices are holding and what it cost. The two views belong together:
+# zramctl's DATA and COMPR columns are the compression this machine is actually
+# getting, and swapon's are what the kernel is prepared to use.
+report() {
+    if [[ -z "$(active_devices)" ]]; then
+        printf '%s is not running\n' "${name}"
+        return 3
+    fi
+    zramctl
+    printf '\n'
+    swapon --show
+    # /proc/swaps already answered the question these two only illustrate, so
+    # the conventional "0 means running" is stated rather than inherited from
+    # whichever of them ran last.
+    return 0
+}
+
+case "${1:-}" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    status)
+        report
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|status}\n' "$0" >&2
+        exit 2
+        ;;
+esac

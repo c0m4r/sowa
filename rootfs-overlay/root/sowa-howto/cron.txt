@@ -1,0 +1,20 @@
+Cron
+====
+
+Cronie starts automatically. Edit root's personal schedule with:
+
+    crontab -e
+
+or add system jobs, which include a user field, to /etc/crontab or a file under
+/etc/cron.d. Cron mail is disabled because this small image has no mail transfer
+agent, so redirect useful output yourself - what crond ran is recorded in
+/var/log/cron by syslog-ng, but what a job printed is the job's own business:
+
+    * * * * * /usr/bin/date >>/var/log/cron-example.log 2>&1
+
+The daemon logs to /var/log/crond.log, and is a service like any other:
+
+    service crond status
+    chkconfig crond off
+
+See also: services.txt, and "man 5 crontab" for the format.

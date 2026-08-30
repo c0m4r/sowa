@@ -1,0 +1,11 @@
+# /etc/shells - the shells a user may choose for themselves.
+#
+# chsh refuses any shell not named here, and getusershell(3) reads nothing else,
+# so an absent file is not an empty policy but a total one: no shell is valid
+# and no unprivileged user can change theirs. Root is exempt from the check,
+# which is what makes the omission easy to miss.
+#
+# /bin/sh is the symlink to Bash rather than a shell of its own. It is listed
+# because a user may reasonably ask for it by that name.
+/bin/sh
+/bin/bash

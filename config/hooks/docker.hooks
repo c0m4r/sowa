@@ -1,0 +1,29 @@
+# Docker.
+#
+# A first install leaves a usable engine: enable it for the ordinary runlevels,
+# then start it after the package transaction has put every binary in place.
+# These are post-install steps rather than post-upgrade steps, so a later
+# upgrade never re-enables or starts Docker after an administrator has disabled
+# or stopped it.
+post-install|service-enable|docker
+post-install|service-start|docker
+#
+# An upgrade replaces the binaries by renaming the new ones over them, so a
+# running dockerd keeps serving from the inode it started with. The restart is
+# what moves it onto the new program, and it happens only if it is running, so
+# a machine that deliberately has Docker stopped keeps it that way.
+#
+# The restart stops every container that is not started with a restart policy,
+# because live restore is off by default: dockerd shuts its containers down
+# with itself. A machine that cannot afford that declines with
+# "sowa-pkg upgrade --no-hooks docker" and restarts when it suits.
+post-upgrade|service-restart|docker
+# Removing the package does not stop the daemons: an unlinked binary keeps
+# running, and this one holds container mounts, a bridge and a set of iptables
+# rules. Without these, "sowa-pkg remove docker" leaves an engine running from
+# programs that are no longer on the disk, and rc links naming an init script
+# the same removal takes away - a service the next boot tries and fails to
+# start. What is left behind on purpose is /var/lib/docker: the images and
+# volumes are data, and removing a package is not asking for them to be deleted.
+pre-remove|service-stop|docker
+pre-remove|service-disable|docker

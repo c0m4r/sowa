@@ -1,0 +1,32 @@
+SSH
+===
+
+sshd is already running on port 22, but root has an empty password and the
+shipped configuration uses "PermitRootLogin prohibit-password" with
+"PermitEmptyPasswords no", so nothing can log in until a key is installed:
+
+    mkdir -p /root/.ssh && chmod 700 /root/.ssh
+    printf '%s\n' 'ssh-ed25519 AAAA... you@example' > /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+
+/root/.ssh is already there and already private; the mkdir is only for a root
+older than that. No package owns authorized_keys, so nothing an upgrade
+installs can write over the keys you put in it.
+
+Authentication and daemon records are in /var/log/secure; host-key generation
+and early start failures are in /var/log/sshd.log. After editing
+/etc/ssh/sshd_config:
+
+    service sshd restart
+
+Under "make run-qemu" the host reaches the guest at port 2222:
+
+    ssh -p 2222 root@127.0.0.1
+
+The host key is not in the image - one shipped with it would give every Sowa
+installation the same identity - so each machine makes its own at the first
+boot that starts sshd. sowa-sshd-keygen is what does it, and "man
+sowa-sshd-keygen" says how to give a cloned disk an identity of its own.
+
+See also: accounts.txt for the root password, and firewall.txt for keeping
+port 22 reachable while closing everything else.

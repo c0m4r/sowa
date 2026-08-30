@@ -1,0 +1,101 @@
+#!/bin/bash
+#
+# chkconfig: - 55 45
+# description: HAProxy TCP and HTTP load balancer
+#
+# Off by default, and after the network in every runlevel it is turned on for.
+# Installing a load balancer and putting one in front of something are two
+# decisions, and the second belongs to the machine - all the more so here, where
+# the shipped /etc/haproxy/haproxy.cfg balances nothing and only serves its own
+# statistics page. The package's install steps say nothing about starting it
+# either; see "sowa-pkg hooks haproxy".
+#
+#     chkconfig haproxy on     # and at the next boot
+#     service haproxy start    # and now
+#
+# -W is master-worker mode and -db keeps the master in the foreground, which is
+# what the daemon helper wants. The pair is what makes "reload" mean anything:
+# a single-process HAProxy can only be replaced, while a master can be told to
+# re-exec with SIGUSR2 and hand its listening sockets to the workers of the new
+# configuration, so established connections finish and nothing is refused in
+# between.
+#
+# The shipped configuration leaves HAProxy's own logging off, and what it
+# writes to stderr is appended to /var/log/haproxy.log instead. A configuration
+# that turns "log" on can point it at the machine's syslog-ng, which is the
+# administrator's business rather than this package's.
+
+. /etc/rc.d/init.d/functions
+
+name=haproxy
+program=/usr/sbin/haproxy
+config=/etc/haproxy/haproxy.cfg
+pidfile=/run/haproxy.pid
+logfile=/var/log/haproxy.log
+
+start() {
+    begin "Starting ${name}"
+    # HAProxy exits rather than starting on a configuration it cannot use - an
+    # unresolvable server name is enough - so it is checked first and the reason
+    # goes to the console instead of arriving as a service that reported success
+    # and is not there.
+    if ! "${program}" -c -f "${config}" >> "${logfile}" 2>&1; then
+        failed
+        printf '%s: %s is not a valid configuration; see %s\n' \
+            "${name}" "${config}" "${logfile}" >&2
+        return 1
+    fi
+    daemon --pidfile "${pidfile}" --log "${logfile}" -- \
+        "${program}" -W -db -f "${config}"
+    result $?
+}
+
+stop() {
+    begin "Stopping ${name}"
+    # SIGTERM to the master takes the workers with it. The graceful form is
+    # SIGUSR1, which lets established connections finish and can therefore take
+    # as long as the longest of them; killproc insists with SIGKILL after ten
+    # seconds, so it is not the signal to hand it.
+    killproc --pidfile "${pidfile}" "${program}"
+    result $?
+}
+
+case "${1:-}" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    reload)
+        # SIGUSR2 asks the master to re-exec itself and start workers for the
+        # configuration as it now reads. The master keeps its pid, so the pid
+        # file stays right, and the old workers are retired as their connections
+        # end. A configuration that will not parse leaves the running one alone,
+        # which is why this is checked here as well: the master would otherwise
+        # report the failure to a log nobody is reading.
+        if ! "${program}" -c -f "${config}" >> "${logfile}" 2>&1; then
+            printf '%s: %s is not a valid configuration; nothing was reloaded\n' \
+                "${name}" "${config}" >&2
+            exit 1
+        fi
+        begin "Reloading ${name}"
+        killproc --pidfile "${pidfile}" --signal USR2 "${program}"
+        result $?
+        ;;
+    status)
+        status --pidfile "${pidfile}" "${program}"
+        ;;
+    configtest)
+        # What start and reload both refuse to act without, asked on its own.
+        "${program}" -c -f "${config}"
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|reload|status|configtest}\n' "$0" >&2
+        exit 2
+        ;;
+esac

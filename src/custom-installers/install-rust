@@ -1,0 +1,46 @@
+#!/bin/sh
+set -eu
+
+RUST_VERSION="1.98.0"
+RUST_TRIPLE="x86_64-unknown-linux-gnu"
+RUST_TARBALL="rust-${RUST_VERSION}-${RUST_TRIPLE}.tar.xz"
+RUST_BASE_URL="https://static.rust-lang.org/dist"
+RUST_SIGNING_KEY="85AB96E6FA1BE5FE"
+RUST_SHA256="ed8ee2df70909c88cbaf87a6cfa3920dac00b537de12a6abe6906641e0f5952f"
+
+if [ -f "/tmp/${RUST_TARBALL}" ] || [ -f "/tmp/${RUST_TARBALL}.asc" ]; then
+	echo "File(s) already downloaded:"
+	[ -f "/tmp/${RUST_TARBALL}" ] && echo "  /tmp/${RUST_TARBALL}"
+	[ -f "/tmp/${RUST_TARBALL}.asc" ] && echo "  /tmp/${RUST_TARBALL}.asc"
+	printf "Remove existing file(s) and download again? [y/N] "
+	read -r answer
+	case "${answer}" in
+		y|Y|yes|YES)
+			rm -f "/tmp/${RUST_TARBALL}" "/tmp/${RUST_TARBALL}.asc"
+			curl -fL -o "/tmp/${RUST_TARBALL}" "${RUST_BASE_URL}/${RUST_TARBALL}"
+			curl -fL -o "/tmp/${RUST_TARBALL}.asc" "${RUST_BASE_URL}/${RUST_TARBALL}.asc"
+			;;
+		*)
+			echo "Keeping existing file(s)."
+			;;
+	esac
+else
+	curl -fL -o "/tmp/${RUST_TARBALL}" "${RUST_BASE_URL}/${RUST_TARBALL}"
+	curl -fL -o "/tmp/${RUST_TARBALL}.asc" "${RUST_BASE_URL}/${RUST_TARBALL}.asc"
+fi
+
+gpg --keyserver keyserver.ubuntu.com --recv-keys "${RUST_SIGNING_KEY}"
+gpg --verify "/tmp/${RUST_TARBALL}.asc" "/tmp/${RUST_TARBALL}"
+
+echo "${RUST_SHA256}  /tmp/${RUST_TARBALL}" | sha256sum -c -
+
+rm -rf "/opt/rust-${RUST_VERSION}-${RUST_TRIPLE}"
+
+tar -C /opt -xf "/tmp/${RUST_TARBALL}"
+
+"/opt/rust-${RUST_VERSION}-${RUST_TRIPLE}/install.sh" --prefix=/opt/rust --without=rust-docs
+
+# shellcheck disable=SC2038,SC2011
+ls -1 /opt/rust/bin | xargs -I {} ln -s /opt/rust/bin/{} /usr/bin/{}
+
+rm -f "/tmp/${RUST_TARBALL}" "/tmp/${RUST_TARBALL}.asc"

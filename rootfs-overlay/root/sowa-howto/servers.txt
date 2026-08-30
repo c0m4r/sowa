@@ -1,0 +1,61 @@
+Web server and load balancer
+============================
+
+Neither is installed - the image is a base system - but both are in the
+repository:
+
+    sowa-pkg update
+    sowa-pkg install nginx
+    service nginx start
+
+Both packages bring an init script with them, and both ship it switched off.
+Installing a web server and publishing a website are two decisions, and the
+package only makes the first one; chkconfig is where the second is made:
+
+    chkconfig nginx on      # start it at every boot from now on
+    chkconfig --list nginx  # what it does per runlevel
+
+nginx serves /usr/share/nginx/html on port 80, is configured in
+/etc/nginx/nginx.conf, logs to /var/log/nginx, and runs its workers as
+"nobody". The service takes the usual verbs:
+
+    service nginx configtest   # the same check as "nginx -t"
+    service nginx reload       # apply a change without dropping connections
+    service nginx status
+    service nginx stop
+
+"reload" is a real reload: the master rereads the configuration, starts workers
+for the new one and retires the old ones as they finish, so nothing in flight is
+lost and the listening sockets never close. A configuration that will not parse
+is refused and the running one carries on. "service nginx start" checks the
+configuration too, so a bad edit is reported on the console instead of becoming
+a service that reported success and is not there.
+
+HAProxy is the other one, on the same terms:
+
+    sowa-pkg install haproxy
+    chkconfig haproxy on
+    service haproxy start
+
+As shipped it only serves its own statistics page on port 8404, with the
+Prometheus exporter under /metrics; /etc/haproxy/haproxy.cfg is where the real
+front ends and back ends go. It is built with TLS and compression. It runs in
+master-worker mode, which is what makes "service haproxy reload" mean a SIGUSR2
+re-exec - established connections finish on the old workers while new ones are
+served by the new configuration - rather than a restart.
+
+Neither is configured to log through syslog, so what they write to stderr goes
+to /var/log/nginx/startup.log and /var/log/haproxy.log. nginx's own logs are the
+error.log and access.log in /var/log/nginx; the startup one holds the narrow
+case those cannot, which is what nginx says before it has opened them. Both can
+be pointed at syslog-ng instead - see logging.txt - and the startup file stays
+useful either way, since it is where a server that could not start says so.
+
+Removing either package stops its daemon and takes its runlevel links away
+first - "sowa-pkg hooks nginx" prints the steps - so a removal does not leave a
+server answering from a program that is no longer on the disk.
+
+Typing either name before installing it prints the sowa-pkg line that would,
+which is what /etc/bash.bashrc's command_not_found_handle is for.
+
+See also: packages.txt, and services.txt for what service and chkconfig are.

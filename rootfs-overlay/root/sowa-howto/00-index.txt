@@ -1,0 +1,55 @@
+Sowa Linux - the howto
+======================
+
+This directory is the shipped documentation: one file per topic, plain text,
+readable with less or cat and greppable with grep. Start wherever the machine
+is stuck.
+
+    network.txt      addresses, routes, DNS, and the nic configuration
+    ssh.txt          getting a key in, and getting logged in
+    firewall.txt     iptables, and what replays a ruleset at boot
+    vpn.txt          WireGuard and OpenVPN
+    time.txt         chronyd and the clock
+    locale.txt       UTF-8, the compiled locales, and how to add one
+
+    packages.txt     sowa-pkg: installing, upgrading, and what a package is
+    licensing.txt    what this is licensed under, and which parts are Sowa's
+    servers.txt      nginx and HAProxy, neither of them installed
+    guix.txt         GNU Guix, which is in the repository and is enormous
+
+    services.txt     init, runlevels, service and chkconfig
+    logging.txt      the two kinds of log, syslog-ng, and logrotate
+    zram.txt         compressed swap in RAM, which is on from boot
+    storage.txt      ext4/XFS/Btrfs, mdadm software RAID, and LVM2
+    partitioning.txt sowa-partitioner: disks, partitions, RAID and LVM
+    cron.txt         crontabs and where their output goes
+    accounts.txt     users, groups, and the password nobody has yet
+    installing.txt   putting this system on a disk
+
+    utilities.txt    what the base commands are, and which names are missing
+    sandboxing.txt   Landlock, and running a command that cannot reach your files
+    archives.txt     tar and every compressor in the image
+    manuals.txt      man, apropos, and building the index they need
+    git-and-gnupg.txt   Git, gpg, and the keys they use
+    compiling.txt    the compiler that is here, and what is not
+
+Sowa's own programs have manual pages, so the reference for each of them is on
+the machine as well as in here:
+
+    man locale-gen        compile a locale, and locale.conf(5) and
+                          locale.gen(5) for the two files it reads
+    man sowa-pkg          the package manager, and sowa-pkg.conf(5) beside it
+    man zram.conf         how much compressed swap there is, and of what
+    man sowa-license      what this system is licensed under, and by whom
+    man syslog-ng         the logger, and syslog-ng.conf(5) beside it
+    man logrotate         log rotation, and logrotate.conf(5) beside it
+    man sowa-setup        install onto a whole disk
+    man sowa-bootstrap    install into a filesystem you mounted yourself
+    man sowa-chroot       enter an installed system to finish the job
+    man service           run an init script the way boot runs it
+    man chkconfig         decide which runlevels start a service
+    man init              PID 1, and inittab(5) for what it reads
+    man shutdown          take the machine down at a stated time
+
+apropos and whatis need an index that is not shipped - see manuals.txt - but
+"man name" needs none.

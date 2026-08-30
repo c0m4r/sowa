@@ -1,0 +1,18 @@
+# bash completion for halt(8), poweroff(8) and reboot(8)   -*- shell-script -*-
+# shellcheck shell=bash
+#
+# One program under three names, so one file under three names: poweroff and
+# reboot in this directory are symbolic links to it, and all three are
+# registered below. -p is halt's alone - it is what makes halt into poweroff -
+# so it is only offered there.
+
+_sowa_comp_halt()
+{
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    local options="-f -n"
+
+    [[ ${1##*/} == halt ]] && options="-f -p -n"
+    mapfile -t COMPREPLY < <(compgen -W "${options}" -- "${current}")
+}
+
+complete -F _sowa_comp_halt halt poweroff reboot

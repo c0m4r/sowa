@@ -1,0 +1,77 @@
+#!/bin/bash
+#
+# chkconfig: 2345 10 90
+# description: network interfaces, as /etc/nic.conf describes them
+#
+# First of the services in every multi-user runlevel, and last to be stopped:
+# chronyd has nothing to reach without it, sshd has nothing to listen on that
+# matters, and crond's jobs are written expecting a network. /etc/nic.conf as
+# shipped restores both firewall families, brings eth0 up and asks for a DHCP
+# lease over IPv4, which is what a machine that has just been installed almost
+# always wants; a machine that wants something else says so in that file, and
+# one that wants nothing says "chkconfig network off".
+#
+# What nic has to say about it goes to /var/log/network.log; "nic status" is
+# the live view.
+#
+# nic is not a daemon - it applies a configuration and exits - so there is no
+# pid to track. The subsystem lock is what tells /etc/rc.d/rc that the
+# configuration was applied and can be taken down again.
+#
+# This used to be the slowest thing in a Sowa boot, and "sowa-boottime" would
+# say so: about three seconds against a tenth of a second for everything else
+# in the runlevel, and almost none of it the DHCP lease - a configuration that
+# asked for no lease at all paid the same three seconds. It was nic's own wait
+# for IPv6 duplicate address detection, and it ran unconditionally, checking
+# every interface for any tentative address including the kernel's own
+# link-local, which nic never configures and nothing here reads; on a link
+# where nothing answers a neighbour solicitation that address never left
+# "tentative", so the wait always ran to its limit. Fixed upstream in nic
+# 0.1.6: the wait now only runs when a DHCPv6 lease was optional and failed to
+# resolve, only looks at the interfaces still waiting on that verdict, and
+# ignores link-local addresses - so a clean lease, or no lease at all, costs
+# nothing, and the worst case is capped at a second and a half rather than
+# three.
+
+. /etc/rc.d/init.d/functions
+
+name=network
+program=/usr/sbin/nic
+logfile=/var/log/network.log
+
+case "${1:-}" in
+    start)
+        begin "Configuring the network"
+        if "${program}" start >> "${logfile}" 2>&1; then
+            subsys_mark "${name}"
+            ok
+        else
+            failed
+        fi
+        ;;
+    stop)
+        begin "Taking the network down"
+        # --force is what makes this a command rather than a question. Without
+        # it, "nic stop" asks whether to tear the configuration down and reads
+        # the answer from stdin, which for a script init runs is /dev/console:
+        # at shutdown nobody is there to type one, and the read is a wait for
+        # something that is never going to arrive.
+        if "${program}" stop --force >> "${logfile}" 2>&1; then
+            subsys_clear "${name}"
+            ok
+        else
+            failed
+        fi
+        ;;
+    restart)
+        "$0" stop
+        "$0" start
+        ;;
+    status)
+        "${program}" status
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|status}\n' "$0" >&2
+        exit 2
+        ;;
+esac

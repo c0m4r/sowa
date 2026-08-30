@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#09110f">
+  <title>Sowa · System overview</title>
+  <link rel="stylesheet" href="assets/dashboard.css">
+  <script src="assets/dashboard.js" defer></script>
+</head>
+<body>
+  <div class="ambient ambient-one" aria-hidden="true"></div>
+  <div class="ambient ambient-two" aria-hidden="true"></div>
+  <div class="shell">
+    <aside class="rail">
+      <a class="brand" href="./" aria-label="Sowa monitor home">
+        <svg class="brand-mark" viewBox="0 0 48 48" aria-hidden="true">
+          <path d="M11 9l8 4.5a18 18 0 0 1 10 0L37 9l-2 10a15 15 0 1 1-22 0L11 9Z"/>
+          <circle cx="19" cy="24" r="3"/><circle cx="29" cy="24" r="3"/>
+          <path d="m21 30 3 3 3-3M24 14v7"/>
+        </svg>
+        <span>Sowa</span>
+      </a>
+      <nav aria-label="Dashboard sections">
+        <a class="nav-item active" href="#overview"><span class="nav-dot"></span>Overview</a>
+        <a class="nav-item" href="#storage"><span class="nav-dot"></span>Storage</a>
+        <a class="nav-item" href="#workloads"><span class="nav-dot"></span>Workloads</a>
+      </nav>
+      <div class="rail-status">
+        <span class="pulse-dot" id="connection-dot"></span>
+        <div><strong id="connection-label">Connecting</strong><small>Read-only socket</small></div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar" id="overview">
+        <div>
+          <p class="eyebrow">System overview</p>
+          <h1 id="hostname">Sowa host</h1>
+          <p class="subtitle"><span id="os-name">Loading system identity…</span><span class="separator">·</span><span id="uptime">—</span></p>
+        </div>
+        <div class="topbar-meta">
+          <div class="health-pill" id="health-pill"><span></span><b id="health-label">Checking</b></div>
+          <p>Updated <time id="updated-at">—</time></p>
+        </div>
+      </header>
+
+      <section class="metric-grid" aria-label="Key system metrics">
+        <article class="metric-card accent-mint">
+          <div class="metric-heading"><span>CPU</span><span class="metric-icon">CPU</span></div>
+          <div class="metric-value"><strong id="cpu-value">—</strong><small>%</small></div>
+          <div class="meter"><span id="cpu-meter"></span></div>
+          <p><b id="load-value">—</b> load across <span id="core-count">—</span> cores</p>
+        </article>
+        <article class="metric-card accent-blue">
+          <div class="metric-heading"><span>Memory</span><span class="metric-icon">RAM</span></div>
+          <div class="metric-value"><strong id="memory-value">—</strong><small>%</small></div>
+          <div class="meter"><span id="memory-meter"></span></div>
+          <p><b id="memory-used">—</b> of <span id="memory-total">—</span></p>
+        </article>
+        <article class="metric-card accent-amber">
+          <div class="metric-heading"><span>Root storage</span><span class="metric-icon">SSD</span></div>
+          <div class="metric-value"><strong id="disk-value">—</strong><small>%</small></div>
+          <div class="meter"><span id="disk-meter"></span></div>
+          <p><b id="disk-free">—</b> available</p>
+        </article>
+        <article class="metric-card accent-violet">
+          <div class="metric-heading"><span>Network</span><span class="metric-icon">NET</span></div>
+          <div class="network-values"><div><small>IN</small><strong id="network-in">—</strong></div><div><small>OUT</small><strong id="network-out">—</strong></div></div>
+          <p><b id="interface-count">—</b> active interfaces</p>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <article class="panel span-two">
+          <div class="panel-heading">
+            <div><p class="eyebrow">Last two minutes</p><h2>System pulse</h2></div>
+            <div class="legend"><span class="cpu-key">CPU</span><span class="memory-key">Memory</span></div>
+          </div>
+          <div class="chart-wrap"><canvas id="pulse-chart" role="img" aria-label="CPU and memory history"></canvas></div>
+        </article>
+
+        <article class="panel system-panel">
+          <div class="panel-heading"><div><p class="eyebrow">Identity</p><h2>This machine</h2></div></div>
+          <dl class="facts">
+            <div><dt>Kernel</dt><dd id="kernel">—</dd></div>
+            <div><dt>Architecture</dt><dd id="architecture">—</dd></div>
+            <div><dt>Packages</dt><dd id="package-count">—</dd></div>
+            <div><dt>Processes</dt><dd id="process-count">—</dd></div>
+            <div><dt>Temperature</dt><dd id="temperature">Unavailable</dd></div>
+          </dl>
+        </article>
+
+        <article class="panel span-two" id="storage">
+          <div class="panel-heading">
+            <div><p class="eyebrow">Mounted filesystems</p><h2>Storage</h2></div>
+            <span class="panel-count" id="filesystem-count">0 volumes</span>
+          </div>
+          <div class="storage-list" id="storage-list"><p class="empty">Waiting for storage data…</p></div>
+        </article>
+
+        <article class="panel" id="workloads">
+          <div class="panel-heading"><div><p class="eyebrow">Memory use</p><h2>Top processes</h2></div></div>
+          <div class="process-list" id="process-list"><p class="empty">Waiting for process data…</p></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">Init state</p><h2>Services</h2></div><span class="panel-count" id="service-count">—</span></div>
+          <div class="service-list" id="service-list"><p class="empty">Waiting for service data…</p></div>
+          <div class="state-strip">
+            <div><strong id="running-processes">—</strong><span>Running</span></div>
+            <div><strong id="sleeping-processes">—</strong><span>Sleeping</span></div>
+            <div><strong id="blocked-processes">—</strong><span>Blocked</span></div>
+            <div><strong id="zombie-processes">—</strong><span>Zombie</span></div>
+          </div>
+        </article>
+      </section>
+
+      <footer><span>Sowa Monitor</span><span>Read-only by design · Live data from <code>/proc</code> and <code>/sys</code></span></footer>
+    </main>
+  </div>
+  <div class="toast" id="error-toast" role="status" aria-live="polite">Dashboard data is temporarily unavailable. Retrying…</div>
+</body>
+</html>

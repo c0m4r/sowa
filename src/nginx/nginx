@@ -1,0 +1,96 @@
+#!/bin/bash
+#
+# chkconfig: - 55 45
+# description: nginx HTTP server and reverse proxy
+#
+# Off by default, and after the network in every runlevel it is turned on for.
+# Installing a web server and publishing one are two decisions, and the second
+# belongs to the machine: until "chkconfig nginx on" answers it, this package is
+# a program on the disk and nothing listening on port 80. The package's install
+# steps say nothing about starting it either, for the same reason - see
+# "sowa-pkg hooks nginx".
+#
+#     chkconfig nginx on     # and at the next boot
+#     service nginx start    # and now
+#
+# -g "daemon off;" keeps the master process in the foreground, which is what the
+# daemon helper wants. nginx writes its own pid file wherever the configuration
+# says - /run/nginx.pid, which is what this package was built with - in
+# foreground and background alike, so "nginx -s reload" and this script are
+# looking at the same process either way.
+#
+# Everything nginx has to say once it is up goes to /var/log/nginx/error.log,
+# which is nginx's own business. What lands in startup.log beside it is the
+# narrow and important case the error log cannot catch: what nginx says before
+# it has opened one, which is where "bind() to 0.0.0.0:80 failed" and a
+# configuration that will not parse both appear.
+
+. /etc/rc.d/init.d/functions
+
+name=nginx
+program=/usr/sbin/nginx
+config=/etc/nginx/nginx.conf
+pidfile=/run/nginx.pid
+logfile=/var/log/nginx/startup.log
+
+start() {
+    begin "Starting ${name}"
+    # Refuse to start on a configuration that will not parse. Without this the
+    # helper reports a service that started, nginx exits half a second later,
+    # and the reason is in a log rather than on the console in front of whoever
+    # just edited the file.
+    if ! "${program}" -t -c "${config}" >> "${logfile}" 2>&1; then
+        failed
+        printf '%s: %s is not a valid configuration; see %s\n' \
+            "${name}" "${config}" "${logfile}" >&2
+        return 1
+    fi
+    daemon --pidfile "${pidfile}" --log "${logfile}" -- \
+        "${program}" -c "${config}" -g 'daemon off;'
+    result $?
+}
+
+stop() {
+    begin "Stopping ${name}"
+    # SIGTERM is nginx's fast shutdown: connections in flight are cut. The
+    # graceful form is SIGQUIT, which waits for every worker to finish what it
+    # is serving - and which killproc has no way to follow up on, since it
+    # insists with SIGKILL after ten seconds. "nginx -s quit" is that form,
+    # for whoever wants to wait.
+    killproc --pidfile "${pidfile}" "${program}"
+    result $?
+}
+
+case "${1:-}" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    reload)
+        # SIGHUP is a real reload here rather than a restart: the master rereads
+        # the configuration, starts workers for the new one and retires the old
+        # ones as they finish, so nothing in flight is dropped and the listening
+        # sockets are never closed. A configuration that will not parse is
+        # refused by the master and the old one keeps running.
+        begin "Reloading ${name}"
+        killproc --pidfile "${pidfile}" --signal HUP "${program}"
+        result $?
+        ;;
+    status)
+        status --pidfile "${pidfile}" "${program}"
+        ;;
+    configtest)
+        # What start refuses to start without, asked on its own.
+        "${program}" -t -c "${config}"
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|reload|status|configtest}\n' "$0" >&2
+        exit 2
+        ;;
+esac

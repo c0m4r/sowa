@@ -1,0 +1,49 @@
+Installing this system to a disk
+================================
+
+  sowa-setup       takes a whole disk and does everything: partitions it,
+                   makes the filesystems, copies the system across and
+                   installs GRUB for both BIOS and UEFI. It offers MBR or GPT,
+                   ext4, XFS or Btrfs, guided NIC settings, and the root
+                   password the installed system should have.
+
+  sowa-bootstrap   takes a directory you have already mounted a filesystem on
+                   and copies the system into it, asks for a root password the
+                   way sowa-setup does, then prints what is left to do. This is
+                   the way onto LVM, RAID, an encrypted root, or a disk shared
+                   with another system - anything sowa-setup's whole-disk
+                   layout does not cover.
+
+  sowa-partitioner gets a disk into a state the other two can be pointed at:
+                   it reads the table that is there, lets partitions be added,
+                   removed and resized in a plan that is not written until it
+                   is applied, makes the filesystems, and builds md arrays and
+                   volume groups on top. Full-screen with no arguments, and a
+                   set of subcommands with them. See partitioning.txt.
+
+  sowa-chroot      enters an installed system with /proc, /sys, /dev and /run
+                   mounted inside it, and unmounts them again on the way out.
+                   Run it on what either of the two above produced when you
+                   need to finish the job - install GRUB, set a password - from
+                   inside rather than outside.
+
+A hand-driven install is the three of them in order:
+
+  sowa-partitioner                     lay the disk out and make the
+                                       filesystems, or use fdisk and mkfs by
+                                       hand if you prefer
+  mount /dev/sda2 /mnt
+  sowa-bootstrap /mnt                  prints the remaining steps
+  sowa-chroot /mnt                     do them from inside
+
+Each has a manual page - "man sowa-setup", "man sowa-bootstrap", "man
+sowa-chroot" - and each takes --help. The environment variables that make an
+unattended install possible (SOWA_SETUP_DISK, SOWA_SETUP_ROOT_PASSWORD and the
+rest) are documented there.
+
+Packages can be installed into a system that is mounted but not running, which
+is the other way to finish one:
+
+    sowa-pkg --root /mnt install haproxy
+
+See also: packages.txt.

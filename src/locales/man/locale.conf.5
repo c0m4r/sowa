@@ -1,0 +1,122 @@
+.Dd August 18, 2026
+.Dt LOCALE.CONF 5
+.Os Sowa
+.Sh NAME
+.Nm locale.conf
+.Nd the locale a login shell starts in
+.Sh SYNOPSIS
+.Pa /etc/locale.conf
+.Sh DESCRIPTION
+The C library has no configuration file of its own.
+.Xr setlocale 3
+is told what to do by the environment alone - by
+.Ev LANG ,
+by the
+.Ev LC_*
+variables and by
+.Ev LC_ALL -
+so something has to put those variables there.
+On this system that something is
+.Pa /etc/profile.d/locale.sh ,
+and
+.Pa /etc/locale.conf
+is the file it reads.
+.Pp
+Each line is
+.Pp
+.Dl NAME=value
+.Pp
+with no spaces around the
+.Ql = .
+The value may be quoted.
+Lines that name anything other than the variables below are ignored, which is
+what makes a comment a comment.
+.Bl -tag -width LC_IDENTIFICATION
+.It Ev LANG
+The default for every category.
+This is the one most systems set and nothing else.
+.It Ev LC_CTYPE
+Character classification and case conversion - which is where the character set
+lives, and therefore whether the system believes in UTF-8 at all.
+.It Ev LC_COLLATE
+Sort order.
+.Ql C
+sorts by code point;
+a real locale sorts the way a dictionary in that language does.
+.It Ev LC_TIME , Ev LC_NUMERIC , Ev LC_MONETARY , Ev LC_PAPER , Ev LC_MEASUREMENT
+Formats: dates, decimal separators, currency, paper size, metric or not.
+.It Ev LC_MESSAGES
+The language of messages, for the programs that have translations.
+Few in this image do - it is built without gettext where that was a choice - so
+this mostly decides
+.Xr yes 1 Ns 's
+idea of what "yes" looks like.
+.It Ev LC_NAME , Ev LC_ADDRESS , Ev LC_TELEPHONE , Ev LC_IDENTIFICATION
+The remaining categories, which few programs read.
+.It Ev LANGUAGE
+Not a category: a colon-separated list of languages for message translation,
+consulted before
+.Ev LC_MESSAGES .
+.It Ev LC_ALL
+Overrides every category at once.
+It is meant for a script that needs a fixed locale and is a poor thing to set
+here, because it cannot then be overridden one category at a time.
+.El
+.Sh WHAT OVERRIDES WHAT
+A value already in the environment is left alone.
+.Xr sshd 8
+is configured with
+.Ql AcceptEnv LANG LC_* ,
+so a person logging in from a machine that speaks their language keeps their own
+locale rather than being handed the server's, and a script that exports
+.Ev LC_ALL
+before running something keeps it.
+This file is the default, not the decision.
+.Pp
+Within the C library the order is
+.Ev LC_ALL ,
+then the specific category, then
+.Ev LANG ,
+then the
+.Ql C
+locale.
+.Sh FILES
+.Bl -tag -width "/etc/profile.d/locale.sh"
+.It Pa /etc/locale.conf
+This file.
+.It Pa /etc/profile.d/locale.sh
+What reads it, for every login shell.
+.It Pa /etc/locale.gen
+Which locales exist on this machine to be named here.
+.El
+.Sh EXAMPLES
+A German system:
+.Bd -literal -offset indent
+locale-gen de_DE.UTF-8
+printf 'LANG=de_DE.UTF-8\en' > /etc/locale.conf
+.Ed
+.Pp
+A Polish system that writes ISO dates and sorts Polish:
+.Bd -literal -offset indent
+LANG=pl_PL.UTF-8
+LC_TIME=en_DK.UTF-8
+.Ed
+.Sh CAVEATS
+Naming a locale that has not been compiled is the common mistake.
+The C library says nothing at the point of failure: every program prints
+.Ql setlocale: LC_ALL: cannot change locale
+on startup and carries on in the
+.Ql C
+locale, so text stops being UTF-8 and nothing explains why.
+.Xr locale-gen 8
+warns about it,
+.Ql locale -a
+lists what is really there, and
+.Ql locale
+with no arguments prints what the current shell resolved to.
+.Sh SEE ALSO
+.Xr locale 1 ,
+.Xr locale.gen 5 ,
+.Xr locale-gen 8
+.Pp
+.Pa /root/sowa-howto/locale.txt

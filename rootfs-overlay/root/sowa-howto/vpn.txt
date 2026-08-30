@@ -1,0 +1,54 @@
+VPNs
+====
+
+Both are installed and both are switched off, because neither has anything to
+do until you write a configuration. WireGuard is in the kernel and is what to
+use when both ends are yours; OpenVPN speaks TLS and X.509 and is what to use
+when the other end already exists.
+
+WireGuard, one interface per file in /etc/wireguard, named after the file:
+
+    umask 077
+    wg genkey > /etc/wireguard/wg0.key
+    wg pubkey < /etc/wireguard/wg0.key     # give this half to the other end
+
+    cat > /etc/wireguard/wg0.conf <<'EOF'
+    [Interface]
+    Address = 10.10.0.2/24
+    PrivateKey = <the contents of wg0.key>
+
+    [Peer]
+    PublicKey = <the other end's public key>
+    AllowedIPs = 10.10.0.0/24
+    Endpoint = vpn.example.net:51820
+    PersistentKeepalive = 25
+    EOF
+
+    wg-quick up wg0     # and wg-quick down wg0
+    wg show             # peers, endpoints, and when each was last heard from
+
+OpenVPN, one tunnel per file in /etc/openvpn, also named after the file. A
+client configuration from whoever runs the server usually just gets renamed:
+
+    install -m 0600 ~/client.ovpn /etc/openvpn/office.conf
+    service openvpn start office
+
+Both are ordinary services, so the whole set starts at boot the usual way:
+
+    chkconfig wg-quick on       # every interface in /etc/wireguard
+    chkconfig openvpn on        # every tunnel in /etc/openvpn
+    service openvpn status      # or wg-quick status
+    service openvpn restart office
+
+They log to /var/log/wg-quick.log and /var/log/openvpn.log. /etc/wireguard and
+/etc/openvpn are mode 0700 and hold key material; leave them that way.
+
+Two things this image does not have that a VPN configuration may expect. There
+is no resolvconf, so "DNS =" in a wg-quick file does not work and a server that
+pushes DNS to OpenVPN is ignored - set resolvers in /etc/nic.conf, or write
+/etc/resolv.conf from a "PostUp" line. And OpenVPN is built without data
+channel offload and without LZO/LZ4 compression, so a server insisting on
+compression needs "comp-lzo stub" at this end.
+
+See also: network.txt for the resolver question, and services.txt for what
+"service openvpn start office" is doing.

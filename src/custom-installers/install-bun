@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+
+BUN_VERSION="1.4.0"
+BUN_ZIP="bun-linux-x64-baseline.zip"
+BUN_URL="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/${BUN_ZIP}"
+BUN_SHA256="184fb4595f0d401a217cf7c78c1bc430ba83314dab7a8b94805babbf7fa7097f"
+
+if [ -f "/tmp/${BUN_ZIP}" ]; then
+	echo "File already downloaded: /tmp/${BUN_ZIP}"
+	printf "Remove existing file and download again? [y/N] "
+	read -r answer
+	case "${answer}" in
+		y|Y|yes|YES)
+			rm -f "/tmp/${BUN_ZIP}"
+			curl -fL -o "/tmp/${BUN_ZIP}" "${BUN_URL}"
+			;;
+		*)
+			echo "Keeping existing file."
+			;;
+	esac
+else
+	curl -fL -o "/tmp/${BUN_ZIP}" "${BUN_URL}"
+fi
+
+echo "${BUN_SHA256}  /tmp/${BUN_ZIP}" | sha256sum -c -
+
+rm -rf /opt/bun
+mkdir -p /opt/bun
+
+unzip -q -o "/tmp/${BUN_ZIP}" -d /opt/bun
+mv "/opt/bun/bun-linux-x64-baseline/bun" /opt/bun/bun
+rmdir /opt/bun/bun-linux-x64-baseline
+rm -f "/tmp/${BUN_ZIP}"
+
+ln -sf /opt/bun/bun /usr/bin/bun

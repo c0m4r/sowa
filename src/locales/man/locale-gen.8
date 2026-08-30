@@ -1,0 +1,115 @@
+.Dd August 18, 2026
+.Dt LOCALE-GEN 8
+.Os Sowa
+.Sh NAME
+.Nm locale-gen
+.Nd compile locales into the archive the C library reads
+.Sh SYNOPSIS
+.Nm
+.Op Ar locale ...
+.Nm
+.Fl -list
+.Nm
+.Fl -help
+.Sh DESCRIPTION
+.Nm
+compiles the locales
+.Xr locale.gen 5
+enables into
+.Pa /usr/lib/locale/locale-archive ,
+which is the file
+.Xr setlocale 3
+finds a locale in.
+Until a locale has been compiled it does not exist as far as any program on the
+system is concerned, however completely
+.Pa /usr/share/i18n
+describes it.
+.Pp
+With no arguments the whole enabled set is compiled.
+With locale names, each is enabled in
+.Pa /etc/locale.gen
+first and the whole enabled set is then compiled:
+.Bd -literal -offset indent
+locale-gen pl_PL.UTF-8 de_DE.UTF-8
+.Ed
+.Pp
+A name has to be one glibc supports.
+The catalogue is
+.Pa /etc/locale.gen
+itself, which lists every one of them with the ones this machine is not using
+commented out, so
+.Ql grep -i portuguese /etc/locale.gen
+is how to find a name and
+.Ql locale -a
+is how to see what has already been compiled.
+.Pp
+The archive is rebuilt from nothing on every run rather than added to, so
+removing a line from
+.Pa /etc/locale.gen
+and running
+.Nm
+removes that locale from the system.
+It is written to a temporary file and renamed into place, so a run that fails
+part way through leaves the locales that were working still working.
+.Pp
+Nothing about this needs a network or a package.
+The locale definitions under
+.Pa /usr/share/i18n/locales ,
+the character maps beside them and
+.Xr localedef 1
+are all in the image; they are about 17 MB that the shipped archive uses barely
+a fifth of a percent of, which is the point of shipping them.
+.Sh OPTIONS
+.Bl -tag -width "--list"
+.It Fl -list
+Print the enabled set, one
+.Ql name charset
+pair per line, and compile nothing.
+.It Fl -help
+Print a usage summary.
+.El
+.Sh FILES
+.Bl -tag -width "/usr/lib/locale/locale-archive"
+.It Pa /etc/locale.gen
+Which locales this machine compiles, and the catalogue of every one it could.
+.It Pa /etc/locale.conf
+Which of them a login shell starts in.
+.Nm
+warns when this names a locale the enabled set does not contain, because the
+result is otherwise a setlocale warning from every command with nothing to say
+which file is wrong.
+.It Pa /usr/lib/locale/locale-archive
+What is written.
+.It Pa /usr/share/i18n/locales
+The definitions locales are compiled from.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh EXAMPLES
+Add a locale and make it the system's:
+.Bd -literal -offset indent
+locale-gen fr_FR.UTF-8
+printf 'LANG=fr_FR.UTF-8\en' > /etc/locale.conf
+.Ed
+.Pp
+The new locale reaches a shell at its next login.
+For the shell that is running:
+.Bd -literal -offset indent
+export LANG=fr_FR.UTF-8
+.Ed
+.Sh SEE ALSO
+.Xr locale 1 ,
+.Xr localedef 1 ,
+.Xr locale.conf 5 ,
+.Xr locale.gen 5
+.Pp
+.Pa /root/sowa-howto/locale.txt
+.Sh AUTHORS
+Part of
+.Nm sowa ,
+whose locale data is glibc's.
+.Sh CAVEATS
+Only root can run it: it writes
+.Pa /usr/lib/locale
+and edits
+.Pa /etc/locale.gen .

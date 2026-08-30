@@ -1,0 +1,10 @@
+--- a/src/funcs.h
++++ b/src/funcs.h
+@@ -92 +92 @@
+-entry		*load_entry(FILE *, void (*)(), struct passwd *, char **);
++entry		*load_entry(FILE *, void (*)(const char *), struct passwd *, char **);
+--- a/src/entry.c
++++ b/src/entry.c
+@@ -93 +93 @@
+-entry *load_entry(FILE * file, void (*error_func) (), struct passwd *pw,
++entry *load_entry(FILE * file, void (*error_func) (const char *), struct passwd *pw,

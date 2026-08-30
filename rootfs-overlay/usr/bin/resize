@@ -1,0 +1,66 @@
+#!/bin/bash
+#
+# resize - ask the terminal how big it is, and tell the kernel.
+#
+# A tty has a window size, and every full-screen program reads it: ncurses sizes
+# its screen from it, readline decides where a line wraps by it. On the video
+# console the kernel knows the answer, because it is drawing the characters. On
+# a serial line nobody does. There is no SIGWINCH over a serial cable and no
+# in-band way to announce a resize, so agetty stamps the tty with a default -
+# 24 rows by 80 columns - and that number stays there for the life of the
+# session no matter what is really on the other end.
+#
+# Being wrong about the width is worse than it sounds. Bash believes the line
+# ends at column 80, the terminal wraps it at 140, and from then on every redraw
+# of the prompt is computed from a cursor position that does not exist: output
+# lands on top of itself and the session looks stuck on one line until something
+# resets the cursor. "clear" appearing to fix it is the symptom, not a fix.
+#
+# The terminal can be asked. ESC[6n is the Device Status Report for the cursor
+# position, answered with ESC[<row>;<col>R. Park the cursor far past any real
+# corner first: the terminal clamps the move to its own last row and column, so
+# what comes back is its size. This is what xterm's resize(1) has always done,
+# and it is the only method that works over a line carrying nothing but bytes.
+#
+# Anything that does not answer within a second is left alone, which covers a
+# real terminal too old to reply and a pipe that is not a terminal at all.
+
+set -u
+
+# Every one of the exchanges below has to go to the terminal itself rather than
+# to this program's own streams. The intended way to run this is
+# "eval $(resize)", which makes stdout a pipe - print the query there and the
+# terminal never sees it, and the reply never comes. So open the controlling
+# terminal explicitly and use that descriptor for the query, the reply and the
+# stty calls alike. This is the whole reason resize(1) has always been a program
+# that opens /dev/tty rather than a couple of lines of shell in a profile.
+if ! exec {tty}<>/dev/tty 2>/dev/null; then
+    printf 'resize: no controlling terminal\n' >&2
+    exit 2
+fi
+
+saved_termios="$(stty -g <&"${tty}")"
+# The reply must not be echoed onto the screen or wait for a newline. "time 10"
+# is tenths of a second: the ceiling on how long the read below can block in the
+# kernel, so a terminal that never answers costs one second and not a session.
+stty raw -echo min 0 time 10 <&"${tty}"
+
+# ESC 7 saves the cursor, ESC 8 restores it, so a resize in the middle of a
+# session does not move the caret out from under whatever drew it.
+printf '\0337\033[999;999H\033[6n' >&"${tty}"
+IFS='[;' read -r -d R -t 2 _discard rows columns <&"${tty}" || true
+printf '\0338' >&"${tty}"
+
+stty "${saved_termios}" <&"${tty}"
+
+if [[ "${rows:-}" =~ ^[0-9]+$ && "${columns:-}" =~ ^[0-9]+$ ]] \
+    && ((rows > 0 && columns > 0)); then
+    stty rows "${rows}" columns "${columns}" <&"${tty}"
+    # Printed the way xterm's resize prints it, so "eval $(resize)" works and
+    # the two numbers are visible when it is run by hand.
+    printf 'COLUMNS=%s;\nLINES=%s;\nexport COLUMNS LINES;\n' "${columns}" "${rows}"
+    exit 0
+fi
+
+printf 'resize: the terminal did not report its size\n' >&2
+exit 1

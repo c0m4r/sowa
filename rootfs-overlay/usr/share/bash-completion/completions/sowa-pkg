@@ -1,0 +1,135 @@
+# bash completion for sowa-pkg(8)                          -*- shell-script -*-
+# shellcheck shell=bash
+#
+# The names offered are the ones the command in front of them would accept, and
+# they come from the machine rather than from a list kept here: the installed
+# database for the commands that act on what is installed, the verified index
+# for the ones that act on what the repository offers.
+#
+# Both are read as files, without running sowa-pkg. A completion that shells out
+# to the program it completes is a completion that can hang a terminal on a
+# repository that is not answering, and Tab is not a good place to discover that
+# the network is down.
+#
+# --root is honoured while completing, so "sowa-pkg --root /mnt install <Tab>"
+# offers what that root's index has rather than this one's.
+
+# The root the rest of the line is about: the argument to --root, or nothing.
+_sowa_comp_pkg_root()
+{
+    local index
+    for ((index = 1; index < COMP_CWORD; index++)); do
+        if [[ ${COMP_WORDS[index]} == --root ]]; then
+            printf '%s' "${COMP_WORDS[index + 1]%/}"
+            return 0
+        fi
+    done
+}
+
+_sowa_comp_pkg_installed()
+{
+    local entry
+    for entry in "$1"/var/lib/sowa/db/*/desc; do
+        [[ -f ${entry} ]] || continue
+        entry=${entry%/desc}
+        printf '%s\n' "${entry##*/}"
+    done
+}
+
+# The first field of every line of the index that is neither blank nor a
+# comment. read rather than cut or awk: one process fewer per Tab, and the
+# same parse sowa-pkg itself does.
+_sowa_comp_pkg_available()
+{
+    local index="$1/var/lib/sowa/repo/index" name rest
+
+    [[ -r ${index} ]] || return 0
+    while IFS='|' read -r name rest; do
+        [[ -n ${name} && ${name} != \#* ]] && printf '%s\n' "${name}"
+    done < "${index}"
+}
+
+_sowa_comp_sowa_pkg()
+{
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    local previous="${COMP_WORDS[COMP_CWORD - 1]}"
+    local root command="" words="" index
+
+    # --root takes a directory, and so does nothing else here.
+    if [[ ${previous} == --root ]]; then
+        compopt -o filenames
+        mapfile -t COMPREPLY < <(compgen -d -- "${current}")
+        return 0
+    fi
+
+    root="$(_sowa_comp_pkg_root)"
+
+    # The command is the first word that is neither an option nor an option's
+    # argument. Everything after it is operands, whose meaning depends on it.
+    for ((index = 1; index < COMP_CWORD; index++)); do
+        case "${COMP_WORDS[index]}" in
+            --root) ((index++)) ;;
+            -*) ;;
+            *)
+                command="${COMP_WORDS[index]}"
+                break
+                ;;
+        esac
+    done
+
+    if [[ ${current} == -* ]]; then
+        words="-y --yes --reinstall --download-only --no-hooks --root --help"
+        # Offered only where they mean something: going back to an older
+        # version is an install, and taking an index that has gone backwards or
+        # run out is an update.
+        case "${command}" in
+            add | install) words+=" --allow-downgrade" ;;
+            update) words+=" --allow-stale" ;;
+        esac
+        case "${command}" in
+            list) words+=" --installed --upgradable --available --all" ;;
+            clean) words+=" --all" ;;
+        esac
+        mapfile -t COMPREPLY < <(compgen -W "${words}" -- "${current}")
+        return 0
+    fi
+
+    case "${command}" in
+        "")
+            words="update list info files owns install upgrade remove
+                   uninstall hooks verify clean help"
+            ;;
+        install | add)
+            # What could be installed: everything the index offers. Packages
+            # already at the right version are left in, because --reinstall is
+            # a thing and because a name that is refused is better than a name
+            # that is missing.
+            words="$(_sowa_comp_pkg_available "${root}")"
+            ;;
+        upgrade | remove | uninstall | files | hooks | verify)
+            words="$(_sowa_comp_pkg_installed "${root}")"
+            ;;
+        info)
+            # The one command that answers for both sides, so both lists - and
+            # sorted through sort -u, since almost every installed package is in
+            # the index too and a name offered twice looks like two packages.
+            words="$( {
+                _sowa_comp_pkg_installed "${root}"
+                _sowa_comp_pkg_available "${root}"
+            } | sort -u)"
+            ;;
+        owns)
+            compopt -o filenames
+            mapfile -t COMPREPLY < <(compgen -f -- "${current}")
+            return 0
+            ;;
+        *)
+            # update, clean, help: nothing more to say.
+            return 0
+            ;;
+    esac
+
+    mapfile -t COMPREPLY < <(compgen -W "${words}" -- "${current}")
+}
+
+complete -F _sowa_comp_sowa_pkg sowa-pkg

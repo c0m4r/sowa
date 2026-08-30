@@ -1,0 +1,24 @@
+/work/
+/downloads/
+/artifacts/
+/dist/
+
+# Public release keys belong in keys/. Private keys never do, even when a
+# RELEASE_KEY override accidentally points into the checkout.
+/keys/*.key
+
+# Build outputs are written to artifacts/, but a medium copied or downloaded
+# into the checkout by hand is 350 MB one "git add -A" away from a commit.
+*.iso
+*.sfs
+
+# Build output from a "make" run inside the init sources; the build stage
+# copies this directory and compiles it under work/.
+/src/init/*.o
+/src/init/init
+/src/init/telinit
+/src/init/shutdown
+/src/init/halt
+/src/init/runlevel
+/src/liveinit/*.o
+/src/liveinit/liveinit

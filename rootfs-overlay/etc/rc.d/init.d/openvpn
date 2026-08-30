@@ -1,0 +1,198 @@
+#!/bin/bash
+#
+# chkconfig: - 45 55
+# description: OpenVPN tunnels, one for each /etc/openvpn/*.conf
+#
+# The service is off by default - that is the "-" in the chkconfig header -
+# because the image ships no tunnels, and a machine that wants one says so:
+#
+#     chkconfig openvpn on
+#
+# What it manages is one openvpn process per configuration file in
+# /etc/openvpn, named after the file: /etc/openvpn/office.conf is the tunnel
+# "office", with its own pid file, its own subsystem lock and its own line of
+# output. A single tunnel can be started, stopped or asked about on its own by
+# naming it - "service openvpn restart office" - and any action with no name
+# applies to all of them.
+#
+# Each openvpn is kept in the foreground, which is what the daemon helper
+# expects and what keeps its diagnostics together: a tunnel's negotiation and
+# its failures are one story and are easier to read as one. Everything the
+# tunnels say is appended to /var/log/openvpn.log - one file for all of them,
+# because openvpn prefixes its own messages and a file per configuration would
+# buy very little.
+
+. /etc/rc.d/init.d/functions
+
+name=openvpn
+program=/usr/sbin/openvpn
+config_dir=/etc/openvpn
+run_dir=/run/openvpn
+logfile=/var/log/openvpn.log
+
+# The tunnels this script manages, in the order the shell sorts their files.
+tunnels() {
+    local config
+
+    for config in "${config_dir}"/*.conf; do
+        [[ -f "${config}" ]] || continue
+        config="${config##*/}"
+        printf '%s\n' "${config%.conf}"
+    done
+}
+
+# Fills "chosen" with the tunnels an action applies to: the ones named on the
+# command line, or all of them. A name with no configuration behind it is an
+# error rather than a silent no-op, since the alternative is a mistyped tunnel
+# that looks exactly like one that started.
+chosen=()
+resolve_tunnels() {
+    local tunnel
+
+    chosen=()
+    if [[ $# -eq 0 ]]; then
+        while IFS= read -r tunnel; do
+            chosen+=("${tunnel}")
+        done < <(tunnels)
+        return 0
+    fi
+    for tunnel in "$@"; do
+        if [[ ! -f "${config_dir}/${tunnel}.conf" ]]; then
+            printf '%s: no such tunnel: %s.conf is not in %s\n' \
+                "${name}" "${tunnel}" "${config_dir}" >&2
+            return 1
+        fi
+        chosen+=("${tunnel}")
+    done
+}
+
+start_tunnel() {
+    local tunnel="$1"
+
+    begin "Starting ${name} tunnel ${tunnel}"
+    if subsys_marked "${name}-${tunnel}"; then
+        skipped
+        return 0
+    fi
+    # --cd is what lets a configuration name its certificates and keys relative
+    # to the directory it lives in, which is how almost every OpenVPN
+    # configuration that has ever been written names them.
+    daemon --name "${name}-${tunnel}" --pidfile "${run_dir}/${tunnel}.pid" \
+        --log "${logfile}" -- \
+        "${program}" --cd "${config_dir}" --config "${tunnel}.conf"
+    result $?
+}
+
+stop_tunnel() {
+    local tunnel="$1"
+
+    begin "Stopping ${name} tunnel ${tunnel}"
+    if ! subsys_marked "${name}-${tunnel}"; then
+        skipped
+        return 0
+    fi
+    killproc --name "${name}-${tunnel}" --pidfile "${run_dir}/${tunnel}.pid" \
+        "${program}"
+    result $?
+}
+
+start() {
+    local tunnel
+    local started=0
+    local outcome=0
+
+    resolve_tunnels "$@" || return 1
+    if [[ "${#chosen[@]}" -eq 0 ]]; then
+        printf 'No tunnels are configured in %s; nothing to start.\n' "${config_dir}"
+        return 0
+    fi
+    install -d -m 0755 "${run_dir}"
+    for tunnel in "${chosen[@]}"; do
+        if start_tunnel "${tunnel}"; then
+            started=1
+        else
+            outcome=1
+        fi
+    done
+    # The lock /etc/rc.d/rc looks for is the service's, not any one tunnel's.
+    # One tunnel running is enough for the service to be running, and so for a
+    # K link in the next runlevel to have something to do.
+    [[ "${started}" -eq 1 ]] && subsys_mark "${name}"
+    return "${outcome}"
+}
+
+stop() {
+    local tunnel
+    local outcome=0
+
+    resolve_tunnels "$@" || return 1
+    for tunnel in "${chosen[@]}"; do
+        stop_tunnel "${tunnel}" || outcome=1
+    done
+    # The service lock is cleared only when nothing is left, so stopping one
+    # tunnel by name does not tell the runlevel machinery the whole service is
+    # down.
+    while IFS= read -r tunnel; do
+        subsys_marked "${name}-${tunnel}" && return "${outcome}"
+    done < <(tunnels)
+    subsys_clear "${name}"
+    return "${outcome}"
+}
+
+reload() {
+    local tunnel
+
+    resolve_tunnels "$@" || return 1
+    for tunnel in "${chosen[@]}"; do
+        # SIGHUP is how openvpn is told to pick up a changed configuration: it
+        # restarts the tunnel and renegotiates without leaving the process.
+        begin "Reloading ${name} tunnel ${tunnel}"
+        killproc --name "${name}-${tunnel}" \
+            --pidfile "${run_dir}/${tunnel}.pid" --signal HUP "${program}"
+        result $?
+    done
+}
+
+report() {
+    local tunnel
+    local outcome=3
+
+    resolve_tunnels "$@" || return 1
+    if [[ "${#chosen[@]}" -eq 0 ]]; then
+        printf 'No tunnels are configured in %s.\n' "${config_dir}"
+        return 3
+    fi
+    for tunnel in "${chosen[@]}"; do
+        printf '%s: ' "${tunnel}"
+        if status --pidfile "${run_dir}/${tunnel}.pid" "${program}"; then
+            outcome=0
+        fi
+    done
+    return "${outcome}"
+}
+
+action="${1:-}"
+shift || true
+
+case "${action}" in
+    start)
+        start "$@"
+        ;;
+    stop)
+        stop "$@"
+        ;;
+    restart)
+        stop "$@"
+        start "$@"
+        ;;
+    reload)
+        reload "$@"
+        ;;
+    status)
+        report "$@"
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|reload|status} [TUNNEL...]\n' "$0" >&2
+        exit 2
+        ;;
+esac

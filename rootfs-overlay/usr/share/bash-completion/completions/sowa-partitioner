@@ -1,0 +1,93 @@
+# bash completion for sowa-partitioner(8)                   -*- shell-script -*-
+# shellcheck shell=bash
+#
+# The first operand is the subcommand and the second is nearly always a disk,
+# so those two are what this knows. Disks are offered by name from lsblk rather
+# than by globbing /dev, which is what keeps partitions, loop devices and the
+# live medium's own nodes out of a list where every entry is something that
+# would be repartitioned; a raw image is a file, so files are offered beside
+# them. The remaining operands differ per subcommand and are completed where
+# the answer is a fixed set - a table format, a partition kind - and left alone
+# where it is a size somebody has to type.
+
+_sowa_comp_sowa_partitioner()
+{
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    local commands='list show firmware raw label scheme create delete wipe raid lvm help'
+    local options='--yes --dry-run --no-format --allow-loop --sector-size= --help'
+
+    # Where in the command line this word is, counting only the operands: the
+    # options may be anywhere and none of them takes a separate argument.
+    local index=0 position=0 word
+    for ((index = 1; index < COMP_CWORD; index++)); do
+        word="${COMP_WORDS[index]}"
+        [[ ${word} == -* ]] && continue
+        position=$((position + 1))
+    done
+
+    if [[ ${current} == -* ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "${options}" -- "${current}")
+        return 0
+    fi
+
+    local command='' first=''
+    for ((index = 1; index < COMP_CWORD; index++)); do
+        word="${COMP_WORDS[index]}"
+        [[ ${word} == -* ]] && continue
+        [[ -n ${command} ]] || { command="${word}"; continue; }
+        [[ -n ${first} ]] || first="${word}"
+    done
+
+    if ((position == 0)); then
+        mapfile -t COMPREPLY < <(compgen -W "${commands}" -- "${current}")
+        return 0
+    fi
+
+    case "${command}" in
+        show | label | scheme | create | delete | wipe | raw)
+            if ((position == 1)); then
+                compopt -o filenames
+                mapfile -t COMPREPLY < <(
+                    lsblk -d -n -p -o NAME,TYPE 2> /dev/null \
+                        | awk '$2 == "disk" || $2 ~ /^raid/ || $2 == "lvm" { print $1 }' \
+                        | grep -- "^${current}" || true
+                    compgen -f -- "${current}"
+                )
+                return 0
+            fi
+            ;;
+        raid | lvm)
+            # Both take devices, and any number of them.
+            compopt -o filenames
+            mapfile -t COMPREPLY < <(
+                lsblk -n -p -o NAME,TYPE 2> /dev/null \
+                    | awk '$2 == "part" || $2 ~ /^raid/ { print $1 }' \
+                    | grep -- "^${current}" || true
+            )
+            return 0
+            ;;
+    esac
+
+    case "${command}:${position}" in
+        label:2 | scheme:2)
+            mapfile -t COMPREPLY < <(compgen -W 'gpt dos' -- "${current}")
+            ;;
+        create:2)
+            mapfile -t COMPREPLY < <(
+                compgen -W 'ext4 xfs btrfs efi biosboot raid lvm' -- "${current}"
+            )
+            ;;
+        delete:2)
+            # A partition number, which is knowable from the disk just named.
+            [[ -n ${first} ]] || return 0
+            mapfile -t COMPREPLY < <(
+                lsblk -n -o PARTN "${first}" 2> /dev/null \
+                    | awk 'NF { print $1 }' \
+                    | grep -- "^${current}" || true
+            )
+            ;;
+    esac
+    return 0
+}
+
+complete -F _sowa_comp_sowa_partitioner sowa-partitioner

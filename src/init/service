@@ -1,0 +1,87 @@
+#!/bin/bash
+#
+# service - run an init script the way boot runs it.
+#
+# The point of the command is the environment: a service started by hand gets
+# the same one it would get at boot, rather than whatever the shell it was
+# typed into happens to be carrying.
+
+set -u
+
+initd=/etc/rc.d/init.d
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: service NAME ACTION [ARGUMENT...]
+       service --status-all
+       service --list
+
+Actions are whatever the init script implements; start, stop, restart and
+status are the ones every Sowa script has.
+USAGE
+    exit 2
+}
+
+list_services() {
+    local script
+
+    for script in "${initd}"/*; do
+        [[ -x "${script}" ]] || continue
+        printf '%s\n' "${script##*/}"
+    done
+}
+
+case "${1:-}" in
+    --list)
+        list_services
+        exit 0
+        ;;
+    --status-all)
+        for name in $(list_services); do
+            "${initd}/${name}" status || true
+        done
+        exit 0
+        ;;
+    "" | -*)
+        usage
+        ;;
+esac
+
+name="$1"
+shift
+[[ $# -gt 0 ]] || usage
+
+script="${initd}/${name}"
+[[ -x "${script}" ]] || {
+    printf 'service: %s: no such service\n' "${name}" >&2
+    exit 1
+}
+
+# The working directory is part of the environment this command exists to
+# normalise, and at boot it is /: init never chdirs, so / is what every service
+# inherits from it. One started by hand would otherwise keep whatever directory
+# it was typed in - a difference of exactly the kind this command is for, and one
+# with teeth, since a daemon holding /mnt/something open is a filesystem that
+# cannot be unmounted.
+#
+# It also settles a getcwd(3) failure that "env -i" below turns into console
+# noise. Clearing the environment clears PWD, so the shell running the init
+# script has to ask the kernel where it is - and on the live medium, whose root
+# is an overlay, that question has no answer for most directories: glibc falls
+# back to walking ".." and matching inode numbers, and overlayfs does not report
+# the same ones through readdir as through stat. What came of it was a burst of
+# "shell-init: error retrieving current directory" ahead of every service's own
+# output. From / there is no ".." to walk, so it cannot arise, and PWD is passed
+# below so the question is not asked at all.
+cd / || exit 1
+
+# LANG and TERM are carried across so the output is readable; everything else
+# is dropped, because an init script must not inherit anything it would not
+# have at boot.
+exec env -i \
+    PATH=/bin:/sbin:/usr/bin:/usr/sbin \
+    HOME=/ \
+    PWD=/ \
+    TERM="${TERM:-linux}" \
+    LANG="${LANG:-C}" \
+    "${script}" "$@"

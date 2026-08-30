@@ -1,0 +1,192 @@
+.Dd August 17, 2026
+.Dt SOWA-BOOTTIME 8
+.Os Sowa
+.Sh NAME
+.Nm sowa-boottime
+.Nd what the boot and the shutdown spent their time on
+.Sh SYNOPSIS
+.Nm
+.Nm
+.Fl a | -all
+.Nm
+.Fl b | -boot Ar id
+.Nm
+.Fl H | -history
+.Nm
+.Fl s | -slowest Op Ar n
+.Nm
+.Fl f | -file Ar path
+.Sh DESCRIPTION
+.Nm
+prints what each init script cost, in the order the scripts ran.
+With no options it shows the boot that is running.
+.Pp
+The numbers are not estimated.
+Every Sowa init script announces what it is about to do with
+.Fn begin
+and reports how it went with
+.Fn ok ,
+.Fn failed
+or
+.Fn skipped ,
+and those helpers in
+.Pa /etc/rc.d/init.d/functions
+time the gap between the two and file a record.
+.Pa /etc/rc.d/rc ,
+the runlevel driver, files one for a whole pass, and
+.Pa /etc/rc.d/rc.sysinit
+files one for the mounting that happens before any runlevel, which is what makes
+the gap between the kernel handing over and the first service starting visible
+rather than inferred.
+.Pp
+The clock is
+.Pa /proc/uptime ,
+which is monotonic.
+A wall clock would do here for nothing:
+.Xr chronyd 8
+starts in the middle of the boot being measured and may step the clock by years,
+and a service that straddled the step would come out having taken less than no
+time.
+.Pp
+Two decimal places is all
+.Pa /proc/uptime
+offers, so that is the resolution of every number here.
+.Ss The files
+.Bl -tag -width "/var/log/service-timing.log"
+.It Pa /run/sowa/timing
+The boot that is running.
+.Pa /run
+is the tmpfs
+.Pa /etc/rc.d/rc.sysinit
+mounts, so this file cannot outlive the boot it describes - which is the point:
+it is never a record of some earlier boot mistaken for this one.
+.It Pa /var/log/service-timing.log
+Every boot that has left a record on this machine.
+This is the one with the shutdowns in it, because a shutdown's records are
+written seconds before the machine stops existing and
+.Pa /run
+goes with it.
+.El
+.Pp
+Each line of both is:
+.Bd -literal -offset indent
+<boot> <at> <took> <outcome> <service> <label...>
+.Ed
+.Pp
+.Ar boot
+is the first field of the kernel's per-boot UUID from
+.Pa /proc/sys/kernel/random/boot_id ,
+which is what tells one boot's records from the next.
+.Ar at
+is when the action started, in seconds since the kernel did, and
+.Ar took
+is how long it ran.
+.Ar outcome
+is
+.Cm ok ,
+.Cm failed
+or
+.Cm skip .
+The label runs to the end of the line, so it is last.
+.Pp
+Nothing rotates the history.
+It grows by roughly a hundred bytes per boot, which is the bargain
+.Pa /var/log/wtmp
+is already on in this image; delete it and it starts again.
+.Sh OPTIONS
+.Bl -tag -width "-s, --slowest n"
+.It Fl a , -all
+Every boot in the history, oldest first, each as its own timeline.
+.It Fl b , -boot Ar id
+One boot, named by the id printed at the head of a timeline.
+This reads the history rather than
+.Pa /run ,
+since a boot that is not this one is only recorded there.
+.It Fl H , -history
+One line per boot: how many actions it ran, what its first runlevel pass cost
+coming up, what its last one cost going down, and how many actions failed.
+This is the view for
+.Dq the boot got slower :
+two numbers per boot, comparable down the column.
+A boot still running has no shutdown figure yet and shows
+.Ql -
+in its place.
+.It Fl s , -slowest Op Ar n
+The
+.Ar n
+slowest actions on record, whichever boot each belongs to.
+The default is 10.
+What to look at first when a boot has become slower and it is not obvious which
+part of it did.
+.It Fl f , -file Ar path
+Read this file rather than either of the usual two.
+.It Fl h , -help
+Print the usage and exit.
+.El
+.Sh FILES
+.Bl -tag -width "/etc/rc.d/init.d/functions"
+.It Pa /run/sowa/timing
+The boot that is running.
+.It Pa /var/log/service-timing.log
+Every boot on record.
+.It Pa /etc/rc.d/init.d/functions
+The helpers that write both.
+.El
+.Sh EXIT STATUS
+.Bl -tag -width 2n
+.It 0
+The records were read.
+.It 1
+There are none to read, and why is on standard error.
+.El
+.Sh EXAMPLES
+What this boot did, and in what order:
+.Bd -literal -offset indent
+# sowa-boottime
+Boot 222e8b0a, kernel 6.18.42, up 12s
+
+        at      took  how     service      what
+      1.01      0.20  ok      rc.sysinit   Mounting and setting up
+      1.21      0.23  ok      zram         Starting zram
+      1.45      3.21  ok      network      Configuring the network
+      4.67      0.24  ok      chronyd      Starting chronyd
+      4.91      0.42  ok      sshd         Starting sshd
+      5.33      0.15  ok      crond        Starting crond
+
+  6 actions, 4.45s of them spent working, last one done at 5.48s
+  Runlevel 3 took 4.27s, starting at 1.21s
+.Ed
+.Pp
+The network is what that boot was waiting for, and the figure is nearly all
+.Ic nic Ns 's
+wait for IPv6 duplicate address detection rather than the DHCP lease.
+See the comment at the top of
+.Pa /etc/rc.d/init.d/network .
+.Pp
+Whether it has been getting worse:
+.Bd -literal -offset indent
+# sowa-boottime --history
+.Ed
+.Pp
+And what to blame if it has:
+.Bd -literal -offset indent
+# sowa-boottime --slowest 5
+.Ed
+.Sh SEE ALSO
+.Xr inittab 5 ,
+.Xr chkconfig 8 ,
+.Xr init 8 ,
+.Xr service 8
+.Sh CAVEATS
+An action is timed between the
+.Fn begin
+that announced it and the marker that ended it, so what is measured is what the
+init script did - not what the daemon it started went on to do afterwards.
+.Xr chronyd 8
+is recorded as costing a quarter of a second because that is what starting it
+costs; stepping the clock to match a server happens later and is not here.
+.Pp
+A service whose script neither prints a marker nor calls
+.Fn result
+leaves no record.
+Nothing in the base image is such a script.

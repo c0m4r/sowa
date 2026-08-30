@@ -1,0 +1,93 @@
+Logs: where they are and what keeps them from filling the disk
+==============================================================
+
+There are two kinds of log on this machine, and knowing which one you want is
+most of finding anything.
+
+
+One file per service
+--------------------
+
+Every service is started in the foreground by the rc framework's daemon
+helper, which appends its standard output and standard error to a file named
+after it:
+
+    /var/log/sshd.log        /var/log/crond.log
+    /var/log/chronyd.log     /var/log/network.log
+    /var/log/zram.log        /var/log/syslog-ng.log
+    /var/log/named.log       /var/log/openvpn.log
+
+This is what a service says on its own account, including the reasons it did
+not start. Look here first when something will not come up:
+
+    tail -n 40 /var/log/sshd.log
+    service sshd status
+
+
+Everything that calls syslog
+----------------------------
+
+syslog-ng listens on /dev/log and writes the four files a Unix has always had:
+
+    /var/log/messages    everything that is not one of the three below
+    /var/log/secure      authentication: logins, su, sudo, sshd's accounting
+    /var/log/cron        what crond ran, and for whom
+    /var/log/maillog     mail, if you ever install something that sends any
+
+Kernel messages go into messages as well, read from /proc/kmsg. dmesg still
+shows the live ring buffer and is unaffected; the difference is that the copy
+in messages survives a reboot, which is where an oops or a disk error is looked
+for afterwards.
+
+    grep sshd /var/log/secure          # who got in, and who did not
+    grep -i 'error\|fail' /var/log/messages
+
+The daemon is a service like any other:
+
+    service syslog-ng status
+    service syslog-ng reload           # after editing the configuration
+
+Its configuration is /etc/syslog-ng/syslog-ng.conf, and it is commented. The
+last few lines of it are a remote destination, commented out: two lines and a
+reload send everything to a collector over TLS, which is the reason syslog-ng
+is the daemon here rather than something smaller.
+
+    man syslog-ng
+    man 5 syslog-ng.conf
+    syslog-ng-ctl stats                # how many messages, by source
+
+
+What keeps /var/log from filling the disk
+-----------------------------------------
+
+logrotate runs at 03:15 every day from /etc/cron.d/logrotate. The policy is
+/etc/logrotate.conf and the rules for this system's own logs are in
+/etc/logrotate.d/sowa: weekly, keeping four rotations of the per-service files
+and eight of syslog-ng's, compressed with gzip except for the newest one.
+
+    logrotate --debug /etc/logrotate.conf    # what it would do, changing nothing
+    logrotate --force /etc/logrotate.conf    # do it now
+    cat /var/lib/logrotate/logrotate.status  # when each log was last rotated
+
+Add a file to /etc/logrotate.d for a log of your own. The two treatments in
+/etc/logrotate.d/sowa are the two that exist: copytruncate for a program that
+holds its log open and cannot be told to reopen it, and a postrotate script for
+one that can.
+
+    man logrotate
+    man 5 logrotate.conf
+
+
+The package manager's own record
+--------------------------------
+
+sowa-pkg writes /var/log/sowa-pkg.log: what was asked for, the plan it made,
+each package that went in or came out with its version and build id, every step
+a package declared, and how the run ended. The database says what is installed
+now; this says how it got that way.
+
+    tail -n 50 /var/log/sowa-pkg.log
+    grep 'installed openssl' /var/log/sowa-pkg.log
+
+Only the commands that change something write to it, so it is a record of
+changes rather than of every time somebody listed a package.

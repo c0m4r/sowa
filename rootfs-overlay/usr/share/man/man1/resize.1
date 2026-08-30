@@ -1,0 +1,102 @@
+.Dd August 17, 2026
+.Dt RESIZE 1
+.Os Sowa
+.Sh NAME
+.Nm resize
+.Nd ask the terminal how big it is, and tell the kernel
+.Sh SYNOPSIS
+.Nm
+.Sh DESCRIPTION
+A tty has a window size and every full-screen program reads it: ncurses sizes
+its screen from it, readline decides where a line wraps by it.
+On the video console the kernel knows the answer, because it is drawing the
+characters.
+On a serial line nobody does.
+There is no
+.Dv SIGWINCH
+over a serial cable and no in-band way to announce a resize, so
+.Xr agetty 8
+stamps the tty with 24 rows by 80 columns and that number stays there for the
+life of the session no matter what is really at the other end.
+.Pp
+Being wrong about the width is worse than it sounds.
+Bash believes the line ends at column 80, the terminal wraps it at 140, and
+from then on every redraw of the prompt is computed from a cursor position that
+does not exist: output lands on top of itself and the session looks stuck on
+one line.
+.Ic clear
+appearing to fix it is the symptom, not a fix.
+.Pp
+.Nm
+asks the terminal instead.
+It parks the cursor far past any real corner - the terminal clamps the move to
+its own last row and column - and then sends the Device Status Report for the
+cursor position,
+.Ql ESC [ 6 n ,
+which is answered with
+.Ql ESC [ <row> ; <col> R .
+That answer is the size.
+It sets it on the tty with
+.Xr stty 1
+and prints it as shell assignments, so that
+.Ic eval $(resize)
+sets
+.Ev COLUMNS
+and
+.Ev LINES
+in the shell as well.
+This is what xterm's
+.Nm
+has always done, and over a line carrying nothing but bytes it is the only
+method there is.
+.Pp
+It takes no options.
+The query, the reply and the
+.Xr stty 1
+calls all go to
+.Pa /dev/tty
+rather than to standard output, which is what makes
+.Ic eval $(resize)
+work: with output going down a pipe, a query printed there would never reach
+the terminal and no reply would ever come.
+.Pp
+Sowa runs it at login from
+.Pa /etc/profile.d/winsize.sh ,
+so a serial session is the right size from the first prompt.
+Run it by hand after resizing the window at the other end.
+.Sh FILES
+.Bl -tag -width "/etc/profile.d/winsize.sh" -compact
+.It Pa /dev/tty
+the terminal, asked directly.
+.It Pa /etc/profile.d/winsize.sh
+what runs this at login.
+.El
+.Sh EXIT STATUS
+.Bl -tag -width 0 -compact
+.It 0
+the terminal answered and the size was set.
+.It 1
+it did not answer within the second it is given.
+.It 2
+there is no controlling terminal.
+.El
+.Sh EXAMPLES
+Set the tty's size, and the shell's idea of it:
+.Pp
+.Dl eval $(resize)
+.Pp
+Just the numbers:
+.Bd -literal -offset indent
+$ resize
+COLUMNS=140;
+LINES=44;
+export COLUMNS LINES;
+.Ed
+.Sh SEE ALSO
+.Xr stty 1 ,
+.Xr agetty 8 ,
+.Xr serial-getty 8
+.Sh CAVEATS
+A terminal that does not answer within a second is left alone, which covers a
+real terminal too old to reply and a pipe that is not a terminal at all.
+Nothing is changed in that case, and the old size stands.

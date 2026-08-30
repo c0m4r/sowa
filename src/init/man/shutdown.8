@@ -1,0 +1,140 @@
+.Dd August 17, 2026
+.Dt SHUTDOWN 8
+.Os Sowa
+.Sh NAME
+.Nm shutdown
+.Nd bring the system down at a stated time
+.Sh SYNOPSIS
+.Nm
+.Op Fl rhHPkc
+.Op Fl t Ar seconds
+.Ar time
+.Op Ar message
+.Sh DESCRIPTION
+.Nm
+waits out a delay, says on the console what is about to happen, and then asks
+.Xr init 8
+for the runlevel that does it.
+The work itself is
+.Xr init 8 Ns 's :
+this program only decides when, and what to tell whoever is watching.
+.Pp
+It stays in the foreground while it waits, so a delayed shutdown is a process
+that can be seen with
+.Xr ps 1
+and interrupted.
+Ctrl-C cancels it; so does
+.Nm Fl c
+from another terminal, which finds it through
+.Pa /run/shutdown.pid .
+.Pp
+.Ar time
+is one of:
+.Bl -tag -width "+minutes" -offset indent
+.It Cm now
+immediately.
+.It Cm + Ns Ar minutes
+that many minutes from now.
+.It Ar hh : Ns Ar mm
+at that time of day.
+A time already past today is taken as tomorrow.
+.El
+.Pp
+.Ar message
+is appended to each announcement, and is the place to say why.
+.Pp
+Announcements go to
+.Pa /dev/console .
+System V wrote to every logged-in terminal, which it found in utmp; nothing on
+a Sowa system writes utmp, so the console is the one place a warning can be
+counted on to appear.
+They are made at an hour, half an hour, fifteen, ten, five, two and one minutes
+remaining, then at thirty and ten seconds, then every second from five down to
+one, and once more as the request goes out.
+.Sh OPTIONS
+.Bl -tag -width "-t seconds"
+.It Fl r
+Reboot: runlevel 6.
+.It Fl h
+Power the system off: runlevel 0.
+.It Fl P
+The same as
+.Fl h .
+.It Fl H
+Halt without powering off, which leaves the machine stopped with the power on.
+.It Fl k
+Announce the shutdown but do not perform it.
+.It Fl c
+Cancel a shutdown that is waiting, and announce that it was cancelled.
+.It Fl t Ar seconds
+How long a process gets between the
+.Dv SIGTERM
+that asks it to leave the runlevel and the
+.Dv SIGKILL
+that makes it.
+The default is 3.
+.El
+.Pp
+Without
+.Fl r ,
+.Fl h ,
+.Fl H
+or
+.Fl P
+the system goes to single user mode, which is what System V's
+.Nm
+has always done with a bare time argument.
+.Pp
+.Fl a , Fl f , Fl F , Fl n
+and
+.Fl q
+are accepted and ignored: there is no fsck here to force or skip, and nothing
+writes wtmp.
+.Sh FILES
+.Bl -tag -width "/run/shutdown.pid" -compact
+.It Pa /run/shutdown.pid
+the waiting
+.Nm ,
+so that
+.Fl c
+can find it.
+.It Pa /run/initctl
+the FIFO the runlevel request is written to.
+.It Pa /dev/console
+where announcements go.
+.El
+.Sh EXIT STATUS
+.Ex -std
+A cancelled shutdown exits 0.
+.Sh EXAMPLES
+Reboot in five minutes, saying why:
+.Pp
+.Dl shutdown -r +5 \(dqkernel upgrade\(dq
+.Pp
+Change your mind:
+.Pp
+.Dl shutdown -c
+.Pp
+Power off at half past two in the morning:
+.Pp
+.Dl shutdown -h 02:30
+.Pp
+Rehearse the announcements without taking anything down:
+.Pp
+.Dl shutdown -k +1 \(dqjust checking\(dq
+.Sh SEE ALSO
+.Xr halt 8 ,
+.Xr init 8 ,
+.Xr telinit 8
+.Sh CAVEATS
+Only root can shut the system down.
+.Pp
+A
+.Nm
+that is killed with
+.Dv SIGKILL
+rather than cancelled leaves
+.Pa /run/shutdown.pid
+behind.
+.Pa /run
+is a tmpfs, so the next boot has none.

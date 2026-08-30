@@ -1,0 +1,264 @@
+.Dd August 21, 2026
+.Dt SOWA-BOOTSTRAP 8
+.Os Sowa
+.Sh NAME
+.Nm sowa-bootstrap
+.Nd install Sowa into a filesystem someone else has mounted
+.Sh SYNOPSIS
+.Nm
+.Op Fl -from-tarball Ar tarball
+.Op Fl -no-fstab
+.Ar destination
+.Sh DESCRIPTION
+.Nm
+is
+.Xr sowa-setup 8
+with the disk half removed.
+.Xr sowa-setup 8
+owns the whole device - it partitions, formats, installs GRUB and writes a boot
+menu - which means it can only produce its guided plain-partition layouts.
+.Nm
+takes a directory instead and copies the system into it, leaving the
+partitioning, the filesystems and the boot loader to whoever ran it.
+That is the way onto LVM, onto RAID, onto an encrypted root, into a custom
+multiboot layout, or into a plain directory used as a chroot tree.
+.Pp
+.Ar destination
+must already exist and be writable.
+It does not have to be a mount point: a tree bootstrapped into an ordinary
+directory is one of the things this program is for, and it says so rather than
+refusing when the destination turns out not to be one.
+A destination that is not empty is not refused either - installing beside an
+existing system is another - but the confirmation says how many entries are
+already there and that files with the same names will be overwritten.
+.Pp
+Without
+.Fl -from-tarball
+the source is the running system, which is only the right source when the
+running system is Sowa; this is checked before anything is measured or copied,
+so that a non-Sowa host is rejected at once rather than after several minutes
+of walking its root filesystem.
+.Pp
+After the confirmation and before the copy,
+.Nm
+asks for the root password the installed system will have, twice, without
+echoing it.
+It is asked before the copy because the copy takes minutes and a question
+waiting at the end of them is a question nobody is there for.
+The image ships root with an empty password, which is right for a live system
+and wrong for one being installed, so an empty answer is accepted and said out
+loud rather than taken silently.
+The question is skipped, and the account left as the image ships it, when
+.Ev SOWA_BOOTSTRAP_ROOT_PASSWORD
+already answers it, when
+.Ev SOWA_BOOTSTRAP_ASSUME_YES
+says the run is unattended, when standard input is not a terminal, or when
+there is no
+.Xr openssl 1
+to hash the answer with - which on a foreign rescue system is a real
+possibility, and the reason it is a skipped question rather than a fatal one.
+.Pp
+One part of the layout it does write:
+.Pa /etc/fstab ,
+generated from the filesystems mounted under
+.Ar destination
+and printed at the end for checking.
+That part is not a guess - whatever belongs in the file is already mounted, so
+it is read back with
+.Xr findmnt 8
+rather than chosen - which is why it is written and the boot loader is not.
+See
+.Sx THE GENERATED FSTAB .
+.Pp
+It ends by printing what is left to do - GRUB and a boot menu, with the fstab
+above them to be read over - with the real device names filled in wherever they
+can be established.
+Both of those steps are deliberately printed rather than performed: the layout
+is the caller's, and a boot loader written to a disk this program only guessed
+at is the one mistake it must not make.
+The instructions are given as
+.Xr sowa-chroot 8
+commands, so that the GRUB that runs is the installed system's own rather than
+whatever the host has - a rescue environment shipping GRUB 0.97 is the case
+that decided it.
+.Sh OPTIONS
+.Bl -tag -width "--from-tarball tarball"
+.It Fl -from-tarball Ar tarball
+Install from a rootfs tarball - one made by
+.Ic make rootfs-tarball ,
+or fetched from a mirror - instead of copying the running system.
+The copy is then that image as it was built rather than the live root as it now
+stands, and the host it is run from need not be Sowa at all.
+This form requires
+.Xr xz 1
+as well as
+.Xr tar 1 .
+Everything else is the same.
+.It Fl -no-fstab
+Do not write
+.Pa destination Ns /etc/fstab .
+For the operator who has already written one, or who is bootstrapping a chroot
+tree that will never boot.
+.It Fl h , Fl -help
+Print usage and exit.
+.El
+.Sh THE GENERATED FSTAB
+Unless
+.Fl -no-fstab
+says otherwise, and unless
+.Ar destination
+is an ordinary directory rather than a mount point,
+.Nm
+writes
+.Pa destination Ns /etc/fstab
+from what
+.Xr findmnt 8
+reports mounted at and below
+.Ar destination ,
+overwriting whatever the copy put there - a tarball or a running installation
+carries the fstab of the machine it was made on, and the image itself carries
+none at all.
+.Pp
+Each filesystem is named by
+.Cm UUID= ,
+which fits every layout this program exists for: a logical volume, an
+.Xr md 4
+array and a plain partition all have one, where only the last has a PARTUUID.
+It falls back to
+.Cm PARTUUID=
+and then to the device path, saying so when it does.
+The kernel command line printed for
+.Pa grub.cfg
+still uses
+.Cm root=PARTUUID= ,
+because that is resolved by the kernel itself, with no initramfs and no
+.Xr udev 7
+to look a UUID up with.
+.Pp
+An ext2, ext3 or ext4 root filesystem gets pass 1, and another filesystem in
+that family gets pass 2.
+Filesystems without a traditional
+.Xr fsck 8
+pass, including XFS and Btrfs, get pass 0.
+A
+.Sy vfat
+filesystem - the EFI System Partition, in every layout this is likely to meet -
+gets
+.Cm defaults , Ns Cm noauto ,
+the same as
+.Xr sowa-setup 8
+writes, so that a machine whose ESP has been removed or reformatted still
+reaches a login prompt.
+Every entry is written
+.Cm defaults :
+the options a filesystem happens to be mounted with here belong to the
+installing environment and not to the installed system.
+.Pp
+Two things are left out, both of them out loud.
+Anything that is not a filesystem on a block device - the kernel's own
+.Pa /proc ,
+.Pa /sys
+and
+.Pa /dev ,
+which
+.Pa /etc/rc.d/rc.sysinit
+mounts itself, along with tmpfs, overlay and bind mounts - is not an fstab line
+here.
+And swap is not a mount, so it cannot be read off the layout at all: the swap
+areas
+.Xr blkid 8
+finds on the machine are written commented out, since one of them may belong to
+another system sharing the disk.
+.Pa /etc/rc.d/rc.sysinit
+runs
+.Ic swapon -a
+after
+.Ic mount -a ,
+so uncommenting a line is all it takes.
+.Sh ENVIRONMENT
+Interactive by default.
+For unattended use:
+.Bl -tag -width SOWA_BOOTSTRAP_ROOT_PASSWORD
+.It Ev SOWA_BOOTSTRAP_ASSUME_YES
+Set to 1 to skip the confirmation and the root password prompt with it.
+.It Ev SOWA_BOOTSTRAP_ROOT_PASSWORD
+The root password for the installed system, given instead of being asked for.
+Unset, an interactive run asks; an unattended one installs the account as the
+image ships it, with no password at all.
+.It Ev SOWA_BOOTSTRAP_HOSTNAME
+The hostname for the installed system.
+.It Ev SOWA_BOOTSTRAP_QUIET
+Set to 1 to leave out the closing instructions.
+.It Ev SOWA_INSTALL_IGNORE_KERNEL
+Set to 1 to install from a kernel older than 6.1 anyway.
+See
+.Sx CAVEATS ;
+this is a way to watch it fail, not a way to make it work.
+.It Ev SOWA_INSTALL_LIB
+Where to find
+.Pa install-functions .
+The default is
+.Pa /usr/lib/sowa .
+This exists so that
+.Pa sowa-install ,
+the bundle that packs all three installers into one portable script, can run
+from a directory of its own.
+.El
+.Sh FILES
+.Bl -tag -width "/usr/lib/sowa/install-functions" -compact
+.It Pa /usr/lib/sowa/install-functions
+the copy, the host-key reset, the mount points and the fstab, shared with
+.Xr sowa-setup 8
+and
+.Xr sowa-chroot 8 .
+.It Pa destination Ns /etc/fstab
+written from the mounts under
+.Ar destination ,
+unless
+.Fl -no-fstab .
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh EXAMPLES
+The three-command install onto a layout of your own:
+.Bd -literal -offset indent
+fdisk /dev/sda
+mkfs.ext4 /dev/sda2
+mount /dev/sda2 /mnt
+sowa-bootstrap /mnt
+sowa-chroot /mnt
+.Ed
+.Pp
+From a rescue system that is not Sowa, using a rootfs tarball:
+.Pp
+.Dl sowa-bootstrap --from-tarball sowa-0.1-x86_64-rootfs.tar.xz /mnt
+.Pp
+A chroot tree in a plain directory:
+.Bd -literal -offset indent
+mkdir /srv/sowa
+sowa-bootstrap /srv/sowa
+sowa-chroot /srv/sowa
+.Ed
+.Sh SEE ALSO
+.Xr sowa-chroot 8 ,
+.Xr sowa-pkg 8 ,
+.Xr sowa-setup 8
+.Sh CAVEATS
+Must run as root.
+.Pp
+It also needs the kernel it runs on to be 6.1 or newer, which is not the kernel
+the installed system will boot.
+glibc here was configured
+.Fl -enable-kernel=6.1.0 ,
+so every binary in the image is entitled to assume every syscall that kernel
+had.
+On an older one the failure is quiet rather than clean:
+.Xr statx 2
+arrived in Linux 4.11 and coreutils 9 calls it directly, so
+.Ic ls -l
+answers
+.Dq Function not implemented
+and prints question marks where the permissions go, and
+.Xr grub-mkconfig 8
+writes a configuration with no menu entries in it.
+The fix is a newer rescue system, not a switch.

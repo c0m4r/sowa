@@ -1,0 +1,112 @@
+.Dd August 17, 2026
+.Dt ZRAM.CONF 5
+.Os Sowa
+.Sh NAME
+.Nm zram.conf
+.Nd configuration for Sowa's compressed swap in RAM
+.Sh SYNOPSIS
+.Pa /etc/sowa/zram.conf
+.Sh DESCRIPTION
+.Pa /etc/rc.d/init.d/zram
+sources this file as shell, so each setting is an ordinary assignment and
+anything after a
+.Sq #
+is a comment.
+A file that is missing or unreadable is not an error: the service carries the
+same defaults the shipped file states.
+.Pp
+zram is a block device whose contents are kept compressed in memory.
+Swapping to one does not move a page out of RAM, it makes the page take about a
+third of the room, so a machine with no disk - or none it is allowed to write
+to - still has somewhere to put what it is not using.
+That is the live medium's case exactly: its root is a tmpfs over the squashfs,
+and tmpfs pages are swappable.
+.Pp
+The service is on in runlevels 2 through 5, first to start and last to stop.
+.Xr chkconfig 8
+turns it off, and
+.Xr service 8
+applies a change to this file with
+.Cm restart .
+.Bl -tag -width ZRAM_SWAPPINESS
+.It Ev ZRAM_SIZE
+How much uncompressed data the device will accept, written either as a
+percentage of this machine's memory or as a size with a suffix
+.Pq Dq 2G , Dq 512M , Dq 1GiB .
+The default is
+.Dq 50% .
+.Pp
+It is a ceiling and not a reservation.
+An empty zram device occupies nothing and a full one occupies whatever its
+contents compressed to, so half of memory costs something nearer a sixth of it
+once real anonymous pages are in there.
+That is also why a figure above 100% is a legitimate thing to ask for, and why
+it is the interesting way to run a machine out of memory.
+.It Ev ZRAM_ALGORITHM
+The compressor, default
+.Dq zstd .
+This kernel is built with zstd, lzo and lzo-rle;
+.Xr zramctl 8
+reports what the device ended up with, and
+.Pa /sys/block/zram0/comp_algorithm
+lists what it could have had.
+.It Ev ZRAM_PRIORITY
+Swap priority, default 100.
+Higher is used first, and 100 is above anything an
+.Xr fstab 5
+entry would give a disk, so a machine with both fills the compressed swap
+before it spills onto the slow one.
+.It Ev ZRAM_SWAPPINESS
+What
+.Pa /proc/sys/vm/swappiness
+is set to while the service is up, from 0 to 200; default 100.
+The kernel's own default of 60 is written for a device with a seek time, and
+swapping here costs a compression instead.
+The service records the value it found in
+.Pa /run/zram.swappiness
+and puts it back when it stops.
+Leaving this empty leaves the kernel's setting alone.
+.El
+.Sh FILES
+.Bl -tag -width /run/zram.swappiness -compact
+.It Pa /etc/sowa/zram.conf
+this file
+.It Pa /etc/rc.d/init.d/zram
+the service that reads it
+.It Pa /var/log/zram.log
+what
+.Xr zramctl 8 ,
+.Xr mkswap 8
+and
+.Xr swapon 8
+had to say
+.It Pa /run/zram.swappiness
+the swappiness in force before the service started
+.El
+.Sh EXAMPLES
+Ask for as much compressed swap as the machine has memory, and leave the
+kernel's swappiness alone:
+.Bd -literal -offset indent
+ZRAM_SIZE=100%
+ZRAM_SWAPPINESS=
+.Ed
+.Pp
+Turn it off at the next boot, and now:
+.Bd -literal -offset indent
+chkconfig zram off
+service zram stop
+.Ed
+.Pp
+What it is holding, and what that cost:
+.Bd -literal -offset indent
+service zram status
+.Ed
+.Sh SEE ALSO
+.Xr fstab 5 ,
+.Xr chkconfig 8 ,
+.Xr mkswap 8 ,
+.Xr service 8 ,
+.Xr swapon 8 ,
+.Xr zramctl 8
+.Pp
+.Pa /root/sowa-howto/zram.txt

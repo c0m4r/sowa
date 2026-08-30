@@ -1,0 +1,287 @@
+/* A small style sheet for a small operating system. */
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: auto;
+}
+
+body {
+  max-width: 88ch;
+  margin: 0 auto;
+  padding: 24px 18px 48px;
+  background: #fff;
+  color: #000;
+  font-family: "Courier New", Courier, monospace;
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+a {
+  color: #0000ee;
+  text-decoration: underline;
+}
+
+a:visited {
+  color: #551a8b;
+}
+
+a:hover,
+a:focus {
+  color: #ee0000;
+}
+
+.skip-link {
+  position: absolute;
+  top: -100px;
+  left: 8px;
+  background: #fff;
+}
+
+.skip-link:focus {
+  top: 8px;
+}
+
+header,
+footer {
+  text-align: center;
+}
+
+.owl {
+  margin: 0 auto;
+  font-weight: bold;
+  line-height: 1.05;
+}
+
+.wordmark {
+  margin: 14px auto 8px;
+  font-weight: bold;
+  line-height: 1.05;
+}
+
+.tagline {
+  margin: 14px 0;
+  font-size: 12px;
+}
+
+.nav {
+  margin: 22px 0 18px;
+  line-height: 2;
+}
+
+.ascii-rule {
+  width: 100%;
+  overflow: hidden;
+  margin: 26px 0;
+  white-space: nowrap;
+}
+
+section {
+  scroll-margin-top: 16px;
+}
+
+h1,
+h2,
+h3 {
+  font-family: inherit;
+}
+
+h1 {
+  margin: 20px 0;
+  font-size: 22px;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+h2 {
+  margin: 0 0 22px;
+  font-size: 19px;
+}
+
+h3 {
+  margin: 30px 0 12px;
+  font-size: 15px;
+}
+
+.announcement,
+.big-link,
+.warning,
+.more-downloads {
+  text-align: center;
+}
+
+.announcement,
+.warning {
+  color: #cc0000;
+  font-weight: bold;
+}
+
+.big-link {
+  margin: 28px 0;
+  font-size: 16px;
+}
+
+.facts,
+.feature-list,
+.code {
+  overflow-x: auto;
+  max-width: 100%;
+  padding: 0;
+  background: #fff;
+  color: #000;
+  font: inherit;
+  white-space: pre;
+}
+
+.facts {
+  width: 50ch;
+  margin: 26px auto 0;
+}
+
+.feature-list {
+  margin: 24px 0;
+}
+
+.location {
+  margin-bottom: 8px;
+  font-weight: bold;
+}
+
+code {
+  font-family: inherit;
+}
+
+.file-list {
+  width: 100%;
+  margin-bottom: 32px;
+}
+
+.file-row {
+  display: grid;
+  grid-template-columns: 13ch minmax(28ch, 1fr) 10ch 7ch;
+  gap: 1ch;
+  min-height: 28px;
+  align-items: baseline;
+}
+
+.file-row > * {
+  min-width: 0;
+}
+
+.file-row a:nth-child(2) {
+  overflow-wrap: anywhere;
+}
+
+.file-head {
+  margin-bottom: 5px;
+  padding-bottom: 4px;
+  border-bottom: 1px dashed #000;
+  font-weight: bold;
+}
+
+.more-downloads {
+  margin-top: 38px;
+  line-height: 2;
+}
+
+.more-downloads span {
+  white-space: nowrap;
+}
+
+.code {
+  margin: 10px 0 26px;
+  padding-left: 2ch;
+}
+
+.warning {
+  margin-top: 34px;
+}
+
+footer {
+  font-size: 12px;
+}
+
+footer p {
+  margin: 8px 0;
+}
+
+footer pre {
+  margin-top: 28px;
+}
+
+@media (max-width: 700px) {
+  body {
+    padding: 16px 12px 36px;
+    font-size: 13px;
+  }
+
+  .wordmark {
+    font-size: clamp(8px, 2.55vw, 13px);
+  }
+
+  .tagline {
+    font-size: clamp(7px, 2.05vw, 10px);
+    line-height: 1.7;
+    white-space: nowrap;
+  }
+
+  h1 {
+    font-size: 18px;
+  }
+
+  h2 {
+    font-size: 16px;
+  }
+
+  .facts {
+    width: 100%;
+    font-size: 12px;
+  }
+
+  .file-list {
+    border-top: 1px dashed #000;
+  }
+
+  .file-head {
+    display: none;
+  }
+
+  .file-row {
+    grid-template-columns: 11ch 1fr auto;
+    padding: 9px 0;
+    gap: 2px 1ch;
+    border-bottom: 1px dashed #999;
+  }
+
+  .file-row > *:nth-child(1) {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .file-row > *:nth-child(2) {
+    grid-column: 2 / -1;
+    grid-row: 1;
+  }
+
+  .file-row > *:nth-child(3) {
+    grid-column: 2;
+    grid-row: 2;
+  }
+
+  .file-row > *:nth-child(4) {
+    grid-column: 3;
+    grid-row: 2;
+  }
+}
+
+@media print {
+  body {
+    max-width: none;
+  }
+
+  a {
+    color: #000;
+  }
+}

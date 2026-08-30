@@ -1,0 +1,548 @@
+.Dd August 27, 2026
+.Dt SOWA-PARTITIONER 8
+.Os Sowa
+.Sh NAME
+.Nm sowa-partitioner
+.Nd look at the disks, lay out partitions, build RAID and LVM
+.Sh SYNOPSIS
+.Nm
+.Op Fl -yes | Fl -dry-run | Fl -no-format
+.Op Fl -allow-loop | Fl -sector-size Ns = Ns Ar n
+.Nm
+.Cm list
+.Nm
+.Cm show Ar disk
+.Nm
+.Cm firmware
+.Nm
+.Cm raw Ar file
+.Nm
+.Cm label Ar disk Cm gpt | dos
+.Nm
+.Cm scheme Ar disk Cm gpt | dos
+.Op Fl -esp-size Ns = Ns Ar size
+.Nm
+.Cm create Ar disk Ar kind Ar size
+.Nm
+.Cm delete Ar disk Ar number
+.Nm
+.Cm wipe Ar disk
+.Op Fl -mode Ns = Ns Ar mode
+.Op Fl -size Ns = Ns Ar size
+.Op Fl -partition Ns = Ns Ar number
+.Nm
+.Cm raid Fl -level Ns = Ns Ar n Fl -name Ns = Ns Ar node Ar partition ...
+.Nm
+.Cm lvm Fl -vg Ns = Ns Ar name Ar device ...
+.Sh DESCRIPTION
+.Nm
+is the program that gets a disk into a state something can be installed onto.
+.Xr sowa-setup 8
+does its own partitioning of one whole disk in one fixed shape;
+.Nm
+does the general case: several disks, an existing table to read and keep,
+partitions placed by hand, and md or LVM stacked on top afterwards.
+.Pp
+With no subcommand it runs as a full-screen program.
+The first screen lists everything on the machine that can hold a partition
+table; opening one of those shows a proportional map of what is on it beside a
+table of its partitions and free space.
+With a subcommand it does one thing and exits, so the same tool serves an
+install being done by hand and a script preparing a machine.
+.Pp
+The two screens divide the work the way the disk does.
+Anything that replaces a whole disk - writing a new table, applying one of the
+predefined layouts - is on the first screen, next to the disk it would replace.
+Anything that edits one partition is on the second.
+.Ss The map
+Every partition and every gap gets a share of the width in proportion to its
+size, except that a partition never gets none: a 1 MiB BIOS Boot Partition on a
+2 TB disk is a hundred-thousandth of the disk and still has to be visible and
+selectable.
+A partition that is on the disk is drawn solid, one that is only in the plan is
+drawn hatched, and free space is drawn light.
+.Pp
+The selected segment stays whole and turns blinking bright white, with a thick
+rule under it in its own colour.
+White is the largest difference available without leaving the palette, blink is
+the one attribute that cannot be mistaken for part of the picture, and the rule
+keeps the type colour so the association survives on a terminal that renders
+neither.
+.Ss What can be partitioned
+Disks, the md arrays built out of their partitions, and the logical volumes
+built out of those.
+All three are block devices with room for a partition table in them, so all
+three appear on the first screen and all three open into the same editor: an
+array can be partitioned, and so can a volume.
+.Pp
+A raw image - a regular file being treated as a disk - appears there too when
+one was named.
+See
+.Sx RAW IMAGES .
+.Ss Partition numbers
+The number a partition has is the one the table gives it, and it is left alone.
+This matters more than it sounds: a cloud image's root is commonly partition 1
+while its BIOS Boot Partition is 14 and its ESP is 15, so numbering by position
+on the disk would call them 3, 1 and 2 - wrong on the screen, and wrong in a
+command that names one.
+Applying a plan writes each partition into the slot it already had, and a new
+partition takes the lowest number nothing is using.
+.Ss The plan
+Nothing is written to a disk until it is applied.
+Everything up to that point edits an in-memory plan - a list of partitions with
+a start, a length and a kind - which is drawn beside the table that is really
+on the disk.
+Applying turns that plan into one
+.Xr sfdisk 8
+script and one call, and the pending changes are listed and confirmed before it
+runs.
+.Pp
+Writing a new table and applying a predefined layout are the exceptions: both
+replace the whole disk rather than editing part of it, both are on the first
+screen, and both happen when they are confirmed.
+The layout shows what is on the disk now, what will be there instead, and a map
+of the result, before it asks.
+.Pp
+Rewriting a table renumbers what is on it, and on GPT it would ordinarily hand
+every partition a fresh UUID.
+Both would break an
+.Xr fstab 5
+that names partitions by PARTUUID, for partitions whose contents were never
+touched.
+So the identity of everything that was already there is carried through the
+rewrite: the GPT partition UUIDs are read out of the old table and written back
+into the new one, and an MBR disk's four-byte signature - the first half of
+every PARTUUID on it - is preserved the same way.
+Only genuinely new partitions get new identities.
+.Pp
+Every start and length is a whole number of mebibytes.
+GPT reserves the last one for its backup header, and MBR leaves the first one
+free as the gap GRUB's i386-pc core is embedded into.
+.Ss Partition kinds
+.Bl -tag -width "biosboot" -compact
+.It Cm ext4
+An ext4 filesystem, made when the plan is applied.
+.It Cm xfs
+An XFS filesystem.
+.It Cm btrfs
+A Btrfs filesystem.
+.It Cm efi
+A FAT32 EFI System Partition.
+.It Cm biosboot
+The 1 MiB BIOS Boot Partition GRUB embeds into on GPT, left empty.
+MBR has no such type and does not need one.
+.It Cm raid
+A Linux RAID member, left empty for
+.Xr mdadm 8 .
+.It Cm lvm
+An LVM2 physical volume, left empty for
+.Xr pvcreate 8 .
+.El
+.Pp
+The ext4 filesystems it makes have
+.Cm orphan_file
+and
+.Cm metadata_csum_seed
+switched off, for the same reason
+.Xr sowa-setup 8
+does it: e2fsprogs 1.47 turns both on by default and GRUB 2.12's ext2 driver
+can read neither, so a
+.Pa /boot
+made without this lands at a rescue prompt instead of a boot menu.
+.Pp
+A partition read off a disk that is none of these keeps whatever type code it
+was found with and is shown under that code's usual name.
+Such a partition can be kept, moved, resized or deleted; changing its type is
+what makes it one of the kinds above, and doing that marks it to be
+reformatted.
+.Ss Sizes
+Sizes are read the way
+.Xr sfdisk 8
+reads them, because
+.Xr sfdisk 8
+is what eventually receives them: a bare unit letter is a power of 1024, a
+two-letter
+.Dq B
+spelling is a power of 1000, and the explicit
+.Dq iB
+spellings are powers of 1024.
+So
+.Ar 10G
+and
+.Ar 10GiB
+are the same number and
+.Ar 10GB
+is a smaller one.
+.Ar 2048s
+is a number of sectors of the disk's own logical sector size.
+.Pp
+A percentage is of whatever is being filled - the free region a new partition
+is being placed in, the disk a wipe is being sized against - so that
+.Ar 100%
+always means
+.Dq the rest of it .
+.Pp
+A number with no unit at all is refused.
+It is the one input whose intent cannot be read off the text, and the answer
+bytes would give is a partition of the minimum size created without complaint.
+.Ss Wiping
+Wiping is a separate operation from partitioning and happens immediately;
+there is nothing to apply afterwards.
+Its default is the narrow one: the regions that hold a partition table and the
+first and last mebibyte of every partition that is on the disk now.
+That is where filesystem superblocks, LVM labels and every version of an mdadm
+superblock live, so it is what makes a disk stop being recognised as whatever
+it used to be - without writing over a terabyte to do it.
+.Pp
+The whole disk, a stated size or percentage from the start of it, or one whole
+partition can be wiped instead.
+Overlapping regions are merged before anything is written, and a wipe long
+enough to be worth watching reports its progress.
+.Ss Firmware
+Which partition table to use is decided by how the machine's firmware finds a
+bootloader, so
+.Nm
+works that out rather than asking.
+.Pa /sys/firmware/efi
+exists if and only if the kernel was entered through EFI boot services, which
+is the question that matters: a UEFI machine booted through its compatibility
+support module is a BIOS machine as far as the disk is concerned, and will
+still be one on the next boot.
+Secure Boot is read from the
+.Va SecureBoot
+EFI variable through efivarfs.
+.Pp
+GPT is the recommendation either way.
+On a machine that booted through UEFI it is effectively required, because UEFI
+firmware is not obliged to look for an EFI System Partition on an MBR disk and
+plenty of it does not.
+On a machine that booted through BIOS the GPT layout below carries a BIOS Boot
+Partition as well as an ESP, so the disk boots under either firmware.
+.Pp
+Secure Boot is reported because of what it does to the result rather than to
+the layout: Sowa's GRUB image is not signed and no Sowa key is in anybody's
+firmware, so a machine with Secure Boot enabled refuses to load it however the
+disk is laid out.
+No partition layout works around that; it has to be turned off in the firmware
+setup.
+.Ss Volume groups
+.Cm V
+on either screen manages LVM.
+With no volume group on the machine it goes straight to building one out of
+partitions; with one or more it offers those as well.
+Inside a group it lists the volumes, how big each is, what filesystem is on it
+and where it is mounted, and the free space left - and creates, removes and
+formats volumes with the same size widget partitions use.
+.Pp
+Volumes are made when they are asked for rather than planned first.
+LVM has its own idea of a transaction and there is nothing to be gained by
+inventing a second one on top of it.
+.Ss Predefined layouts
+Two layouts that are known to boot Sowa, so that the common case is one
+keystroke rather than four sizes typed by hand.
+Both put the whole of the rest of the disk into an ext4 root, which is what
+.Xr sowa-setup 8
+would have made.
+.Bl -tag -width "dos" -compact
+.It Cm gpt
+1 MiB BIOS boot, 512 MiB EFI System, ext4 for the rest.
+.It Cm dos
+512 MiB EFI System, ext4 for the rest.
+.El
+.Pp
+The MBR layout has no BIOS Boot Partition because MBR has no such type: GRUB's
+i386-pc core goes in the gap between the MBR and the first partition, which the
+alignment leaves free anyway.
+The ESP is in both because it costs half a gigabyte and lets the same disk boot
+under either firmware.
+.Sh SUBCOMMANDS
+.Bl -tag -width Ds
+.It Cm list
+Every disk, with its partition table, size and partitions.
+Needs no privilege.
+.It Cm show Ar disk
+One disk in detail: the table, the sector size, and every partition and free
+region with its start, length and contents.
+Needs no privilege.
+.It Cm firmware
+How this machine booted, whether Secure Boot is enabled, which layout suits it
+and why.
+Needs no privilege.
+.It Cm raw Ar file
+Open the full-screen program on a raw image.
+Needs no privilege beyond write access to the file itself.
+.It Cm label Ar disk Cm gpt | dos
+Write an empty partition table, discarding whatever the current one describes.
+.It Cm scheme Ar disk Cm gpt | dos
+Lay the disk out with one of the predefined layouts above.
+.Fl -esp-size
+sets the EFI System Partition size, which defaults to 512MiB and may not be
+under 34 MiB - below that a FAT32 filesystem cannot reach the 65525 clusters
+.Xr mkfs.fat 8
+requires.
+.It Cm create Ar disk Ar kind Ar size
+Add one partition of that kind, in the largest free region on the disk.
+.Ar size
+may be a percentage of that region.
+.It Cm delete Ar disk Ar number
+Remove one partition from the table.
+What follows it is renumbered.
+.It Cm wipe Ar disk
+Write zeros over it, in the mode
+.Fl -mode
+names:
+.Cm signatures
+(the default),
+.Cm full ,
+.Cm size
+with
+.Fl -size ,
+or
+.Cm partition
+with
+.Fl -partition .
+.It Cm raid Fl -level Ns = Ns Ar n Fl -name Ns = Ns Ar node Ar partition ...
+Create a RAID array from partitions that exist.
+Levels 0, 1, 5, 6 and 10 are offered, with 1.2 metadata - mdadm's own default,
+and the only version the kernel assembles a root from without help.
+.Fl -record
+appends the resulting array to
+.Pa /etc/mdadm.conf ,
+which is what
+.Pa rc.sysinit
+consults when it assembles arrays before mounting
+.Xr fstab 5 .
+.It Cm lvm Fl -vg Ns = Ns Ar name Ar device ...
+Create physical volumes on the named devices and a volume group over them.
+With
+.Fl -lv
+and
+.Fl -size
+it then creates one logical volume, and with
+.Fl -fs
+it makes a filesystem on it.
+A
+.Fl -size
+given as a percentage is passed to
+.Xr lvcreate 8
+as a share of the free extents, which is more accurate than anything computed
+outside LVM.
+.El
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl -yes , Fl y
+Do not ask before writing.
+.It Fl -dry-run , Fl n
+Print every command that would be run and write nothing.
+Every destructive step in this program goes through one place, so this covers
+all of them, and it does not require privilege.
+.It Fl -no-format
+Write the partition table but make no filesystems.
+.It Fl -allow-loop
+Treat loop devices as disks.
+They are not disks and are left out of the listing, which is what stops a live
+system's own medium from appearing as a target; this is for testing.
+.It Fl -sector-size Ns = Ns Ar n
+The sector size a raw image is treated as having: 512, 1024, 2048 or 4096.
+A file has no opinion about this the way a disk does, and 512 is what every
+tool assumes of one unless it is told otherwise.
+Ignored for real devices, which are asked.
+.El
+.Sh RAW IMAGES
+A raw image is a regular file partitioned as though it were a disk.
+Every subcommand takes one wherever it takes a disk, and
+.Cm raw
+opens the full-screen program on it:
+.Bd -literal -offset indent
+fallocate -l 1G fake_disk
+sowa-partitioner raw fake_disk
+.Ed
+.Pp
+Everything a partition table needs is in the bytes of the file and none of it
+is in the fact that a disk is a disk, so the table, the free-space arithmetic,
+the layouts and the wipe all work unchanged.
+Writing to a file needs no privilege beyond the file's own permissions, so this
+does not ask for root.
+.Pp
+The one thing a file cannot have is partition device nodes, and
+.Xr mkfs 8
+has to be pointed at one.
+So filesystems inside an image are made by attaching it with
+.Dq losetup -P ,
+which gives it nodes for as long as it stays attached; that needs root.
+Without it the partition table is still written and the filesystems are simply
+not made, which is said rather than skipped quietly - attach the image and run
+.Xr mkfs 8
+afterwards.
+.Pp
+An image must be a whole number of sectors and at least two mebibytes.
+.Sh KEYS
+In the full-screen program, on the disk list:
+.Bl -tag -width "Enter" -compact
+.It Enter
+Open the disk under the cursor.
+.It Ic s
+Lay the whole thing out for Sowa, with a preview of the result.
+.It Ic l
+Write a new, empty partition table.
+.It Ic f
+What the firmware means for the layout.
+.It Ic R
+Build a RAID array out of partitions.
+.It Ic V
+Manage volume groups and the volumes in them.
+.It Ic r
+Look again.
+.It Ic q
+Quit.
+.El
+.Pp
+On a disk:
+.Bl -tag -width "Enter" -compact
+.It Ic n
+A new partition in the free region under the cursor.
+.It Ic d
+Delete the partition under the cursor.
+.It Ic t
+Change its kind, which marks it to be reformatted.
+.It Ic z
+Resize it.
+Only the end moves; no filesystem is resized with it.
+.It Ic f
+What the firmware means for the layout.
+.It Ic w
+Wipe with zeros.
+.It Ic a
+Apply the plan.
+.It Ic u
+Forget the plan and read the disk again.
+.It Ic q
+Go back.
+.El
+.Pp
+In a volume group,
+.Ic n
+makes a volume,
+.Ic d
+removes one and
+.Ic t
+puts a filesystem on one.
+.Pp
+Where a size is asked for, the left and right arrows move a slider and the
+shifted arrows or PgUp and PgDn move it further; Home and End go to the
+smallest and largest it may be.
+Typing a size replaces it, and the slider follows what is typed as it is typed.
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev SOWA_PARTITIONER_ALLOW_LOOP
+Set to 1, the same as
+.Fl -allow-loop .
+.It Ev NO_COLOR
+Set to anything, colour is not used.
+.It Ev LANG , Ev LC_CTYPE , Ev LC_ALL
+A UTF-8 locale draws the partition map with block characters, and anything else
+draws it with ASCII.
+The Linux console draws box characters only when it has been put in UTF-8 mode,
+and a serial console draws whatever is on the other end of the line.
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa /etc/mdadm.conf
+Where
+.Cm raid Fl -record
+records an array so it is assembled under the same name at every boot.
+.It Pa /sys/firmware/efi
+Present if and only if this system booted through UEFI.
+.It Pa /sys/firmware/efi/efivars
+Where the Secure Boot state is read from, when efivarfs is mounted there.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh EXAMPLES
+Look before touching anything:
+.Bd -literal -offset indent
+sowa-partitioner list
+sowa-partitioner show /dev/sda
+sowa-partitioner firmware
+.Ed
+.Pp
+Try a layout out on a file first, where nothing is at stake:
+.Bd -literal -offset indent
+fallocate -l 10G fake_disk
+sowa-partitioner scheme fake_disk gpt
+sowa-partitioner show fake_disk
+.Ed
+.Pp
+Lay a disk out for Sowa, having been told which table suits the machine:
+.Pp
+.Dl sowa-partitioner scheme /dev/sda gpt
+.Pp
+See what that would do without doing any of it:
+.Pp
+.Dl sowa-partitioner --dry-run scheme /dev/sda gpt
+.Pp
+A disk that came from somewhere else, cleared of every signature it arrived
+with and laid out again, unattended:
+.Bd -literal -offset indent
+sowa-partitioner --yes wipe /dev/sdb
+sowa-partitioner --yes scheme /dev/sdb gpt --esp-size=1G
+.Ed
+.Pp
+A mirror of two disks, with a volume group on it:
+.Bd -literal -offset indent
+sowa-partitioner --yes label /dev/sdb gpt
+sowa-partitioner --yes label /dev/sdc gpt
+sowa-partitioner --yes create /dev/sdb raid 100%
+sowa-partitioner --yes create /dev/sdc raid 100%
+sowa-partitioner --yes raid --level=1 --name=/dev/md0 --record \e
+    /dev/sdb1 /dev/sdc1
+sowa-partitioner --yes lvm --vg=data --lv=files --size=100% --fs=xfs /dev/md0
+.Ed
+.Sh SEE ALSO
+.Xr sowa-setup 8 ,
+.Xr sowa-bootstrap 8 ,
+.Xr sowa-chroot 8 ,
+.Xr sfdisk 8 ,
+.Xr wipefs 8 ,
+.Xr mdadm 8 ,
+.Xr lvm 8
+.Sh CAVEATS
+An MBR table here holds four primary partitions and nothing else.
+Extended and logical partitions exist to get past that limit on disks that
+predate GPT, and the answer on any disk that can hold a modern system is to use
+GPT instead.
+.Pp
+Resizing moves the end of a partition and does not move or resize the
+filesystem inside it.
+Growing one is harmless and the filesystem can be grown into the new space
+afterwards with
+.Xr resize2fs 8 ,
+.Xr xfs_growfs 8
+or
+.Xr btrfs 8 ;
+shrinking one below the size of its filesystem destroys it.
+Nothing here shrinks a filesystem first.
+.Pp
+Applying a plan rewrites the whole table, but it does not renumber it: each
+partition is written back into the slot it already had, and the PARTUUIDs and
+the disk's own identity are carried across with it.
+Deleting a partition frees its number for the next one created, and does not
+move any other.
+.Pp
+The kernel will not re-read a partition table while anything on the disk is
+open, so a disk with a mounted partition, an assembled array member or an
+active physical volume on it cannot be repartitioned.
+.Nm
+checks for mounts and refuses rather than writing a table the kernel then
+declines to read.
+.Pp
+Building a RAID array or a volume group takes device nodes, not intentions, so
+the plan has to have been applied before either can be built on its partitions.
+.Pp
+Nothing here resizes or moves a filesystem, mounts anything, or writes an
+.Xr fstab 5 .
+Making a disk bootable is
+.Xr sowa-setup 8
+and
+.Xr sowa-bootstrap 8 ;
+this program stops at the point where those can be pointed at the result.

@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Sowa Linux — a small, inspectable Linux system built from source. Download the live ISO, disk images, rootfs, and release artifacts.">
+  <meta name="theme-color" content="#07100b">
+  <title>Sowa Linux :: small / inspectable / built from source</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="site.css">
+  <script src="site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">skip to content</a>
+  <div class="scanlines" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="#top" aria-label="Sowa Linux home">
+        <span aria-hidden="true">[</span>SOWA<span class="brand-dim">/OS</span><span aria-hidden="true">]</span>
+      </a>
+
+      <nav class="primary-nav" aria-label="Primary navigation">
+        <a href="#downloads"><span>01</span> downloads</a>
+        <a href="#about"><span>02</span> about</a>
+        <a href="#boot"><span>03</span> quickstart</a>
+        <a href="#terminal"><span>04</span> terminal</a>
+      </nav>
+
+      <div class="system-status" aria-label="Mirror status">
+        <span class="status-light" aria-hidden="true"></span>
+        <span>mirror online</span>
+        <time id="clock" datetime="">--:--:--</time>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top" aria-labelledby="hero-title">
+      <div class="terminal-bar" aria-hidden="true">
+        <span>root@sowa:~#</span>
+        <span>./welcome</span>
+        <span class="terminal-bar-fill">────────────────────────</span>
+        <span>tty1</span>
+      </div>
+
+      <div class="hero-grid">
+        <div class="hero-mark" aria-hidden="true">
+          <pre>
+       ___
+      (o,o)
+      {`"'}
+      -"-"-
+          </pre>
+          <span>SOWA / LINUX</span>
+        </div>
+
+        <div class="hero-copy">
+          <p class="kicker">// RELEASE 0.1 &nbsp;·&nbsp; X86_64 &nbsp;·&nbsp; EXPERIMENTAL</p>
+          <h1 id="hero-title">A Linux system you can see all the way through.</h1>
+          <p class="hero-lede">
+            Small, inspectable, and built from source. Sowa is a headless Linux
+            distribution for people who still want to know what starts at boot.
+          </p>
+
+          <div class="hero-actions" aria-label="Primary actions">
+            <a class="button button-primary" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.iso">[ download live ISO · 289 MiB ]</a>
+            <a class="button" href="#downloads">[ browse all artifacts ]</a>
+          </div>
+
+          <p class="hero-note">
+            <span class="prompt">$</span> BIOS + UEFI &nbsp;/&nbsp; kernel 6.18.44 &nbsp;/&nbsp; no systemd
+          </p>
+        </div>
+      </div>
+
+      <dl class="system-readout" aria-label="Release information">
+        <div><dt>release</dt><dd>0.1</dd></div>
+        <div><dt>arch</dt><dd>x86_64</dd></div>
+        <div><dt>kernel</dt><dd>6.18.44</dd></div>
+        <div><dt>init</dt><dd>sowa-init / SysV</dd></div>
+        <div><dt>published</dt><dd><time datetime="2026-08-29">2026-08-29</time></dd></div>
+      </dl>
+    </section>
+
+    <section class="content-section downloads" id="downloads" aria-labelledby="downloads-title">
+      <div class="section-heading">
+        <div>
+          <p class="command"><span>$</span> ls -lh /releases/0.1</p>
+          <h2 id="downloads-title">Choose your medium.</h2>
+        </div>
+        <p class="section-index">[01 / ARTIFACTS]</p>
+      </div>
+
+      <div class="featured-downloads">
+        <article class="download-panel featured">
+          <div class="panel-topline">
+            <span>01</span>
+            <span>BOOT / INSTALL</span>
+            <span class="recommended">recommended</span>
+          </div>
+          <h3>Live ISO</h3>
+          <p>Boot on bare metal or a VM. Includes the interactive <code>sowa-setup</code> installer.</p>
+          <dl class="file-meta">
+            <div><dt>file</dt><dd>sowa-0.1-x86_64.iso</dd></div>
+            <div><dt>size</dt><dd>289 MiB</dd></div>
+          </dl>
+          <div class="panel-actions">
+            <a href="https://sowa.wolfet.pl/sowa-0.1-x86_64.iso">[ GET ISO ]</a>
+            <a href="https://sowa.wolfet.pl/sowa-0.1-x86_64.iso.sha256">[ SHA256 ]</a>
+          </div>
+        </article>
+
+        <article class="download-panel">
+          <div class="panel-topline">
+            <span>02</span>
+            <span>PHYSICAL / VM</span>
+            <span>xz</span>
+          </div>
+          <h3>RAW disk image</h3>
+          <p>Pre-installed disk for direct writes, loopback inspection, or virtual machines.</p>
+          <dl class="file-meta">
+            <div><dt>file</dt><dd>sowa-0.1-x86_64.img.xz</dd></div>
+            <div><dt>size</dt><dd>239 MiB</dd></div>
+          </dl>
+          <div class="panel-actions">
+            <a href="https://sowa.wolfet.pl/sowa-0.1-x86_64.img.xz">[ GET IMG.XZ ]</a>
+            <a href="https://sowa.wolfet.pl/sowa-0.1-x86_64.img.xz.sha256">[ SHA256 ]</a>
+          </div>
+        </article>
+
+        <article class="download-panel">
+          <div class="panel-topline">
+            <span>03</span>
+            <span>QEMU / KVM</span>
+            <span>xz</span>
+          </div>
+          <h3>QCOW2 image</h3>
+          <p>Compact, pre-installed image for QEMU and KVM with copy-on-write support.</p>
+          <dl class="file-meta">
+            <div><dt>file</dt><dd>sowa-0.1-x86_64.qcow2.xz</dd></div>
+            <div><dt>size</dt><dd>238 MiB</dd></div>
+          </dl>
+          <div class="panel-actions">
+            <a href="https://sowa.wolfet.pl/sowa-0.1-x86_64.qcow2.xz">[ GET QCOW2.XZ ]</a>
+            <a href="https://sowa.wolfet.pl/sowa-0.1-x86_64.qcow2.xz.sha256">[ SHA256 ]</a>
+          </div>
+        </article>
+      </div>
+
+      <div class="catalog-header">
+        <h3>Complete release catalog</h3>
+        <div class="filters" role="group" aria-label="Filter artifacts">
+          <button type="button" class="filter is-active" data-filter="all" aria-pressed="true">[ all ]</button>
+          <button type="button" class="filter" data-filter="image" aria-pressed="false">[ images ]</button>
+          <button type="button" class="filter" data-filter="system" aria-pressed="false">[ system ]</button>
+          <button type="button" class="filter" data-filter="build" aria-pressed="false">[ build ]</button>
+        </div>
+      </div>
+
+      <div class="artifact-table" role="table" aria-label="Sowa 0.1 artifacts">
+        <div class="artifact-row artifact-head" role="row">
+          <span role="columnheader">mode</span>
+          <span role="columnheader">artifact</span>
+          <span role="columnheader">size</span>
+          <span role="columnheader">action</span>
+        </div>
+
+        <div class="artifact-row" role="row" data-category="image">
+          <span role="cell" data-label="mode">boot</span>
+          <a role="cell" data-label="artifact" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.iso">sowa-0.1-x86_64.iso</a>
+          <span role="cell" data-label="size">289 MiB</span>
+          <a role="cell" data-label="action" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.iso.sha256">sha256</a>
+        </div>
+        <div class="artifact-row" role="row" data-category="image">
+          <span role="cell" data-label="mode">raw / xz</span>
+          <a role="cell" data-label="artifact" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.img.xz">sowa-0.1-x86_64.img.xz</a>
+          <span role="cell" data-label="size">239 MiB</span>
+          <a role="cell" data-label="action" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.img.xz.sha256">sha256</a>
+        </div>
+        <div class="artifact-row" role="row" data-category="image">
+          <span role="cell" data-label="mode">raw</span>
+          <a role="cell" data-label="artifact" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.img">sowa-0.1-x86_64.img</a>
+          <span role="cell" data-label="size">2.0 GiB</span>
+          <span role="cell" data-label="action">—</span>
+        </div>
+        <div class="artifact-row" role="row" data-category="image">
+          <span role="cell" data-label="mode">qcow2 / xz</span>
+          <a role="cell" data-label="artifact" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.qcow2.xz">sowa-0.1-x86_64.qcow2.xz</a>
+          <span role="cell" data-label="size">238 MiB</span>
+          <a role="cell" data-label="action" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.qcow2.xz.sha256">sha256</a>
+        </div>
+        <div class="artifact-row" role="row" data-category="image">
+          <span role="cell" data-label="mode">qcow2</span>
+          <a role="cell" data-label="artifact" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.qcow2">sowa-0.1-x86_64.qcow2</a>
+          <span role="cell" data-label="size">1.1 GiB</span>
+          <span role="cell" data-label="action">—</span>
+        </div>
+        <div class="artifact-row" role="row" data-category="system">
+          <span role="cell" data-label="mode">rootfs</span>
+          <a role="cell" data-label="artifact" href="https://sowa.wolfet.pl/sowa-0.1-x86_64-rootfs.tar.xz">sowa-0.1-x86_64-rootfs.tar.xz</a>
+          <span role="cell" data-label="size">239 MiB</span>
+          <a role="cell" data-label="action" href="https://sowa.wolfet.pl/sowa-0.1-x86_64-rootfs.tar.xz.sha256">sha256</a>
+        </div>
+        <div class="artifact-row" role="row" data-category="system">
+          <span role="cell" data-label="mode">recovery</span>
+          <a role="cell" data-label="artifact" href="https://sowa.wolfet.pl/sowa-0.1-x86_64-recovery.cpio.xz">sowa-0.1-x86_64-recovery.cpio.xz</a>
+          <span role="cell" data-label="size">236 MiB</span>
+          <a role="cell" data-label="action" href="https://sowa.wolfet.pl/sowa-0.1-x86_64-recovery.cpio.xz.sha256">sha256</a>
+        </div>
+        <div class="artifact-row" role="row" data-category="system">
+          <span role="cell" data-label="mode">docker</span>
+          <a role="cell" data-label="artifact" href="https://sowa.wolfet.pl/sowa-0.1-x86_64-docker.tar">sowa-0.1-x86_64-docker.tar</a>
+          <span role="cell" data-label="size">968 MiB</span>
+          <a role="cell" data-label="action" href="https://sowa.wolfet.pl/sowa-0.1-x86_64-docker.tar.sha256">sha256</a>
+        </div>
+        <div class="artifact-row" role="row" data-category="system">
+          <span role="cell" data-label="mode">installer</span>
+          <a role="cell" data-label="artifact" href="https://sowa.wolfet.pl/sowa-install">sowa-install</a>
+          <span role="cell" data-label="size">77 KiB</span>
+          <a role="cell" data-label="action" href="https://sowa.wolfet.pl/sowa-install.sha256">sha256</a>
+        </div>
+        <div class="artifact-row" role="row" data-category="build">
+          <span role="cell" data-label="mode">squashfs</span>
+          <a role="cell" data-label="artifact" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.sfs">sowa-0.1-x86_64.sfs</a>
+          <span role="cell" data-label="size">250 MiB</span>
+          <a role="cell" data-label="action" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.sfs.sha256">sha256</a>
+        </div>
+        <div class="artifact-row" role="row" data-category="build">
+          <span role="cell" data-label="mode">initramfs</span>
+          <a role="cell" data-label="artifact" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.cpio.xz">sowa-0.1-x86_64.cpio.xz</a>
+          <span role="cell" data-label="size">301 KiB</span>
+          <a role="cell" data-label="action" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.cpio.xz.sha256">sha256</a>
+        </div>
+        <div class="artifact-row" role="row" data-category="build">
+          <span role="cell" data-label="mode">kernel</span>
+          <a role="cell" data-label="artifact" href="https://sowa.wolfet.pl/vmlinuz-6.18.44-x86_64">vmlinuz-6.18.44-x86_64</a>
+          <span role="cell" data-label="size">18 MiB</span>
+          <span role="cell" data-label="action">—</span>
+        </div>
+        <div class="artifact-row" role="row" data-category="build">
+          <span role="cell" data-label="mode">config</span>
+          <a role="cell" data-label="artifact" href="https://sowa.wolfet.pl/kernel-6.18.44-x86_64.config">kernel-6.18.44-x86_64.config</a>
+          <span role="cell" data-label="size">152 KiB</span>
+          <span role="cell" data-label="action">plain text</span>
+        </div>
+      </div>
+
+      <div class="repository-links">
+        <p><span class="prompt">+</span> Need individual packages? <a href="https://sowa.wolfet.pl/x86_64/">browse /x86_64/</a> or fetch the <a href="https://sowa.wolfet.pl/x86_64/index">signed package index</a> + <a href="https://sowa.wolfet.pl/x86_64/index.sig">signature</a>.</p>
+        <p><span class="prompt">+</span> Auditing the inputs? <a href="https://sowa.wolfet.pl/sources/">browse pinned source archives</a>.</p>
+      </div>
+    </section>
+
+    <section class="content-section about" id="about" aria-labelledby="about-title">
+      <div class="section-heading">
+        <div>
+          <p class="command"><span>$</span> man sowa</p>
+          <h2 id="about-title">Understand the whole machine.</h2>
+        </div>
+        <p class="section-index">[02 / ABOUT]</p>
+      </div>
+
+      <div class="about-grid">
+        <div class="about-copy">
+          <p class="large-copy">
+            Sowa is a standalone, experimental distribution for servers and
+            headless environments. It builds an x86_64 toolchain, kernel,
+            userspace, live media, and signed package repository without
+            installing files into the host system.
+          </p>
+          <p>
+            It is intentionally compact, legible, and old-school. There is no
+            fixed release cycle and no promise of backward compatibility—just
+            an honest system you can inspect, modify, and rebuild.
+          </p>
+          <div class="text-links">
+            <a href="https://github.com/c0m4r/sowa">[ source on github ]</a>
+            <a href="https://github.com/c0m4r/sowa/tree/main/docs">[ read the manual ]</a>
+            <a href="https://github.com/c0m4r/sowa/blob/main/LICENSE">[ gpl-3.0-or-later ]</a>
+          </div>
+        </div>
+
+        <div class="manifest" aria-label="System features">
+          <p class="manifest-title">/etc/sowa-release</p>
+          <ul>
+            <li><span>+</span> custom SysV-style init</li>
+            <li><span>+</span> signed binary package repository</li>
+            <li><span>+</span> <code>sowa-pkg</code> package manager</li>
+            <li><span>+</span> BIOS + UEFI live boot</li>
+            <li><span>+</span> declarative networking via <code>nic</code></li>
+            <li><span>+</span> root SSH keys only by default</li>
+            <li><span>+</span> Docker + GNU Guix available</li>
+            <li><span>+</span> reproducible, pinned build inputs</li>
+          </ul>
+          <p class="manifest-end">-- end of file --</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="content-section quickstart" id="boot" aria-labelledby="boot-title">
+      <div class="section-heading">
+        <div>
+          <p class="command"><span>$</span> less /root/sowa-howto/installing.txt</p>
+          <h2 id="boot-title">Boot it. Inspect it. Keep it.</h2>
+        </div>
+        <p class="section-index">[03 / QUICKSTART]</p>
+      </div>
+
+      <ol class="steps">
+        <li>
+          <span class="step-number">01</span>
+          <div>
+            <h3>Download + verify</h3>
+            <p>Keep the image and checksum file together.</p>
+            <div class="code-line">
+              <code>sha256sum -c sowa-0.1-x86_64.iso.sha256</code>
+              <button type="button" data-copy="sha256sum -c sowa-0.1-x86_64.iso.sha256" aria-label="Copy checksum command">[ copy ]</button>
+            </div>
+          </div>
+        </li>
+        <li>
+          <span class="step-number">02</span>
+          <div>
+            <h3>Test in QEMU</h3>
+            <p>Give the live system 2 GiB of memory and a serial console.</p>
+            <div class="code-line">
+              <code>qemu-system-x86_64 -m 2G -cdrom sowa-0.1-x86_64.iso -nographic</code>
+              <button type="button" data-copy="qemu-system-x86_64 -m 2G -cdrom sowa-0.1-x86_64.iso -nographic" aria-label="Copy QEMU command">[ copy ]</button>
+            </div>
+          </div>
+        </li>
+        <li>
+          <span class="step-number">03</span>
+          <div>
+            <h3>Install from live</h3>
+            <p>Log in as root on the local console, then launch setup.</p>
+            <div class="code-line">
+              <code>sowa-setup</code>
+              <button type="button" data-copy="sowa-setup" aria-label="Copy installer command">[ copy ]</button>
+            </div>
+          </div>
+        </li>
+      </ol>
+
+      <div class="warning" role="note">
+        <span aria-hidden="true">!</span>
+        <p><strong>EXPERIMENTAL SYSTEM.</strong> Read the <a href="https://github.com/c0m4r/sowa/blob/main/docs/install.md">installation guide</a> before touching a real disk. You are expected to know where your backups are.</p>
+      </div>
+    </section>
+
+    <section class="content-section interactive-terminal" id="terminal" aria-labelledby="terminal-title">
+      <div class="section-heading">
+        <div>
+          <p class="command"><span>$</span> /bin/sh</p>
+          <h2 id="terminal-title">Still here? Type something.</h2>
+        </div>
+        <p class="section-index">[04 / TERMINAL]</p>
+      </div>
+
+      <div class="terminal-window">
+        <div class="terminal-titlebar">
+          <span>SOWA CONSOLE</span>
+          <span>80×24</span>
+        </div>
+        <div id="terminal-output" class="terminal-output" role="log" aria-live="polite">Sowa Linux 0.1 (tty-web)
+Type 'help' for available commands.</div>
+        <form id="terminal-form" class="terminal-form" autocomplete="off">
+          <label for="terminal-input"><span>guest@sowa</span>:~$</label>
+          <input id="terminal-input" name="command" type="text" inputmode="text" spellcheck="false" aria-describedby="terminal-hint">
+          <span class="cursor" aria-hidden="true"></span>
+        </form>
+        <p id="terminal-hint" class="sr-only">Try help, ls, uname -a, downloads, about, date, theme amber, theme green, or clear.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div>
+      <p><span class="prompt">root@sowa:~#</span> <span class="footer-cursor" aria-hidden="true">_</span></p>
+      <p>Sowa Linux 0.1 · x86_64 · GPL-3.0-or-later</p>
+    </div>
+    <div class="footer-links">
+      <a href="https://sowa.wolfet.pl/">artifact mirror</a>
+      <a href="https://github.com/c0m4r/sowa">source</a>
+      <a href="#top">return to top ↑</a>
+    </div>
+  </footer>
+
+  <noscript>
+    <div class="noscript">JavaScript is off. Good. Downloads and navigation still work; only filters, copy buttons, the clock, and the toy terminal are disabled.</div>
+  </noscript>
+</body>
+</html>

@@ -1,0 +1,41 @@
+Git and GnuPG
+=============
+
+Git is the full one, with the HTTPS and SSH transports and "git grep -P":
+
+    git clone https://example.org/repo.git
+    git clone ssh://git@example.org/repo.git    # uses the OpenSSH client
+    git config --global user.name  "Your Name"
+    git config --global user.email you@example.org
+
+It pages with less and edits with vi - GNU less and Vim - and
+$PAGER, $EDITOR, "git config core.pager" and "git config core.editor" override
+both. "git help commit" formats the page with man, which is mandoc; "git commit
+-h" prints the summary without leaving the terminal.
+
+GnuPG is gpg 2.5 with its agent, dirmngr and pinentry:
+
+    gpg --full-generate-key             # pinentry asks on the terminal
+    gpg --list-keys / --list-secret-keys
+    gpg --armor --export you@example.org
+    gpg --detach-sign --armor file      # and gpg --verify file.asc file
+    gpg -c file                         # symmetric, no key needed
+
+Keys and the agent's sockets live in ~/.gnupg. /usr/bin/pinentry is a link to
+pinentry-curses; put "pinentry-program /usr/bin/pinentry-tty" in
+~/.gnupg/gpg-agent.conf for the plainer prompt, and use "--pinentry-mode
+loopback" with "--passphrase-fd" in a script that must not prompt at all.
+
+Fetching a key needs the network, and hkps works because dirmngr is built with
+TLS and trusts /etc/ssl/certs/ca-certificates.crt:
+
+    gpg --keyserver hkps://keys.openpgp.org --recv-keys <fingerprint>
+    gpg --locate-external-key you@example.org   # Web Key Directory
+
+gpgv is the small half: it verifies a signature against a keyring and nothing
+else, which is what a script should use.
+
+    gpgv --keyring /path/to/keyring.gpg thing.tar.xz.sig thing.tar.xz
+
+There is no SQLite in the image, so the TOFU trust model and keyboxd are not
+built; keys are kept in the keyring files gpg has always used.

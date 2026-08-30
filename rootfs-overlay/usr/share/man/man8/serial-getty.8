@@ -1,0 +1,136 @@
+.Dd August 17, 2026
+.Dt SERIAL-GETTY 8
+.Os Sowa
+.Sh NAME
+.Nm serial-getty
+.Nd a login prompt on a serial line, once there is a serial line
+.Sh SYNOPSIS
+.Nm
+.Ar line
+.Op Ar baud
+.Op Ar termtype
+.Sh DESCRIPTION
+.Xr inittab 5
+runs one getty per console, and a serial port is the one console that may not be
+there.
+.Nm
+is what stands in front of
+.Xr agetty 8
+for those: it asks the kernel whether the port has a chip behind it and only
+then execs the getty.
+.Pp
+.Xr agetty 8
+on a port with no UART behind it does not fail the way a missing device would.
+It opens fine - the 8250 driver registers ttyS0 through ttyS3 for the legacy
+addresses whether or not anything answers - then blocks writing the prompt,
+gives up about ten seconds later, and exits.
+.Xr init 8
+respawns it, and ten of those inside two minutes is exactly what init calls
+respawning too fast, so the entry is disabled for five minutes and then starts
+over, for the life of the machine.
+Nobody sees any of it:
+.Xr init 8
+reports it on
+.Pa /dev/console ,
+which on the machine this happens to - one booted with
+.Ar console=ttyS0
+and no serial port, which is what the ISO's kernel command line does to a
+laptop - is that same absent port.
+.Pp
+So the kernel is asked first.
+The 8250 driver autoconfigures every port it registers and reports what it found
+in
+.Pa /proc/tty/driver/serial :
+.Ql uart:16550A
+for a port with a chip behind it,
+.Ql uart:unknown
+for one without.
+That file is the only thing that knows the difference.
+.Pa /sys/class/tty/console/active
+lists ttyS0 either way, because it answers
+.Dq which consoles did the kernel register ,
+and registering a console does not probe for hardware.
+.Pp
+With no UART,
+.Nm
+waits and rechecks once a minute rather than exiting, because exiting is what
+starts the respawn loop it exists to prevent.
+A port that appears later still gets its prompt.
+.Pp
+Only the legacy 8250 lines can be phantoms.
+Anything else - a USB adapter, a hypervisor console - exists as a device only
+when it is real, so a
+.Ar line
+that is not
+.Pa ttyS Ns Ar N
+is handed straight to
+.Xr agetty 8 .
+.Sh ARGUMENTS
+.Bl -tag -width termtype
+.It Ar line
+The tty, named without
+.Pa /dev :
+.Ar ttyS0 .
+Required.
+.It Ar baud
+The line speed.
+The default is 115200.
+.It Ar termtype
+What to put in
+.Ev TERM
+for the session handed to
+.Xr login 1 .
+The default is
+.Ar xterm-256color .
+.El
+.Pp
+That default is a guess about hardware at the far end of a wire, and the getty
+has no way to ask, so the only question is which guess is wrong less often.
+It used to be
+.Ar vt100 ,
+which is the safest thing that can be said about a serial line and also the most
+useless: a real VT100 has no colour at all - terminfo reports
+.Ql colors: -1
+for it, not zero - and no
+.Ql kdch1 ,
+the capability that says what the Delete key sends.
+Everything that reads terminfo believes it.
+.Xr htop 1
+draws in monochrome because it is told there are no colour pairs to allocate,
+readline leaves Delete unbound because nothing claims the sequence, and a pager
+asked for colour it cannot produce prints the escapes themselves.
+Nothing on the other end of this port has been a VT100 in forty years; it is
+QEMU forwarding stdio to a terminal emulator, or screen, or minicom.
+.Pp
+.Ar vt220
+is the conservative choice worth knowing about: still no colour, but unlike
+.Ar vt100
+it does define
+.Ql kdch1 ,
+so Delete works.
+.Sh FILES
+.Bl -tag -width "/proc/tty/driver/serial" -compact
+.It Pa /proc/tty/driver/serial
+what the kernel found on each 8250 port.
+.It Pa /etc/inittab
+where the getty entries are.
+.El
+.Sh EXIT STATUS
+It does not normally exit: it execs
+.Xr agetty 8 ,
+or waits for a port to appear.
+Bad arguments exit 2.
+.Sh EXAMPLES
+The shipped inittab entry:
+.Bd -literal -offset indent
+s0:12345:respawn:@/usr/sbin/serial-getty ttyS0 115200
+.Ed
+.Pp
+A genuine DEC terminal at 9600 baud:
+.Bd -literal -offset indent
+s0:12345:respawn:@/usr/sbin/serial-getty ttyS0 9600 vt220
+.Ed
+.Sh SEE ALSO
+.Xr inittab 5 ,
+.Xr agetty 8 ,
+.Xr init 8

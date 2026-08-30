@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Sowa Linux — a small, inspectable Linux system built from source.">
+  <title>Sowa Linux 0.1</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="site.css">
+</head>
+<body>
+  <a class="skip-link" href="#content">[skip to content]</a>
+
+  <header id="top">
+    <pre class="owl" aria-hidden="true">
+       ___
+      (o,o)
+      {`"'}
+      -"-"-
+    </pre>
+
+    <pre class="wordmark" aria-label="Sowa Linux">
+  ____     ___   __        __    _
+ / ___|   / _ \  \ \      / /   / \
+ \___ \  | | | |  \ \ /\ / /   / _ \
+  ___) | | |_| |   \ V  V /   / ___ \
+ |____/   \___/     \_/\_/   /_/   \_\
+    </pre>
+
+    <p class="tagline">S M A L L&nbsp;&nbsp;*&nbsp;&nbsp;I N S P E C T A B L E&nbsp;&nbsp;*&nbsp;&nbsp;B U I L T&nbsp;&nbsp;F R O M&nbsp;&nbsp;S O U R C E</p>
+
+    <p class="nav">
+      [ <a href="#about">ABOUT</a> ]
+      [ <a href="#downloads">DOWNLOADS</a> ]
+      [ <a href="#quickstart">QUICK START</a> ]
+      [ <a href="https://github.com/c0m4r/sowa">SOURCE CODE</a> ]
+      [ <a href="https://github.com/c0m4r/sowa/tree/main/docs">MANUAL</a> ]
+    </p>
+  </header>
+
+  <div class="ascii-rule" aria-hidden="true">================================================================================</div>
+
+  <main id="content">
+    <section class="intro" aria-labelledby="intro-title">
+      <p class="announcement">*** SOWA LINUX 0.1 IS AVAILABLE FOR X86_64 ***</p>
+
+      <h1 id="intro-title">Welcome to the Sowa Linux home page</h1>
+
+      <p>
+        Sowa is a small, experimental Linux distribution for servers and
+        headless machines. It is built from source, uses its own SysV-style
+        init, and tries to keep the whole system small enough to understand.
+      </p>
+
+      <p class="big-link">
+        &gt;&gt;&gt; <a href="https://sowa.wolfet.pl/sowa-0.1-x86_64.iso"><strong>DOWNLOAD THE LIVE ISO (289 MiB)</strong></a> &lt;&lt;&lt;
+      </p>
+
+      <pre class="facts" aria-label="Current release information">
+CURRENT RELEASE : 0.1
+ARCHITECTURE    : x86_64
+KERNEL         : Linux 6.18.44
+INIT           : sowa-init (SysV style)
+BOOT           : BIOS and UEFI
+STATUS         : experimental / no warranty
+LAST UPDATED   : 29 August 2026
+      </pre>
+    </section>
+
+    <div class="ascii-rule" aria-hidden="true">--------------------------------------------------------------------------------</div>
+
+    <section id="about" aria-labelledby="about-title">
+      <p class="location">sowa@www:~$ cat ABOUT.TXT</p>
+      <h2 id="about-title">== WHAT IS SOWA? ==</h2>
+
+      <p>
+        Sowa builds an x86_64 toolchain, kernel, userspace, live ISO,
+        installable disk images, and a signed binary package repository without
+        installing files into the host system. It is aimed at power users who
+        miss small Unix-like systems and do not want systemd.
+      </p>
+
+      <pre class="feature-list" aria-label="Sowa features">
+[+] custom System V-style init and service framework
+[+] sowa-pkg package manager with a signed package repository
+[+] live media for both legacy BIOS and UEFI
+[+] declarative network configuration through "nic"
+[+] SSH enabled with key-only root access by default
+[+] Docker and GNU Guix available as optional packages
+[+] pinned source archives and per-package file ownership
+[+] no fixed release cycle, update model, or compatibility promise
+      </pre>
+
+      <p>
+        If you want a polished desktop, this is not it. If you want to build a
+        machine from the ground up and see what every part is doing, you may be
+        in the right place.
+      </p>
+
+      <p>
+        Read: <a href="https://github.com/c0m4r/sowa/blob/main/README.md">README</a> |
+        <a href="https://github.com/c0m4r/sowa/tree/main/docs">documentation index</a> |
+        <a href="https://github.com/c0m4r/sowa/blob/main/docs/architecture.md">architecture</a> |
+        <a href="https://github.com/c0m4r/sowa/blob/main/LICENSE">license</a>
+      </p>
+    </section>
+
+    <div class="ascii-rule" aria-hidden="true">--------------------------------------------------------------------------------</div>
+
+    <section id="downloads" aria-labelledby="downloads-title">
+      <p class="location">sowa@www:~$ ls -lh /releases/0.1/</p>
+      <h2 id="downloads-title">== DOWNLOADS ==</h2>
+
+      <p>
+        All files below come directly from
+        <a href="https://sowa.wolfet.pl/">sowa.wolfet.pl</a>.
+        Download the matching <code>.sha256</code> file when one is available.
+      </p>
+
+      <h3>--- bootable media and disk images ---</h3>
+
+      <div class="file-list" role="table" aria-label="Boot and disk image downloads">
+        <div class="file-row file-head" role="row">
+          <span role="columnheader">TYPE</span><span role="columnheader">FILE</span><span role="columnheader">SIZE</span><span role="columnheader">CHECK</span>
+        </div>
+        <div class="file-row" role="row">
+          <span role="cell">[LIVE ISO]</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.iso">sowa-0.1-x86_64.iso</a><span role="cell">289 MiB</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.iso.sha256">SHA256</a>
+        </div>
+        <div class="file-row" role="row">
+          <span role="cell">[RAW/XZ]</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.img.xz">sowa-0.1-x86_64.img.xz</a><span role="cell">239 MiB</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.img.xz.sha256">SHA256</a>
+        </div>
+        <div class="file-row" role="row">
+          <span role="cell">[RAW]</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.img">sowa-0.1-x86_64.img</a><span role="cell">2.0 GiB</span><span role="cell">---</span>
+        </div>
+        <div class="file-row" role="row">
+          <span role="cell">[QCOW2/XZ]</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.qcow2.xz">sowa-0.1-x86_64.qcow2.xz</a><span role="cell">238 MiB</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.qcow2.xz.sha256">SHA256</a>
+        </div>
+        <div class="file-row" role="row">
+          <span role="cell">[QCOW2]</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.qcow2">sowa-0.1-x86_64.qcow2</a><span role="cell">1.1 GiB</span><span role="cell">---</span>
+        </div>
+      </div>
+
+      <h3>--- system archives and installer ---</h3>
+
+      <div class="file-list" role="table" aria-label="System archive downloads">
+        <div class="file-row file-head" role="row">
+          <span role="columnheader">TYPE</span><span role="columnheader">FILE</span><span role="columnheader">SIZE</span><span role="columnheader">CHECK</span>
+        </div>
+        <div class="file-row" role="row">
+          <span role="cell">[ROOTFS]</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64-rootfs.tar.xz">sowa-0.1-x86_64-rootfs.tar.xz</a><span role="cell">239 MiB</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64-rootfs.tar.xz.sha256">SHA256</a>
+        </div>
+        <div class="file-row" role="row">
+          <span role="cell">[RECOVERY]</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64-recovery.cpio.xz">sowa-0.1-x86_64-recovery.cpio.xz</a><span role="cell">236 MiB</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64-recovery.cpio.xz.sha256">SHA256</a>
+        </div>
+        <div class="file-row" role="row">
+          <span role="cell">[DOCKER]</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64-docker.tar">sowa-0.1-x86_64-docker.tar</a><span role="cell">968 MiB</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64-docker.tar.sha256">SHA256</a>
+        </div>
+        <div class="file-row" role="row">
+          <span role="cell">[INSTALLER]</span><a role="cell" href="https://sowa.wolfet.pl/sowa-install">sowa-install</a><span role="cell">77 KiB</span><a role="cell" href="https://sowa.wolfet.pl/sowa-install.sha256">SHA256</a>
+        </div>
+      </div>
+
+      <h3>--- kernel and live-system parts ---</h3>
+
+      <div class="file-list" role="table" aria-label="Kernel and live system downloads">
+        <div class="file-row file-head" role="row">
+          <span role="columnheader">TYPE</span><span role="columnheader">FILE</span><span role="columnheader">SIZE</span><span role="columnheader">CHECK</span>
+        </div>
+        <div class="file-row" role="row">
+          <span role="cell">[SQUASHFS]</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.sfs">sowa-0.1-x86_64.sfs</a><span role="cell">250 MiB</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.sfs.sha256">SHA256</a>
+        </div>
+        <div class="file-row" role="row">
+          <span role="cell">[INITRAMFS]</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.cpio.xz">sowa-0.1-x86_64.cpio.xz</a><span role="cell">301 KiB</span><a role="cell" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.cpio.xz.sha256">SHA256</a>
+        </div>
+        <div class="file-row" role="row">
+          <span role="cell">[KERNEL]</span><a role="cell" href="https://sowa.wolfet.pl/vmlinuz-6.18.44-x86_64">vmlinuz-6.18.44-x86_64</a><span role="cell">18 MiB</span><span role="cell">---</span>
+        </div>
+        <div class="file-row" role="row">
+          <span role="cell">[CONFIG]</span><a role="cell" href="https://sowa.wolfet.pl/kernel-6.18.44-x86_64.config">kernel-6.18.44-x86_64.config</a><span role="cell">152 KiB</span><span role="cell">TEXT</span>
+        </div>
+      </div>
+
+      <p class="more-downloads">
+        <span>[ <a href="https://sowa.wolfet.pl/x86_64/">X86_64 PACKAGE DIRECTORY</a> ]</span>
+        <span>[ <a href="https://sowa.wolfet.pl/x86_64/index">PACKAGE INDEX</a> ]</span>
+        <span>[ <a href="https://sowa.wolfet.pl/x86_64/index.sig">INDEX SIGNATURE</a> ]</span>
+        <span>[ <a href="https://sowa.wolfet.pl/sources/">PINNED SOURCES</a> ]</span>
+      </p>
+    </section>
+
+    <div class="ascii-rule" aria-hidden="true">--------------------------------------------------------------------------------</div>
+
+    <section id="quickstart" aria-labelledby="quickstart-title">
+      <p class="location">root@sowa:~# less /root/sowa-howto/installing.txt</p>
+      <h2 id="quickstart-title">== QUICK START ==</h2>
+
+      <h3>1. Download and check the ISO</h3>
+      <pre class="code">$ sha256sum -c sowa-0.1-x86_64.iso.sha256</pre>
+
+      <h3>2. Boot it in QEMU</h3>
+      <pre class="code">$ qemu-system-x86_64 -m 2G -cdrom sowa-0.1-x86_64.iso -nographic</pre>
+
+      <h3>3. Install from the live system</h3>
+      <pre class="code"># sowa-setup</pre>
+
+      <p>
+        The live console logs in as root without a password. Remote root login
+        stays disabled until you install an SSH key. Read the
+        <a href="https://github.com/c0m4r/sowa/blob/main/docs/install.md">installation guide</a>
+        before writing to a real disk.
+      </p>
+
+      <p class="warning">
+        !!! WARNING: THE INSTALLER CAN ERASE AN ENTIRE DISK. KEEP BACKUPS. !!!
+      </p>
+    </section>
+  </main>
+
+  <div class="ascii-rule" aria-hidden="true">================================================================================</div>
+
+  <footer>
+    <p>
+      [ <a href="#top">TOP</a> ]
+      [ <a href="https://github.com/c0m4r/sowa">GITHUB</a> ]
+      [ <a href="https://sowa.wolfet.pl/">FILE MIRROR</a> ]
+    </p>
+    <p>Sowa Linux 0.1 / GPL-3.0-or-later / Linux is a registered trademark of Linus Torvalds.</p>
+    <p>This page contains 0 images, 0 cookies, 0 trackers, and 0 JavaScript.</p>
+    <p>Best viewed with any browser that can display plain text.</p>
+    <pre aria-hidden="true">[EOF]</pre>
+  </footer>
+</body>
+</html>

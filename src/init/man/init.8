@@ -1,0 +1,235 @@
+.Dd August 17, 2026
+.Dt INIT 8
+.Os Sowa
+.Sh NAME
+.Nm init
+.Nd process control initialization
+.Sh SYNOPSIS
+.Nm
+.Op Ar runlevel
+.Sh DESCRIPTION
+.Nm
+is process 1: the kernel starts it once the root filesystem is mounted, and it
+is the ancestor of everything else on the machine.
+It reads
+.Xr inittab 5 ,
+runs the entries the current runlevel asks for, keeps the respawning ones
+alive, reaps whatever the system orphans onto it, listens on
+.Pa /run/initctl
+for
+.Xr telinit 8
+and
+.Xr shutdown 8 ,
+and takes the machine down itself when it reaches runlevel 0 or 6.
+.Pp
+This is System V style init.
+Nothing here supervises a service that dies: a daemon that exits stays exited
+until something starts it again.
+What is respawned is what
+.Xr inittab 5
+says to respawn, which in a shipped image is the login prompt on each console.
+.Ss Runlevels
+A runlevel is a state of the machine, named by one character, and the entries
+in
+.Xr inittab 5
+say which of them each entry belongs to.
+Sowa uses them as follows:
+.Bl -tag -width "S  " -compact -offset indent
+.It 0
+halt or power off
+.It 1
+single user with the rc scripts run: services stopped, console login
+.It 2
+multi user
+.It 3
+multi user, and the default
+.It 4
+multi user, free for local use
+.It 5
+multi user, free for local use; nothing here manages a display
+.It 6
+reboot
+.It S
+single user without the rc scripts: a root shell and nothing else
+.El
+.Pp
+The runlevel to enter at boot comes from the
+.Cm initdefault
+entry in
+.Xr inittab 5 ,
+unless the kernel command line overrides it.
+Runlevels 2 through 5 differ only in what has been linked into their
+.Pa /etc/rc.d/rc Ns Ar N Ns Pa .d
+directory; see
+.Xr chkconfig 8 .
+.Ss The boot
+.Nm
+runs the
+.Cm sysinit
+entry first and waits for it.
+In a shipped image that is
+.Pa /etc/rc.d/rc.sysinit ,
+which mounts
+.Pa /proc ,
+.Pa /sys ,
+.Pa /dev
+and
+.Pa /run ,
+sets the hostname and brings the loopback interface up.
+Only then is a runlevel entered, which runs
+.Pa /etc/rc.d/rc
+against the links in that runlevel's directory.
+.Pp
+Each process
+.Nm
+starts is given the environment a service is expected to boot in and nothing
+else:
+.Ev PATH
+is
+.Pa /bin:/sbin:/usr/bin:/usr/sbin ,
+.Ev HOME
+is
+.Pa / ,
+.Ev CONSOLE
+is
+.Pa /dev/console ,
+.Ev RUNLEVEL
+and
+.Ev PREVLEVEL
+name the runlevel being entered and the one before it, and
+.Ev INIT_VERSION
+says which init this is.
+A command containing a shell metacharacter is run through
+.Pa /bin/sh -c ;
+anything else is executed directly.
+Its standard input, output and error are the console, unless the entry is
+marked
+.Qq @
+in
+.Xr inittab 5 ,
+which is what a getty needs.
+.Pp
+A respawning entry that starts more than ten times in two minutes is treated as
+broken: it is disabled for five minutes, with a line on the console saying so,
+and then tried again.
+.Ss The kernel command line
+Arguments the kernel did not recognise are passed to
+.Nm ,
+which is how these have reached init since the beginning:
+.Bl -tag -width "emergency" -offset indent
+.It Ar 0-6 , Cm S , Cm s
+enter that runlevel instead of the
+.Cm initdefault
+one.
+.It Cm single , Fl s
+runlevel S: everything mounted, nothing started, a root shell on the console.
+.It Cm emergency , Fl b
+a root shell and nothing else, without reading
+.Xr inittab 5
+at all.
+This is what to boot when the inittab itself is the problem.
+.El
+.Ss Shutdown
+Reaching runlevel 0 or 6 is what brings the machine down, and
+.Nm
+performs the last phase itself rather than leaving it to a script.
+It runs the runlevel's own K links first, so the services stop in order, then
+signals every remaining process with
+.Dv SIGTERM ,
+waits, sends
+.Dv SIGKILL ,
+flushes the filesystems and remounts them read-only, and makes the reboot,
+halt or power-off call.
+.Pp
+Whether runlevel 0 halts or powers off is carried in the request:
+.Xr halt 8
+asks for one and
+.Xr poweroff 8
+for the other.
+A request with nothing to say powers the machine off, which is what a machine
+with no operator standing at it wants.
+.Ss Signals
+.Bl -tag -width SIGWINCH
+.It Dv SIGHUP
+reread
+.Xr inittab 5
+without changing the runlevel.
+.Xr telinit 8 Cm q
+sends this.
+.It Dv SIGUSR1
+close the control FIFO and create it again.
+.Pa /run
+is a tmpfs mounted by
+.Pa rc.sysinit
+after
+.Nm
+has already made its FIFO, so without this the FIFO would be under the mount
+and nothing could reach it.
+.It Dv SIGINT
+run the
+.Cm ctrlaltdel
+entry.
+The kernel sends this when Ctrl-Alt-Del is pressed.
+.It Dv SIGPWR
+run the
+.Cm powerfail
+or
+.Cm powerwait
+entries.
+A UPS daemon sends this; nothing in the base image does.
+.It Dv SIGWINCH
+run the
+.Cm kbrequest
+entry, which the kernel asks for through the KeyboardSignal keymap action.
+.It Dv SIGTERM
+ignored, with a line on the console.
+Use
+.Xr telinit 8
+or
+.Xr shutdown 8 .
+.El
+.Ss Run as anything but process 1
+.Nm
+run by a user forwards a runlevel request to the real one and exits, exactly as
+System V's did, so
+.Ic init 1
+and
+.Ic telinit 1
+are the same instruction.
+.Sh FILES
+.Bl -tag -width "/run/initrunlevel" -compact
+.It Pa /etc/inittab
+what to run, and when.
+.It Pa /run/initctl
+the FIFO requests arrive on.
+.Pa /dev/initctl
+is a symbolic link to it.
+.It Pa /run/initrunlevel
+the previous and current runlevel, as
+.Xr runlevel 8
+reports them.
+System V read this out of utmp; glibc 2.42 removed the functions that wrote
+utmp, so it is kept here instead.
+.It Pa /etc/rc.d/rc.sysinit
+the
+.Cm sysinit
+entry in the shipped inittab.
+.It Pa /etc/rc.d/rc
+the runlevel driver, run for every runlevel.
+.El
+.Sh SEE ALSO
+.Xr inittab 5 ,
+.Xr chkconfig 8 ,
+.Xr halt 8 ,
+.Xr runlevel 8 ,
+.Xr service 8 ,
+.Xr shutdown 8 ,
+.Xr telinit 8
+.Sh HISTORY
+.Nm
+is
+.Nm sowa-init ,
+written specifically for Sowa.
+It speaks the System V request protocol on
+.Pa /run/initctl ,
+so anything that already knows how to drive that FIFO can drive this.

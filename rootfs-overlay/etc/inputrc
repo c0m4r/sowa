@@ -1,0 +1,73 @@
+# /etc/inputrc - the key bindings readline starts with.
+#
+# readline is what gives Bash, and everything else linked against it, its
+# command line: history, word movement, the editing keys. It binds a handful of
+# sequences on its own - the four arrows, Home and End - and nothing more.
+# Every other key sends an escape sequence readline has no name for, and an
+# unbound sequence does nothing useful: the terminal reports the keypress and
+# readline discards it.
+#
+# Delete is the key everyone notices, because the one that does work is
+# Backspace, so the line editor looks half broken rather than unconfigured. Its
+# sequence is "\e[3~" on both consoles this image has - the kernel's VGA console
+# and a serial line claiming to be an xterm - and terminfo has known that all
+# along: "tput kdch1" prints it. Knowing what the key sends and having a binding
+# for it are separate things, though, and this file is the second one.
+#
+# Bash is built against its bundled copy of readline rather than a separate
+# library, so no package installs this file and the overlay owns it.
+#
+# readline reads $INPUTRC if it is set, then ~/.inputrc, then this file. A user
+# who writes their own ~/.inputrc replaces these bindings rather than adding to
+# them, so such a file should start with: $include /etc/inputrc
+
+# Pass every one of the eight bits through, in both directions, and do not
+# rewrite a byte with the high bit set into an ESC-prefixed pair. Anything else
+# mangles UTF-8, which is the only encoding this image is built for - ncurses
+# here is the wide-character build.
+set meta-flag on
+set input-meta on
+set convert-meta off
+set output-meta on
+
+# Everything below is emacs-mode editing. Bash starts in emacs mode; a vi-mode
+# user has a different set of keys entirely and should not have these applied
+# over the top of them, which is what the guard is for.
+$if mode=emacs
+
+# The reason this file exists.
+"\e[3~": delete-char
+
+# Home and End, which are the other keys that differ by console. The kernel
+# console sends the first pair, a terminal in application cursor mode sends the
+# second, and a terminal in normal mode sends the third - readline binds that
+# last pair itself, but naming them here costs nothing and keeps the set
+# readable as one thing.
+"\e[1~": beginning-of-line
+"\e[4~": end-of-line
+"\eOH": beginning-of-line
+"\eOF": end-of-line
+"\e[H": beginning-of-line
+"\e[F": end-of-line
+"\e[7~": beginning-of-line
+"\e[8~": end-of-line
+
+# Ctrl-Left and Ctrl-Right move by words. The first pair is what xterm-family
+# terminals send, the second is the older form, and the third is what a terminal
+# that sends Meta with the arrow produces.
+"\e[1;5C": forward-word
+"\e[1;5D": backward-word
+"\e[5C": forward-word
+"\e[5D": backward-word
+"\e\e[C": forward-word
+"\e\e[D": backward-word
+
+# Page Up and Page Down reach the ends of the history list.
+"\e[5~": beginning-of-history
+"\e[6~": end-of-history
+
+# Insert quotes the next keystroke instead of toggling an overwrite mode
+# readline does not have.
+"\e[2~": quoted-insert
+
+$endif

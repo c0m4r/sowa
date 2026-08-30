@@ -1,0 +1,21 @@
+# grub-mkconfig's settings for Sowa. The installed system boots its kernel
+# directly - no initramfs - so the command line below is the whole of what the
+# kernel gets beyond the root= and rw that /etc/grub.d/10_linux adds itself.
+
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR="Sowa Linux"
+
+# Both consoles, the way the live medium names them: the kernel log reaches the
+# display and the serial line. init is named explicitly because there is no
+# initramfs to hand control over.
+GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200 init=/sbin/init panic=-1"
+
+# GRUB draws its own menu on the native console; /etc/grub.d/10_linux adds the
+# serial line behind a probe, so a machine with no UART never names a terminal
+# GRUB has not registered.
+GRUB_TERMINAL_INPUT="console"
+GRUB_TERMINAL_OUTPUT="console"
+
+# Sowa ships no os-prober; leave other operating systems alone.
+GRUB_DISABLE_OS_PROBER=true

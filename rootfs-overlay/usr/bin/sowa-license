@@ -1,0 +1,546 @@
+#!/bin/bash
+#
+# sowa-license - what this system is licensed under, and by whom.
+#
+# Sowa is a few thousand lines of its own code wrapped around eighty upstream
+# projects. Four packages are Sowa's own work - sowa-init, sowa-release,
+# custom-installers and the optional sowa-monitor - and all are
+# GPL-3.0-or-later, like the build system that produced the image. Everything
+# else belongs to the people who wrote it and is shipped under their terms,
+# unmodified. This program says
+# which is which without anyone having to go and read a table somewhere else.
+#
+# It reads three things, all of them local:
+#
+#   /var/lib/sowa/db/<package>/desc     the licence and copyright of every
+#                                       installed package, written when the
+#                                       package was installed
+#   /var/lib/sowa/repo/index            the same fields for packages the
+#                                       repository offers and this system does
+#                                       not have, if an index has been fetched
+#   /usr/share/licenses/<package>/      the licence texts themselves, which
+#                                       every package carries as files it owns
+#
+# Nothing here contacts the network, and nothing here needs root: a licence is
+# something a system should be able to state about itself while offline and
+# while logged in as anybody.
+
+set -uo pipefail
+
+readonly PROGRAM=sowa-license
+
+ROOT=""
+DB_DIR=""
+INDEX=""
+LICENSE_DIR=""
+OS_RELEASE=""
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+usage: sowa-license [command] [package...]
+
+commands:
+  summary                what this system as a whole is licensed under
+  list                   every installed package and its licence
+  list --available       the licences of packages the repository offers
+  list --all             both, in one table
+  show <package>...      print the licence texts a package carries
+  files <package>...     list the licence files a package carries
+  sowa                   the parts of this system Sowa itself wrote
+
+  <package>              the same as "show <package>"
+
+options:
+  --root <dir>           ask about another root filesystem
+  -h, --help             this text
+
+With no arguments at all, "summary" is what runs.
+
+Every licence text is a file the package owns below
+/usr/share/licenses/<package>/, so it is listed by "sowa-pkg files", checked by
+"sowa-pkg verify", and removed with the package.
+EOF
+}
+
+set_paths() {
+    DB_DIR="${ROOT}/var/lib/sowa/db"
+    INDEX="${ROOT}/var/lib/sowa/repo/index"
+    LICENSE_DIR="${ROOT}/usr/share/licenses"
+    OS_RELEASE="${ROOT}/etc/os-release"
+}
+
+# ------------------------------------------------------------------ database
+
+installed_names() {
+    local entry
+    [[ -d "${DB_DIR}" ]] || return 0
+    for entry in "${DB_DIR}"/*; do
+        [[ -f "${entry}/desc" ]] || continue
+        printf '%s\n' "${entry##*/}"
+    done
+}
+
+is_installed() {
+    [[ -f "${DB_DIR}/$1/desc" ]]
+}
+
+installed_field() {
+    local name="$1"
+    local wanted="$2"
+    local key value
+    [[ -f "${DB_DIR}/${name}/desc" ]] || return 1
+    while IFS='=' read -r key value; do
+        if [[ "${key}" == "${wanted}" ]]; then
+            printf '%s\n' "${value}"
+            return 0
+        fi
+    done < "${DB_DIR}/${name}/desc"
+    return 1
+}
+
+# The index fields, in the order scripts/package.sh writes them. A package this
+# system has never installed is still describable from here.
+index_field() {
+    local wanted="$1"
+    local field="$2"
+    local name rest
+    local version _arch _archive _sha256 _size _depends license copyright
+    local build_or_description description
+    [[ -f "${INDEX}" ]] || return 1
+    while IFS='|' read -r name rest; do
+        [[ -z "${name}" || "${name}" == \#* ]] && continue
+        [[ "${name}" == "${wanted}" ]] || continue
+        IFS='|' read -r version _arch _archive _sha256 _size _depends license \
+            copyright build_or_description description <<< "${rest}"
+        if [[ ! "${build_or_description}" =~ ^[0-9a-f]{64}$ ]]; then
+            description="${build_or_description}${description:+|${description}}"
+        fi
+        case "${field}" in
+            pkgver) printf '%s\n' "${version}" ;;
+            license) printf '%s\n' "${license}" ;;
+            copyright) printf '%s\n' "${copyright}" ;;
+            description) printf '%s\n' "${description}" ;;
+            *) return 1 ;;
+        esac
+        return 0
+    done < "${INDEX}"
+    return 1
+}
+
+index_names() {
+    local name _rest
+    [[ -f "${INDEX}" ]] || return 0
+    while IFS='|' read -r name _rest; do
+        if [[ -n "${name}" && "${name}" != \#* ]]; then
+            printf '%s\n' "${name}"
+        fi
+    done < "${INDEX}"
+}
+
+# Installed first, because that is what this machine actually runs; the index
+# is the fallback for a package it does not have.
+package_field() {
+    local name="$1"
+    local field="$2"
+    installed_field "${name}" "${field}" && return 0
+    index_field "${name}" "${field}" && return 0
+    return 1
+}
+
+known_package() {
+    is_installed "$1" && return 0
+    index_field "$1" license > /dev/null && return 0
+    return 1
+}
+
+require_package() {
+    known_package "$1" \
+        || die "no package called $1 is installed, and the index does not offer one"
+}
+
+# Read rather than sourced: /etc/os-release is shell-shaped by specification,
+# but sourcing a file to learn a distribution's name runs whatever is in it,
+# and this program has no reason to.
+distro_name() {
+    local name="Sowa" version=""
+    local key value
+    if [[ -f "${OS_RELEASE}" ]]; then
+        while IFS='=' read -r key value; do
+            value="${value%\"}"
+            value="${value#\"}"
+            case "${key}" in
+                NAME) name="${value}" ;;
+                VERSION_ID) version="${value}" ;;
+            esac
+        done < "${OS_RELEASE}"
+    fi
+    printf '%s%s\n' "${name}" "${version:+ ${version}}"
+}
+
+# ------------------------------------------------------------------ licences
+
+# Breaks an SPDX expression into the identifiers it names. "AND" and "OR" are
+# operators and are dropped; "WITH" is not, because an exception is part of the
+# licence it modifies and means nothing on its own - "GPL-3.0-or-later WITH
+# GCC-exception-3.1" is one answer, not two.
+license_identifiers() {
+    awk '
+        {
+            gsub(/[()]/, " ")
+            count = split($0, token, /[ \t]+/)
+            for (i = 1; i <= count; i++) {
+                if (token[i] == "" || token[i] == "AND" || token[i] == "OR") {
+                    continue
+                }
+                if (i + 2 <= count && token[i + 1] == "WITH") {
+                    printf "%s WITH %s\n", token[i], token[i + 2]
+                    i += 2
+                    continue
+                }
+                print token[i]
+            }
+        }
+    ' <<< "$1"
+}
+
+# This is deliberately a small, local policy table rather than a network
+# lookup: sowa-license must be able to answer offline.  The OSI entries are the
+# SPDX identifiers in use by Sowa that appear on https://opensource.org/licenses.
+# The foss entries are reviewed free licences which OSI does not list.  New
+# licence identifiers need adding here when their package is added; unknown
+# identifiers are reported conservatively as source-available-non-free until
+# reviewed.
+license_identifier_class() {
+    local identifier="$1"
+
+    # An SPDX exception changes the terms of its base licence, but does not
+    # turn it into a separate licence for this classification.
+    identifier="${identifier%% WITH *}"
+    case "${identifier}" in
+        0BSD | AGPL-3.0-only | AGPL-3.0-or-later | Apache-2.0 | \
+        Artistic-1.0-Perl | BSD-2-Clause | BSD-3-Clause | EUPL-1.2 | \
+        GPL-1.0-only | GPL-1.0-or-later | GPL-2.0-only | GPL-2.0-or-later | \
+        GPL-3.0-only | GPL-3.0-or-later | ISC | LGPL-2.0-only | \
+        LGPL-2.0-or-later | LGPL-2.1-only | LGPL-2.1-or-later | \
+        LGPL-3.0-only | LGPL-3.0-or-later | MIT | MPL-2.0 | Zlib | curl)
+            printf '%s\n' osi-approved
+            ;;
+        BSD-4-Clause-UC | CC-BY-4.0 | GFDL-1.2-or-later | Info-ZIP | \
+        LicenseRef-public-domain | Python-2.0.1 | Vim | X11 | bzip2-1.0.6)
+            printf '%s\n' foss
+            ;;
+        LicenseRef-Nmap-Public-Source-License | LicenseRef-unRAR)
+            printf '%s\n' source-available-non-free
+            ;;
+        *)
+            printf '%s\n' source-available-non-free
+            ;;
+    esac
+}
+
+# Reduce the identifiers in an SPDX expression to the classification of the
+# package as distributed.  A package can be OSI-approved only when every
+# applicable identifier is OSI-approved; an OR is intentionally treated the
+# same way because this reports all terms a package carries, not a user's
+# selected option.
+license_classification() {
+    local license="$1"
+    local identifier class has_osi=0 has_foss=0
+
+    while IFS= read -r identifier; do
+        [[ -n "${identifier}" ]] || continue
+        class="$(license_identifier_class "${identifier}")"
+        case "${class}" in
+            osi-approved) has_osi=1 ;;
+            foss) has_foss=1 ;;
+            source-available-non-free)
+                printf '%s\n' source-available-non-free
+                return 0
+                ;;
+        esac
+    done < <(license_identifiers "${license}")
+
+    if ((has_osi == 1 && has_foss == 1)); then
+        printf '%s\n' foss-mixed
+    elif ((has_osi == 1)); then
+        printf '%s\n' osi-approved
+    else
+        printf '%s\n' foss
+    fi
+}
+
+license_files() {
+    local name="$1"
+    local directory="${LICENSE_DIR}/${name}"
+    local file
+    [[ -d "${directory}" ]] || return 0
+    for file in "${directory}"/*; do
+        [[ -f "${file}" ]] || continue
+        printf '%s\n' "${file}"
+    done
+}
+
+# What a package's licence line should say when it is printed on its own.
+license_line() {
+    local name="$1"
+    local license copyright classification
+    license="$(package_field "${name}" license)" || license="unknown"
+    copyright="$(package_field "${name}" copyright)" || copyright="unknown"
+    [[ -n "${license}" ]] || license="unknown"
+    classification="$(license_classification "${license}")"
+    case "${copyright}" in
+        sowa) printf '%s [%s, Sowa]\n' "${license}" "${classification}" ;;
+        upstream) printf '%s [%s, upstream]\n' "${license}" "${classification}" ;;
+        *) printf '%s [%s]\n' "${license}" "${classification}" ;;
+    esac
+}
+
+# Long texts go through a pager when there is somebody to read them, which is
+# what makes "sowa-license show gcc" usable: the GPL alone is six hundred lines.
+page() {
+    local pager="${PAGER:-}"
+    if [[ ! -t 1 ]]; then
+        cat
+        return 0
+    fi
+    if [[ -z "${pager}" && -x /usr/bin/less ]]; then
+        pager="/usr/bin/less -R"
+    fi
+    if [[ -z "${pager}" ]]; then
+        cat
+        return 0
+    fi
+    ${pager} || cat
+}
+
+# ------------------------------------------------------------------ commands
+
+cmd_summary() {
+    local name license copyright total=0 ours=0 theirs=0 unknown=0
+    local -a sowa_packages=()
+    local identifier count
+
+    while IFS= read -r name; do
+        total=$((total + 1))
+        copyright="$(installed_field "${name}" copyright)" || copyright=""
+        case "${copyright}" in
+            sowa)
+                ours=$((ours + 1))
+                sowa_packages+=("${name}")
+                ;;
+            upstream) theirs=$((theirs + 1)) ;;
+            *) unknown=$((unknown + 1)) ;;
+        esac
+    done < <(installed_names)
+
+    ((total > 0)) \
+        || die "${PROGRAM} found no package database at ${DB_DIR}; this is not a Sowa root filesystem"
+
+    printf '%s licensing\n\n' "$(distro_name)"
+    printf '  %d packages installed: %d written by Sowa, %d packaged from other\n' \
+        "${total}" "${ours}" "${theirs}"
+    printf '  people'"'"'s projects and shipped under their own terms.\n'
+    if ((unknown > 0)); then
+        printf '  %d package(s) record no licence; report that as a bug.\n' "${unknown}"
+    fi
+
+    printf '\nSowa'"'"'s own work, GPL-3.0-or-later\n\n'
+    for name in "${sowa_packages[@]}"; do
+        printf '  %-18s %s\n' "${name}" "$(installed_field "${name}" description)"
+    done
+    printf '\n  The same terms cover the build system that produced this image.\n'
+    printf '  Full text: %s/sowa-release/LICENSE\n' "${LICENSE_DIR#"${ROOT}"}"
+
+    printf '\nLicences in use across every installed package\n\n'
+    while IFS= read -r name; do
+        license="$(installed_field "${name}" license)" || continue
+        [[ -n "${license}" ]] || continue
+        license_identifiers "${license}"
+    done < <(installed_names) | sort | uniq -c | sort -k1,1nr -k2,2 \
+        | while read -r count identifier; do
+            printf '  %-52s %4d package(s)\n' "${identifier}" "${count}"
+        done
+
+    printf '\n  An "AND" in a package'"'"'s licence means every one of them applies, to\n'
+    printf '  different files; the counts above are per identifier, so a package\n'
+    printf '  under several appears under each.\n'
+
+    printf '\nPackage licence classifications\n\n'
+    while IFS= read -r name; do
+        license="$(installed_field "${name}" license)" || continue
+        [[ -n "${license}" ]] || continue
+        license_classification "${license}"
+    done < <(installed_names) | sort | uniq -c | sort -k2,2 \
+        | while read -r count identifier; do
+            printf '  %-18s %4d package(s)\n' "${identifier}" "${count}"
+        done
+    printf '\n  osi-approved: every applicable licence is OSI-approved.\n'
+    printf '  foss: free and open source, but not OSI-approved.\n'
+    printf '  foss-mixed: both OSI-approved and other FOSS licences apply.\n'
+    printf '  source-available-non-free: source-available terms that are not free.\n'
+
+    printf '\n  sowa-license list             every package and its licence\n'
+    printf '  sowa-license show <package>   the full text a package ships\n'
+}
+
+cmd_list() {
+    local mode="${1:---installed}"
+    local name version license copyright classification
+
+    case "${mode}" in
+        --installed | --available | --all) ;;
+        *) die "unknown option for list: ${mode}" ;;
+    esac
+    if [[ "${mode}" != --installed && ! -f "${INDEX}" ]]; then
+        die "no package index; run 'sowa-pkg update' first"
+    fi
+
+    printf '%-18s %-14s %-26s %-10s %s\n' \
+        package version classification copyright licence
+    if [[ "${mode}" != --available ]]; then
+        while IFS= read -r name; do
+            version="$(installed_field "${name}" pkgver)" || version="-"
+            license="$(installed_field "${name}" license)" || license="unknown"
+            copyright="$(installed_field "${name}" copyright)" || copyright="unknown"
+            classification="$(license_classification "${license:-unknown}")"
+            printf '%-18s %-14s %-26s %-10s %s\n' \
+                "${name}" "${version}" "${classification}" "${copyright}" \
+                "${license:-unknown}"
+        done < <(installed_names)
+    fi
+    if [[ "${mode}" != --installed ]]; then
+        while IFS= read -r name; do
+            # --all has already printed everything installed, and --available
+            # is by definition what this system does not have.
+            is_installed "${name}" && continue
+            version="$(index_field "${name}" pkgver)" || version="-"
+            license="$(index_field "${name}" license)" || license="unknown"
+            copyright="$(index_field "${name}" copyright)" || copyright="unknown"
+            classification="$(license_classification "${license:-unknown}")"
+            printf '%-18s %-14s %-26s %-10s %s\n' \
+                "${name}" "${version}" "${classification}" "${copyright}" \
+                "${license:-unknown}"
+        done < <(index_names)
+    fi
+}
+
+cmd_files() {
+    local name file found
+    (($# > 0)) || die "files needs a package name"
+    for name in "$@"; do
+        require_package "${name}"
+        found=0
+        while IFS= read -r file; do
+            printf '%s\n' "${file#"${ROOT}"}"
+            found=1
+        done < <(license_files "${name}")
+        ((found == 1)) \
+            || die "${name} carries no licence text on this system; it may not be installed"
+    done
+}
+
+cmd_show() {
+    local name file found
+    (($# > 0)) || die "show needs a package name"
+    for name in "$@"; do
+        require_package "${name}"
+    done
+    {
+        for name in "$@"; do
+            printf '==> %s %s\n' "${name}" "$(package_field "${name}" pkgver)"
+            printf '    %s\n' "$(license_line "${name}")"
+            found=0
+            while IFS= read -r file; do
+                printf '\n--- %s ---\n\n' "${file#"${ROOT}"}"
+                cat "${file}"
+                found=1
+            done < <(license_files "${name}")
+            if ((found == 0)); then
+                printf '\n    No licence text on this system. ' >&2
+                printf 'Install %s to read it.\n' "${name}" >&2
+            fi
+            printf '\n'
+        done
+    } | page
+}
+
+cmd_sowa() {
+    local name copyright found=0
+
+    printf 'These are the parts of this system Sowa itself wrote. They are\n'
+    printf 'GPL-3.0-or-later, as is the build system that produced the image.\n\n'
+    while IFS= read -r name; do
+        copyright="$(installed_field "${name}" copyright)" || continue
+        [[ "${copyright}" == sowa ]] || continue
+        found=1
+        printf '  %-18s %-14s %s\n' "${name}" \
+            "$(installed_field "${name}" pkgver)" \
+            "$(installed_field "${name}" description)"
+    done < <(installed_names)
+    ((found == 1)) || die "no package on this system records Sowa as its copyright holder"
+    printf '\nEverything else in the image is other people'"'"'s work, compiled from\n'
+    printf 'unmodified upstream sources and shipped under the terms those sources\n'
+    printf 'carry. "sowa-license list" names each one.\n'
+}
+
+# ---------------------------------------------------------------------- main
+
+main() {
+    local -a arguments=()
+    local command=""
+
+    while (($# > 0)); do
+        case "$1" in
+            --root)
+                [[ $# -ge 2 ]] || die "--root needs a directory"
+                ROOT="${2%/}"
+                shift 2
+                ;;
+            -h | --help)
+                usage
+                return 0
+                ;;
+            --)
+                shift
+                arguments+=("$@")
+                break
+                ;;
+            *)
+                arguments+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    set_paths
+    [[ -z "${ROOT}" || -d "${ROOT}" ]] || die "no such root filesystem: ${ROOT}"
+
+    if ((${#arguments[@]} == 0)); then
+        cmd_summary
+        return 0
+    fi
+
+    command="${arguments[0]}"
+    arguments=("${arguments[@]:1}")
+    case "${command}" in
+        summary) cmd_summary ;;
+        list) cmd_list "${arguments[@]}" ;;
+        files) cmd_files "${arguments[@]}" ;;
+        show) cmd_show "${arguments[@]}" ;;
+        sowa) cmd_sowa ;;
+        # A bare package name is the question people actually ask, so it is
+        # answered rather than met with a usage message.
+        *)
+            if known_package "${command}"; then
+                cmd_show "${command}" "${arguments[@]}"
+            else
+                usage >&2
+                die "unknown command or package: ${command}"
+            fi
+            ;;
+    esac
+}
+
+main "$@"

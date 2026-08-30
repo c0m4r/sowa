@@ -1,0 +1,31 @@
+#!/bin/sh
+# A name Sowa answers but does not implement.
+#
+# Sowa has no program called nc. Nmap's ncat is the replacement: it does what
+# every netcat does and adds TLS and proxying. Nmap is optional, so this file
+# tells users how to install it instead of pretending its replacement is here.
+#
+# The flags are close but not identical. ncat has -l, -p, -u, -v, -w and -z and
+# means the same things by them; what it does not have is the OpenBSD nc's -N,
+# and "ncat -l" does not imply the "keep listening" behaviour that some netcats
+# take -k to mean, so a script written against a particular netcat is worth
+# reading rather than renaming.
+#
+# It exits 127, the same status a missing command produces, so a script testing
+# for nc still fails rather than believing it succeeded.
+
+printf '%s\n' \
+    "nc is not part of Sowa. Install Nmap for ncat(1), its netcat:" \
+    "" \
+    "    sowa-pkg install nmap" \
+    "" \
+    "    ncat HOST PORT            connect, like nc HOST PORT" \
+    "    ncat -l PORT              listen on a port" \
+    "    ncat -l -k PORT           keep listening after a client disconnects" \
+    "    ncat -z -v HOST PORT      test whether a port is open, then exit" \
+    "    ncat -u HOST PORT         UDP instead of TCP" \
+    "    ncat --ssl HOST PORT      connect with TLS, which no plain nc does" \
+    "" \
+    "After installing Nmap, see ncat(1). The image also has ss for what is" \
+    "listening locally, and Nmap can inspect what is listening elsewhere." >&2
+exit 127

@@ -1,0 +1,77 @@
+# Two ways into the same image.
+#
+#   docker compose -f docker/compose.yml run --rm build
+#       The checkout this file lives in, bind-mounted. Artifacts land in
+#       artifacts/ on the host, where the README says they are, and work/ and
+#       downloads/ are the ones already there. This is the one to use.
+#
+#   docker compose -f docker/compose.yml run --rm clone
+#       A clone into a named volume instead, writing nothing the host can see.
+#       It clones this checkout by default - no network, no credentials - which
+#       is what proves a tree builds somewhere that has never had a Sowa build
+#       in it. Set SOWA_REPO to a URL to clone that instead, and SOWA_REF to a
+#       branch or tag.
+#
+# Both drop into a login shell. Give either a command to run one instead:
+#
+#   docker compose -f docker/compose.yml run --rm build make check
+#
+# "run" rather than "up", because this is a shell and a build, not a service.
+
+name: sowa-build
+
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      # Pin these two together for a reproducible environment. See Dockerfile.
+      BASE_IMAGE: ${SOWA_BASE_IMAGE:-archlinux:base-devel-20260823.0.578598}
+      ARCH_SNAPSHOT: ${SOWA_ARCH_SNAPSHOT:-}
+  image: sowa-build:latest
+  working_dir: /sowa
+  # A from-source distribution spends most of its build in the compiler, and
+  # the compiler is happiest with the whole machine. JOBS=auto - the default in
+  # config/build.conf - reads the CPU count the container is allowed to see.
+  environment:
+    JOBS: ${JOBS:-auto}
+    TERM: ${TERM:-xterm-256color}
+    # Whose files the build should write. Empty means the entrypoint takes the
+    # owner of the mounted checkout, which is the right answer for the bind
+    # mount and is why this is not set to a number here.
+    SOWA_UID: ${SOWA_UID:-}
+    SOWA_GID: ${SOWA_GID:-}
+  # The kernel and GCC builds fork wide and link large; the default 64 MiB of
+  # /dev/shm is not enough for a parallel link.
+  shm_size: 2gb
+  stdin_open: true
+  tty: true
+  init: true
+
+services:
+  # The checkout on the host, built in the container.
+  build:
+    <<: *common
+    volumes:
+      - ..:/sowa
+
+  # A clone in a volume, writing nothing the host can see.
+  clone:
+    <<: *common
+    environment:
+      JOBS: ${JOBS:-auto}
+      TERM: ${TERM:-xterm-256color}
+      # This checkout by default, which needs no network and no credentials:
+      # git clones a directory as happily as a URL, and a pristine tree carries
+      # nothing over from a build that has already happened here. Set SOWA_REPO
+      # to a URL to clone that instead.
+      SOWA_REPO: ${SOWA_REPO:-/srv/origin}
+      SOWA_REF: ${SOWA_REF:-}
+    volumes:
+      - checkout:/sowa
+      # Read-only: the clone reads it, and the build in the volume cannot reach
+      # back through it to the checkout it came from.
+      - ..:/srv/origin:ro
+
+volumes:
+  checkout:

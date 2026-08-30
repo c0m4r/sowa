@@ -1,0 +1,13 @@
+Archives
+========
+
+    tar xf thing.tar.zst              # and .gz, .xz, .bz2 - tar picks the tool
+    gzip / gunzip / zcat     and  zgrep, zdiff, zless
+    xz / unxz / xzcat        and  lzma, unlzma, lzcat
+    zstd / unzstd / zstdcat  and  zstdmt, zstdgrep, zstdless
+    bzip2 / bunzip2 / bzcat
+    zip -r out.zip dir/      and  unzip, zipinfo, funzip, zipgrep
+    sowa-pkg install 7zip # install 7-Zip first when handling .7z, RAR or ISO
+    7z x thing.7z         # 7-Zip, also as 7zz: 7z, zip, xz, rar, iso and more
+
+tar is GNU tar, which is also what sowa-pkg unpacks packages with.

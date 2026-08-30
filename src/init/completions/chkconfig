@@ -1,0 +1,57 @@
+# bash completion for chkconfig(8)                         -*- shell-script -*-
+# shellcheck shell=bash
+#
+# This replaces the generic chkconfig completion bash-completion itself ships.
+# It offers --override and resetpriorities, asks systemd and xinetd what
+# services exist, and knows nothing about the four forms Sowa's chkconfig
+# actually takes. The loader looks in this directory before its own, so the
+# file being here is what makes ours the one that answers.
+
+_sowa_comp_chkconfig_scripts()
+{
+    local script
+    for script in /etc/rc.d/init.d/*; do
+        [[ -x ${script} && ! -d ${script} ]] || continue
+        [[ ${script##*/} == functions ]] && continue
+        printf '%s\n' "${script##*/}"
+    done
+}
+
+_sowa_comp_chkconfig()
+{
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    local previous="${COMP_WORDS[COMP_CWORD - 1]}"
+    local words=""
+
+    case ${previous} in
+        --add | --del | --list)
+            words="$(_sowa_comp_chkconfig_scripts)"
+            ;;
+        --level)
+            # The runlevels a service is usually asked about together. Any
+            # string of digits is valid; these are the ones worth typing.
+            words="2345 345 35 3 5"
+            ;;
+        *)
+            # Which position this is depends on whether the line began with
+            # --level, which takes an argument of its own before the name:
+            #
+            #   chkconfig            NAME on
+            #   chkconfig --level 35 NAME on
+            if [[ ${COMP_WORDS[1]} == --level ]]; then
+                case ${COMP_CWORD} in
+                    3) words="$(_sowa_comp_chkconfig_scripts)" ;;
+                    4) words="on off reset" ;;
+                esac
+            elif ((COMP_CWORD == 1)); then
+                words="--list --add --del --level $(_sowa_comp_chkconfig_scripts)"
+            elif ((COMP_CWORD == 2)) && [[ ${COMP_WORDS[1]} != -* ]]; then
+                words="on off reset"
+            fi
+            ;;
+    esac
+
+    mapfile -t COMPREPLY < <(compgen -W "${words}" -- "${current}")
+}
+
+complete -F _sowa_comp_chkconfig chkconfig

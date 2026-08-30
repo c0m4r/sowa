@@ -1,0 +1,273 @@
+#!/bin/bash
+#
+# sowa-guix-setup - create the state GNU Guix needs, once, on this machine.
+#
+# The guix package carries /gnu/store and nothing that changes. A store path
+# names its own contents, so sowa-pkg can own, upgrade and verify the store the
+# way it owns any other set of files, and two versions of Guix never claim the
+# same path. Everything Guix *writes* is state, and a package must not own
+# state: /var/guix/db/db.sqlite is the record of what this machine has
+# installed, and a package upgrade that wrote over it would throw that record
+# away. The package therefore ships the pristine database, and the profile the
+# tarball was built with, under /usr/share/guix; this script installs them the
+# first time it runs, along with the build users, root's profile link, and the
+# substitute keys.
+#
+# It is meant to be run again. Anything already in place is left as it is, so
+# this is also how a half-configured installation is repaired - and why an
+# upgrade of the guix package is followed by running it, not by undoing it.
+#
+# These are the state-initialization steps needed after unpacking Guix, without
+# the systemd or GnuPG paths. See docs/guix.md.
+
+set -Eeuo pipefail
+
+readonly PROGRAM=sowa-guix-setup
+readonly STORE=/gnu/store
+readonly SEED=/usr/share/guix
+readonly VAR_GUIX=/var/guix
+readonly PROFILES=/var/guix/profiles/per-user/root
+readonly CURRENT="${PROFILES}/current-guix"
+readonly BUILD_GROUP=guixbuild
+
+# The unprivileged accounts guix-daemon runs builds as. Ten is what upstream
+# creates and is enough to keep a machine busy; the identifiers sit below the
+# 1000 an ordinary account starts at and above the ones the image already uses.
+BUILD_USERS="${SOWA_GUIX_BUILD_USERS:-10}"
+BUILD_ID_BASE="${SOWA_GUIX_BUILD_ID_BASE:-980}"
+# The substitute servers guix-daemon is told about in /etc/rc.d/init.d/guix-daemon.
+# Authorizing their keys is what makes downloading pre-built binaries possible;
+# without it every "guix install" builds from source.
+AUTHORIZE=1
+# Whether anything on this machine was actually changed. The script is meant to
+# be run again, and a run that repairs nothing has nothing to say - saying it
+# anyway is noise in front of the one line that would matter.
+CHANGED=0
+
+log() {
+    CHANGED=1
+    printf '%s: %s\n' "${PROGRAM}" "$*"
+}
+
+# Said whether or not anything happened: what a re-run reports is its own
+# result, and "nothing needed doing" is that result.
+note() {
+    printf '%s: %s\n' "${PROGRAM}" "$*"
+}
+
+warn() {
+    printf '%s: warning: %s\n' "${PROGRAM}" "$*" >&2
+}
+
+die() {
+    printf '%s: error: %s\n' "${PROGRAM}" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: sowa-guix-setup [--no-authorize] [--build-users N]
+
+Creates what GNU Guix needs and the guix package deliberately does not carry:
+the guixbuild accounts, /var/guix, root's profile links, and /etc/guix/acl.
+Safe to run more than once - anything already there is left alone.
+
+  --no-authorize   do not authorize the substitute servers' keys; every
+                   package is then built locally from source
+  --build-users N  create N build users instead of 10
+USAGE
+    exit 2
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-authorize) AUTHORIZE=0; shift ;;
+        --build-users) [[ $# -ge 2 ]] || usage; BUILD_USERS="$2"; shift 2 ;;
+        -h | --help) usage ;;
+        *) printf '%s: unknown option: %s\n' "${PROGRAM}" "$1" >&2; usage ;;
+    esac
+done
+
+[[ "${BUILD_USERS}" =~ ^[0-9]+$ ]] || die "--build-users takes a number"
+[[ "${BUILD_USERS}" -ge 1 ]] || die "at least one build user is required"
+
+# A dangling symbolic link is still something that is there, and every link
+# below /var/guix points at a store path that may have been collected, so -e
+# alone would answer the wrong question and the second ln would fail.
+present() {
+    [[ -e "$1" || -L "$1" ]]
+}
+
+# There is no getent in the image, and /etc/passwd and /etc/group are the whole
+# account database on a Sowa system, so they are read directly.
+account_exists() {
+    local file="$1"
+    local wanted="$2"
+    local name
+
+    while IFS=: read -r name _; do
+        [[ "${name}" == "${wanted}" ]] && return 0
+    done < "${file}"
+    return 1
+}
+
+# guix-daemon finds its build users by reading the *member list* of the group it
+# was given - getgrnam("guixbuild")->gr_mem - and not by looking for accounts
+# whose primary group that is. shadow's useradd records the membership from -G,
+# so the accounts this script creates are members already; what this repairs is
+# the ones an older Sowa created, when its useradd recorded a supplementary
+# group only if it differed from the primary one. Those
+# machines have ten build users and an empty member list, which the daemon
+# reports as "all build users are currently in use". The list is merged rather
+# than replaced, so an account added by hand stays a member.
+add_group_members() {
+    local group="$1"
+    shift
+    local wanted temporary
+    wanted="$(IFS=,; printf '%s' "$*")"
+    temporary="/etc/group.sowa-guix.$$"
+
+    awk -F: -v OFS=: -v group="${group}" -v wanted="${wanted}" '
+        $1 != group { print; next }
+        {
+            count = split(wanted, want, ",")
+            members = $4
+            for (i = 1; i <= count; i++) {
+                if (index("," members ",", "," want[i] ",") == 0) {
+                    members = (members == "" ? want[i] : members "," want[i])
+                }
+            }
+            $4 = members
+            print
+        }
+    ' /etc/group > "${temporary}"
+    # A truncated /etc/group is a system that cannot resolve a group name, so
+    # the new one is written beside the old and renamed over it.
+    [[ -s "${temporary}" ]] || { rm -f "${temporary}"; die "could not rewrite /etc/group"; }
+    chmod 0644 "${temporary}"
+    mv "${temporary}" /etc/group
+}
+
+create_build_users() {
+    local index name uid created=0
+    local -a builders=()
+
+    if ! account_exists /etc/group "${BUILD_GROUP}"; then
+        groupadd -g "${BUILD_ID_BASE}" "${BUILD_GROUP}"
+    fi
+
+    for ((index = 1; index <= BUILD_USERS; index++)); do
+        name="$(printf 'guixbuilder%02d' "${index}")"
+        uid=$((BUILD_ID_BASE + index))
+        builders+=("${name}")
+        account_exists /etc/passwd "${name}" && continue
+        # -r keeps these below the 1000 an ordinary account starts at, -M gives
+        # them no home directory, and nologin plus the locked password shadow
+        # writes means nothing can ever authenticate as one of them. That is the
+        # point of them: they own nothing and can log in nowhere, and a build
+        # that escapes its chroot is still only one of these.
+        useradd -r -M -u "${uid}" -g "${BUILD_GROUP}" -G "${BUILD_GROUP}" \
+            -d /var/empty -s /usr/sbin/nologin \
+            -c "Guix build user ${index}" "${name}"
+        created=$((created + 1))
+    done
+    add_group_members "${BUILD_GROUP}" "${builders[@]}"
+
+    if ((created > 0)); then
+        log "created ${created} build user(s) in ${BUILD_GROUP}"
+    fi
+}
+
+create_state() {
+    local seed_profile
+
+    install -d -m 0755 "${VAR_GUIX}/db" "${VAR_GUIX}/gcroots" "${PROFILES}"
+
+    if [[ ! -f "${VAR_GUIX}/db/db.sqlite" ]]; then
+        install -m 0644 "${SEED}/db.sqlite" "${VAR_GUIX}/db/db.sqlite"
+        log "installed the store database"
+    fi
+
+    # The profiles directory is a garbage collector root: what a profile refers
+    # to is live, and everything else in the store is not.
+    present "${VAR_GUIX}/gcroots/profiles" \
+        || ln -s /var/guix/profiles "${VAR_GUIX}/gcroots/profiles"
+
+    # The generation the tarball was built with. "guix pull" replaces this with
+    # a generation of its own and goes on numbering from here, so this is only
+    # ever the one root starts on.
+    seed_profile="$(readlink "${SEED}/current-guix")"
+    [[ -d "${seed_profile}" ]] \
+        || die "the packaged profile ${seed_profile} is not in the store"
+    if [[ ! -e "${CURRENT}-1-link" ]]; then
+        rm -f "${CURRENT}-1-link"
+        ln -s "${seed_profile}" "${CURRENT}-1-link"
+    fi
+
+    if [[ ! -e "${CURRENT}" ]]; then
+        # Either there is nothing there, or what is there names a store item
+        # that is gone - an upgrade of the guix package replaces the store it
+        # owns, and "guix gc" collects what no root keeps. A dangling profile is
+        # the one case where replacing it is a repair rather than a decision,
+        # and leaving it would mean no working guix command at all.
+        if present "${CURRENT}"; then
+            warn "root's profile named a store item that is gone; re-seeding it"
+            rm -f "${CURRENT}"
+        fi
+        ln -s current-guix-1-link "${CURRENT}"
+        log "linked root's guix profile"
+    fi
+
+    install -d -m 0755 /root/.config/guix
+    present /root/.config/guix/current \
+        || ln -s "${CURRENT}" /root/.config/guix/current
+}
+
+authorize_substitutes() {
+    local key name servers
+    local -a keys=() authorized=()
+
+    for name in bordeaux.guix.gnu.org ci.guix.gnu.org; do
+        key="${CURRENT}/share/guix/${name}.pub"
+        if [[ -f "${key}" ]]; then
+            keys+=("${key}")
+        else
+            warn "no substitute key for ${name} in the profile"
+        fi
+    done
+    ((${#keys[@]} > 0)) || return 0
+
+    install -d -m 0755 /etc/guix
+    for key in "${keys[@]}"; do
+        name="${key##*/}"
+        if "${CURRENT}/bin/guix" archive --authorize < "${key}"; then
+            authorized+=("${name%.pub}")
+        else
+            warn "could not authorize ${name%.pub}; with guix-daemon running, retry with"
+            warn "  guix archive --authorize < ${key}"
+        fi
+    done
+    if ((${#authorized[@]} > 0)); then
+        printf -v servers '%s, ' "${authorized[@]}"
+        log "authorized substitutes from ${servers%, }"
+    fi
+}
+
+[[ "${EUID}" -eq 0 ]] || die "this has to run as root"
+[[ -d "${STORE}" ]] || die "${STORE} is missing; run 'sowa-pkg install guix' first"
+[[ -f "${SEED}/db.sqlite" ]] || die "${SEED}/db.sqlite is missing from the guix package"
+[[ -L "${SEED}/current-guix" ]] || die "${SEED}/current-guix is missing from the guix package"
+
+create_build_users
+create_state
+if ((AUTHORIZE)); then
+    authorize_substitutes
+else
+    log "left the substitute servers unauthorized; everything will be built here"
+fi
+
+# Nothing about the daemon is said here. Whether it runs is the installer's
+# business - config/hooks/guix.hooks enables and starts it - and this script
+# telling somebody to start what is already running was wrong every time it was
+# read.
+((CHANGED)) || note "everything guix needs is already in place"

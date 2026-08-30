@@ -1,0 +1,65 @@
+Networking
+==========
+
+The network comes up at boot: the "network" service runs nic, which applies
+/etc/nic.conf, first of the services in every multi-user runlevel. So a booted
+machine already has an address, and this is how to look at it or change it:
+
+    nic show        # what the configuration says
+    nic dry-run     # what it would do, without doing it
+    nic start       # do it
+    nic status      # what the interfaces look like now
+
+As shipped, /etc/nic.conf restores /etc/nic.rules.v4 and .v6, brings eth0 up,
+and asks for a DHCP lease over IPv4, which is what happened at boot. For a
+static address instead, replace the "dhcp" line with:
+
+    ip 192.168.1.50/24 eth0
+    route default via 192.168.1.1 eth0
+
+The network is a service like any other, so a changed /etc/nic.conf is applied
+the way any service is, and a machine that wants no network at boot says so:
+
+    service network restart   # apply the file as it is now
+    chkconfig network off     # and stop doing it at boot
+    tail /var/log/network.log # what nic had to say about it
+
+/usr/share/doc/nic has the manual, upstream's annotated nic.conf, and a fuller
+example.
+
+sowa-setup can write the NIC configuration during installation. Its guided
+choices are keep, DHCP, static and firewall-only; "man sowa-setup" lists the
+SOWA_SETUP_NIC_* variables for unattended installs. A complete nic.conf can be
+provided with SOWA_SETUP_NIC_CONFIG_FILE.
+
+The same thing by hand, with iproute2 and a static address:
+
+    ip link set dev eth0 up
+    ip addr add 192.168.1.50/24 dev eth0
+    ip route add default via 192.168.1.1
+
+That is applied once and forgotten - /etc/nic.conf is the file the boot reads.
+
+Replace "eth0" with the interface you actually have; "ip link" with no
+arguments lists them. There is no standalone DHCP client here - nic has its
+own - so a lease means letting nic ask for it, against a file of your own if
+/etc/nic.conf is not the one to change:
+
+    printf 'up eth0\ndhcp eth0\n' > /tmp/net.conf
+    nic start --config=/tmp/net.conf
+
+Check the result:
+
+    ip addr show eth0
+    ip route
+    ping -c 3 1.1.1.1
+
+/etc/resolv.conf already points at public resolvers (1.1.1.1 and 8.8.8.8),
+so name resolution works as soon as there is a route. "nic start" rewrites it
+from the "ns" lines in /etc/nic.conf and then makes it immutable, so editing it
+afterwards needs "chattr -i /etc/resolv.conf" - or a change to /etc/nic.conf,
+which is the file that decides it.
+
+See also: ssh.txt for reaching the machine once it has an address, firewall.txt
+for keeping other people out, and services.txt for what "service" and
+"chkconfig" are.

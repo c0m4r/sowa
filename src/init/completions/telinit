@@ -1,0 +1,26 @@
+# bash completion for telinit(8) and init(8)               -*- shell-script -*-
+# shellcheck shell=bash
+#
+# One file for both names, because "init 3" run by anyone but process 1 is
+# "telinit 3": it forwards the request and exits. /usr/share/bash-completion/
+# completions/init is a symbolic link to this file, and both names are
+# registered below so that whichever of them was typed finds the other.
+
+_sowa_comp_telinit()
+{
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    local previous="${COMP_WORDS[COMP_CWORD - 1]}"
+
+    # -t takes a number of seconds; nothing here can guess which one.
+    if [[ ${previous} == -t ]]; then
+        return 0
+    fi
+
+    # 0-6 are the runlevels, S is single user, Q rereads the inittab, and
+    # a, b and c run the ondemand entries rather than changing anything.
+    mapfile -t COMPREPLY < <(
+        compgen -W "0 1 2 3 4 5 6 S s Q q a b c -t" -- "${current}"
+    )
+}
+
+complete -F _sowa_comp_telinit telinit init

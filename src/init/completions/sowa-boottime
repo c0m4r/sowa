@@ -1,0 +1,46 @@
+# bash completion for sowa-boottime(8)                     -*- shell-script -*-
+# shellcheck shell=bash
+#
+# The options, and for --boot the ids that are actually on this machine, read
+# out of the history the program itself reads. Offering a list of boots is the
+# point: they are eight hex digits, nobody remembers one, and the alternative is
+# running the program once to find an id and again to use it.
+
+_sowa_comp_boottime_boots()
+{
+    local log=/var/log/service-timing.log
+
+    [[ -r ${log} ]] || return 0
+    awk '!seen[$1]++ { print $1 }' "${log}" 2>/dev/null
+}
+
+_sowa_comp_boottime()
+{
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    local previous="${COMP_WORDS[COMP_CWORD-1]}"
+
+    case ${previous} in
+        -b | --boot)
+            mapfile -t COMPREPLY \
+                < <(compgen -W "$(_sowa_comp_boottime_boots)" -- "${current}")
+            return 0
+            ;;
+        -f | --file)
+            # A path, which readline completes better than any list here could.
+            mapfile -t COMPREPLY < <(compgen -f -- "${current}")
+            return 0
+            ;;
+        -s | --slowest)
+            # The count is optional; offering a couple of round ones is a hint
+            # that it takes a number at all.
+            mapfile -t COMPREPLY < <(compgen -W "5 10 20" -- "${current}")
+            return 0
+            ;;
+    esac
+
+    mapfile -t COMPREPLY < <(compgen -W "
+        -a --all -b --boot -H --history -s --slowest -f --file -h --help
+    " -- "${current}")
+}
+
+complete -F _sowa_comp_boottime sowa-boottime

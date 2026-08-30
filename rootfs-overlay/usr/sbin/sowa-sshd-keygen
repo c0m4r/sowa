@@ -1,0 +1,24 @@
+#!/bin/bash
+#
+# sowa-sshd-keygen - create the sshd host key on the running system.
+#
+# Host keys identify a machine, so shipping one in the image would give every
+# Sowa installation the same identity. /etc/rc.d/init.d/sshd runs this before
+# it starts the daemon instead, and it is a no-op once the key exists. Only the
+# Ed25519 key /etc/ssh/sshd_config names is created; "ssh-keygen -A" adds the
+# remaining types if a client needs them.
+
+set -Eeuo pipefail
+
+readonly KEY=/etc/ssh/ssh_host_ed25519_key
+
+[[ -f "${KEY}" ]] && exit 0
+
+mkdir -p /etc/ssh
+# rc.sysinit has already set the hostname from this file by now; reading it
+# again is simply the shortest way to the same string.
+comment="root@$(cat /etc/hostname 2>/dev/null || printf 'localhost')"
+ssh-keygen -q -t ed25519 -f "${KEY}" -N '' -C "${comment}"
+chmod 0600 "${KEY}"
+chmod 0644 "${KEY}.pub"
+printf '==> generated the sshd host key %s\n' "${KEY}"

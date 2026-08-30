@@ -1,0 +1,2778 @@
+#!/bin/bash
+#
+# sowa-pkg - the Sowa binary package manager.
+#
+# Packages are XZ-compressed tar archives served from a plain HTTPS
+# directory, described by a single signed index file. There is no server side:
+# an update is nothing but a GET of
+#
+#   ${SOWA_REPO_URL}/index
+#   ${SOWA_REPO_URL}/index.sig
+#   ${SOWA_REPO_URL}/sowa-<name>-<version>-<arch>-<pkgbuild>.tar.xz
+#
+# The index is signed with Ed25519 and every archive in it is pinned by
+# SHA-256, so the index signature covers the whole repository. That signature,
+# not the transport, is what an update trusts.
+#
+# Installing never writes through an existing file. Each archive is unpacked
+# into a staging directory and its files are then moved into place, so every
+# replacement is a rename(2): a running program keeps the inode it started
+# with, a shared library is never truncated under the processes that mapped it,
+# and an interrupted install cannot leave a half-written binary behind. This is
+# also why upgrading sowa-pkg itself while it is running is safe.
+#
+# Files below /etc are treated as configuration: a locally modified one is kept
+# and the packaged version is written beside it as <file>.tpknew.
+#
+# A package may carry a .MESSAGE beside its .PKGINFO and .FILES: the note it
+# wants shown once it is installed, for the few that are not finished by being
+# unpacked. It is kept in the local database and printed at the end of the
+# transaction rather than in the middle of it, so what a package has to say
+# does not scroll past behind the ones installed after it.
+#
+# It may also carry a .HOOKS: the steps that finish an installation the files
+# alone do not, and that undo them again before a removal. There is still no
+# post-install *script*, and a package cannot ship one. A hook is a line naming
+# an event and one of a fixed set of actions this program implements itself:
+#
+#   post-install|setup|/usr/sbin/sowa-guix-setup
+#   post-install|service-enable|guix-daemon
+#   pre-remove|service-stop|sshd
+#
+# The service actions run an init script that is already on the machine, and
+# "setup" runs a program the package itself owns - looked up in that package's
+# own .FILES before it is run, so a hook cannot name /bin/sh, a path another
+# package placed, or anything that was not in the archive whose hash the signed
+# index pinned. The set of programs a repository can run as root is therefore
+# still exactly the set of files it ships, which it could run anyway the first
+# time anybody used one of them; what the hooks change is when they run, not
+# what can be delivered. --no-hooks declines even that, and every hook that
+# runs is printed before it does.
+#
+# The "|"-separated metadata is parsed with bash's own read rather than with
+# grep, sed, or awk: one process per file instead of one per line, and no
+# dependence on which regular-expression dialect the base utilities implement.
+# That was a live concern rather than a hypothetical: this ran for a while
+# against a base whose grep matched with Go regular expressions, in which "|"
+# is alternation rather than a literal.
+
+set -Eeuo pipefail
+
+readonly PROGRAM=sowa-pkg
+readonly ENTRY_NEWLINE=$'\n'
+readonly CHUNK=256
+
+# Removing any of these from a running system would leave it unable to boot,
+# run a shell, or install anything again. tar and xz are on the list for the
+# last of those reasons: every new package is an XZ-compressed tar archive, and
+# unpacking one runs both programs, so a system without them could never install
+# them back.
+readonly ESSENTIAL=(sowa-base bash linux sowa-init sowa-release tar xz)
+
+# The events a hook can name, and the actions it can ask for. Both lists are
+# closed: a .HOOKS line naming anything else is refused rather than guessed at.
+#
+# post-install and post-upgrade are separate because they answer different
+# questions. "This machine has just been given Guix for the first time, so make
+# it a Guix host and start the daemon" is not the same instruction as "the guix
+# package has been replaced, so re-seed what it needs and restart the daemon
+# that is running the old one" - and a package that enabled its service on every
+# upgrade would quietly undo an administrator who had turned it off.
+readonly HOOK_EVENTS=(post-install post-upgrade pre-remove)
+readonly HOOK_ACTIONS=(
+    service-start service-stop service-restart service-enable service-disable
+    setup
+)
+# The environment a hook is given. It is the one an init script gets at boot,
+# because that is what most of them are: see /sbin/service.
+readonly HOOK_PATH=/bin:/sbin:/usr/bin:/usr/sbin
+readonly INITD=/etc/rc.d/init.d
+
+ROOT=""
+LOCK_HELD=0
+ASSUME_YES=0
+REINSTALL=0
+DOWNLOAD_ONLY=0
+RUN_HOOKS=1
+# Going back to an older version, and accepting repository metadata that is
+# older or older-than-it-should-be, are both things an operator may genuinely
+# need and neither is something this program will do because a server asked it
+# to. See run_transaction and check_index_freshness.
+ALLOW_DOWNGRADE=0
+ALLOW_STALE=0
+
+# Keyed by path and by package name, so they have to be associative: an indexed
+# array would evaluate "etc/nanorc" as arithmetic.
+declare -A RECORDED_HASH=()
+declare -A VISITED=()
+declare -a RESOLVED=()
+# The packages installed in this transaction that carried a .MESSAGE, in the
+# order they were installed.
+declare -a ANNOUNCED=()
+# The hooks that were asked for and did not succeed. A hook failing does not
+# undo an installation - the files are in place and correct either way - so it
+# is collected and reported at the end rather than thrown as the last word of
+# an otherwise successful transaction.
+declare -a HOOK_FAILURES=()
+# The package names the operator actually typed, as against the ones this
+# program worked out for them: a bare "upgrade" asks for everything that
+# differs, and a named install pulls in dependencies. Only a name somebody typed
+# can ask for a downgrade or a reinstall.
+declare -a NAMED=()
+
+SOWA_REPO_URL=""
+SOWA_REPO_ARCH="x86_64"
+SOWA_REPO_KEY="/etc/sowa/keys/sowa-repo.pub"
+SOWA_REQUIRE_SIGNATURE=1
+SOWA_RUN_HOOKS=1
+
+# ------------------------------------------------------------------- logging
+#
+# What this program did, kept where the machine keeps everything else it has
+# been told. Every service in the image appends to /var/log/<name>.log and this
+# is that file for package management: what was asked for, what the plan was,
+# which package went in or came out, which declared step ran, and how it ended.
+# A machine that was working on Monday and is not on Tuesday is the case it
+# exists for, and "when did openssl change, and to what" is not a question the
+# database can answer - it holds what is installed now, not what happened.
+#
+# Only the commands that change something open it. "sowa-pkg list" in a loop is
+# not a record of anything, and a read-only command has to keep working for
+# somebody who cannot write to /var/log at all. That is also why every write
+# here is allowed to fail in silence: a full disk or a read-only root is a
+# reason for a package operation to say so in its own words, not a reason for
+# it to die inside its logger.
+#
+# --root writes into that root. The record belongs with the system that
+# changed, not with the one that ran the command.
+readonly LOGGED_COMMANDS=(update add install upgrade remove uninstall clean)
+LOG_FILE=""
+LOGGING=0
+
+open_log() {
+    LOG_FILE="${ROOT}/var/log/${PROGRAM}.log"
+    mkdir -p "${ROOT}/var/log" 2> /dev/null || return 0
+    # Refuse a link or special file: logging must never turn a package command
+    # into a privileged write to some other path, or block on a FIFO. A new
+    # regular file is 0640 through the private umask; an existing file keeps the
+    # administrator's mode instead of being widened on every transaction.
+    [[ ! -L "${LOG_FILE}" ]] || return 0
+    [[ ! -e "${LOG_FILE}" || -f "${LOG_FILE}" ]] || return 0
+    if (umask 0027; : >> "${LOG_FILE}") 2> /dev/null; then
+        LOGGING=1
+    fi
+    return 0
+}
+
+audit() {
+    local message
+    ((LOGGING == 1)) || return 0
+    message="$*"
+    # Arguments and repository text are data, not extra log records. Keep one
+    # physical line per event even if an alternate-root path contains a newline.
+    message="${message//$'\r'/\\r}"
+    message="${message//$'\n'/\\n}"
+    printf '%s %s[%s]: %s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${PROGRAM}" "$$" "${message}" \
+        >> "${LOG_FILE}" 2> /dev/null || true
+    return 0
+}
+
+log()  { printf '==> %s\n' "$*"; audit "$*"; }
+warn() { printf '==> warning: %s\n' "$*" >&2; audit "warning: $*"; }
+die()  { printf 'error: %s\n' "$*" >&2; audit "error: $*"; exit 1; }
+
+usage() {
+    cat <<'EOF'
+usage: sowa-pkg <command> [options] [package...]
+
+commands:
+  update                 fetch and verify the repository index
+  list [--upgradable]    list installed packages, or only versions that differ
+  list --available       list what the repository offers and this system lacks
+  list --all             list everything, installed and not
+  info <package>...      show what a package is and where it came from
+  files <package>        list the paths a package owns
+  owns <path>            report which package owns a path
+  install <package>...   install packages and their dependencies
+  upgrade [<package>...] bring packages, or the whole system, up to the repository
+  remove <package>...    remove packages and their files
+  uninstall <package>... the same thing
+  hooks [<package>...]   show the install and removal steps packages declare
+  verify [<package>...]  re-check installed files against their recorded hashes
+  clean [--all]          drop cached archives the index no longer references
+
+options:
+  -y, --yes              do not ask for confirmation
+      --reinstall        install again even at the same version
+      --download-only    fetch archives into the cache and stop
+      --no-hooks         do not run the steps packages declare
+      --allow-downgrade  install a named package the repository has an older
+                         version of; an upgrade never does this on its own
+      --allow-stale      accept a repository index that is expired or older
+                         than one this machine has already seen
+      --root <dir>       operate on another root filesystem
+
+exit status:
+  0  done
+  1  nothing was changed, and why is on standard error
+  2  the packages are installed, but a step one of them declared did not run
+
+Configuration lives in /etc/sowa/pkg.conf.
+
+"sowa-license" answers the licensing questions: what a package is under, which
+packages are Sowa's own work, and where the full text of each licence is.
+EOF
+}
+
+# ---------------------------------------------------------------- environment
+
+set_paths() {
+    STATE_DIR="${ROOT}/var/lib/sowa"
+    DB_DIR="${STATE_DIR}/db"
+    REPO_DIR="${STATE_DIR}/repo"
+    LOCK_DIR="${STATE_DIR}/lock"
+    CACHE_DIR="${ROOT}/var/cache/sowa/pkg"
+    STAGING_DIR="${ROOT}/var/cache/sowa/staging"
+    INDEX="${REPO_DIR}/index"
+    CONFIG="${ROOT}/etc/sowa/pkg.conf"
+}
+
+# --root names a directory to be operated on, and everything read out of it -
+# the configuration, the database, the manifests - is read as data belonging to
+# somebody else. Resolving it once, here, is what makes "below the root" a
+# question with an answer later on: a relative path, a trailing slash and a
+# symbolic link all become the same absolute physical directory before anything
+# is read or written.
+canonicalize_root() {
+    local resolved
+    [[ -n "${ROOT}" ]] || return 0
+    [[ -d "${ROOT}" ]] || die "--root ${ROOT} is not a directory"
+    resolved="$(cd -P -- "${ROOT}" 2> /dev/null && pwd -P)" \
+        || die "--root ${ROOT} cannot be resolved"
+    # "--root /" is the running system, said the long way round.
+    [[ "${resolved}" != / ]] || resolved=""
+    ROOT="${resolved}"
+}
+
+# The settings a configuration file may make. A key that is not on this list is
+# refused rather than ignored: an unknown key is either a typo that would
+# otherwise take effect as silence, or a file written for something else.
+readonly CONFIG_KEYS=(
+    SOWA_REPO_URL SOWA_REPO_ARCH SOWA_REPO_KEY SOWA_REQUIRE_SIGNATURE
+    SOWA_RUN_HOOKS
+)
+
+# A repository URL is a scheme, a host, an optional port and a path, and
+# nothing else. No credentials, no query, no fragment: none of them mean
+# anything to a directory of files, and refusing them keeps a configuration
+# file from steering curl somewhere with a URL that still looks like one.
+readonly CONFIG_URL_RE='^https?://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~%+-]+)*/?$'
+readonly CONFIG_PATH_RE='^(/[A-Za-z0-9._+-]+)+$'
+readonly CONFIG_ARCH_RE='^[A-Za-z0-9_]+$'
+
+CONFIG_VALUE=""
+
+# Takes one layer of quotes off a value and refuses everything that would have
+# had a meaning of its own when this file was still being sourced. The three
+# characters that made it a program - $, ` and \ - appear in no value this
+# program accepts, so they are refused outright rather than escaped and handed
+# back to an expansion.
+config_unquote() {
+    local where="$1"
+    local value="$2"
+    local quote
+
+    if [[ "${value}" == '"'* || "${value}" == "'"* ]]; then
+        quote="${value:0:1}"
+        [[ ${#value} -ge 2 && "${value: -1}" == "${quote}" ]] \
+            || die "${where}: a quoted value has to be closed on the same line"
+        value="${value:1:${#value}-2}"
+    fi
+    [[ "${value}" != *'"'* && "${value}" != *"'"* ]] \
+        || die "${where}: a value may not contain a quote"
+    [[ "${value}" != *'$'* && "${value}" != *'`'* && "${value}" != *"\\"* ]] \
+        || die "${where}: a value may not contain an expansion"
+    [[ "${value}" != *[[:space:]]* ]] \
+        || die "${where}: a value may not contain whitespace"
+    CONFIG_VALUE="${value}"
+}
+
+# What each setting is allowed to be. A value that does not match is refused
+# with the key named and the value not: the key came from the allowlist above,
+# and the value is the part that was written by whoever wrote the file.
+config_value_is_valid() {
+    local key="$1"
+    local value="$2"
+
+    case "${key}" in
+        SOWA_REPO_URL)
+            [[ "${value}" =~ ${CONFIG_URL_RE} ]]
+            ;;
+        SOWA_REPO_ARCH)
+            [[ "${value}" =~ ${CONFIG_ARCH_RE} ]]
+            ;;
+        SOWA_REPO_KEY)
+            [[ "${value}" =~ ${CONFIG_PATH_RE} ]] && [[ "/${value}/" != */../* ]]
+            ;;
+        SOWA_REQUIRE_SIGNATURE | SOWA_RUN_HOOKS)
+            [[ "${value}" == 0 || "${value}" == 1 ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# Reads pkg.conf as data.
+#
+# This file used to be sourced, which made it a program rather than a
+# configuration file: every line ran, with the privileges of whoever ran
+# sowa-pkg. On the running system that is defensible - anybody who can write
+# /etc/sowa/pkg.conf can already write /bin - but --root points this program at
+# *another* root, and repairing a downloaded, borrowed or compromised image as
+# root then executed that image's configuration file on the host. The target of
+# --root is data. It is now read as data.
+#
+# So: no shell. Each line is KEY=VALUE with at most one layer of quotes, the key
+# has to be one of five, the value has to match that key's grammar, and nothing
+# that could reintroduce an expansion is accepted anywhere in it. A file that
+# does not fit is refused rather than partly applied, and the message names the
+# file, the line and the key but never repeats the value back: on an untrusted
+# root the value is the untrusted part.
+parse_config() {
+    local file="$1"
+    local line key value where number=0
+    local -A seen=()
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        number=$((number + 1))
+        where="${file}:${number}"
+        # A file edited on another system carries these; they are not part of
+        # any value here.
+        line="${line%$'\r'}"
+        [[ "${line}" != *[$'\001'-$'\037'$'\177']* ]] \
+            || die "${where}: control character in a configuration file"
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -n "${line}" && "${line}" != '#'* ]] || continue
+        [[ "${line}" == *=* ]] || die "${where}: not a KEY=VALUE line"
+        key="${line%%=*}"
+        value="${line#*=}"
+        # Blanks after the value, which a value that wanted them would have
+        # quoted.
+        value="${value%"${value##*[![:space:]]}"}"
+        [[ "${key}" =~ ^[A-Z][A-Z0-9_]*$ ]] \
+            || die "${where}: not a configuration key"
+        in_list "${key}" "${CONFIG_KEYS[@]}" \
+            || die "${where}: ${key} is not a setting this program has"
+        [[ -z "${seen[${key}]:-}" ]] \
+            || die "${where}: ${key} is set more than once"
+        seen["${key}"]=1
+        config_unquote "${where}" "${value}"
+        config_value_is_valid "${key}" "${CONFIG_VALUE}" \
+            || die "${where}: ${key} is not set to something this program will use"
+        printf -v "${key}" '%s' "${CONFIG_VALUE}"
+    done < "${file}"
+}
+
+load_config() {
+    if [[ -e "${CONFIG}" || -L "${CONFIG}" ]]; then
+        # A link here would let a root being repaired choose which file on the
+        # host this program reads and quotes back in its errors.
+        [[ ! -L "${CONFIG}" ]] \
+            || die "${CONFIG} is a symbolic link; configuration has to be a file"
+        [[ -f "${CONFIG}" ]] \
+            || die "${CONFIG} is not a regular file"
+        parse_config "${CONFIG}"
+    fi
+    # Every request appends "/name", so a configured trailing slash would ask
+    # for "//name". Most servers answer that anyway; some do not.
+    SOWA_REPO_URL="${SOWA_REPO_URL%/}"
+    # --no-hooks has already been read from the command line and is not undone
+    # by a configuration file that leaves them on.
+    if [[ "${SOWA_RUN_HOOKS}" != 1 ]]; then
+        RUN_HOOKS=0
+    fi
+    [[ -n "${SOWA_REPO_URL}" ]] \
+        || die "no repository configured; set SOWA_REPO_URL in ${CONFIG}"
+    case "${SOWA_REPO_URL}" in
+        *example.org* | *example.com* | *example.invalid*)
+            die "${CONFIG} still has the placeholder repository URL; set SOWA_REPO_URL to your own server"
+            ;;
+    esac
+}
+
+# The signature is what an update trusts, so plain HTTP does not let anybody
+# ship code to this machine. What it does let them do is choose which signed
+# index this machine is shown, and read what it asks for. The serial and expiry
+# inside the index answer the first; nothing but TLS answers the second.
+#
+# Said once, and only when something is actually being fetched: a "list" that
+# reads the local database has no transport to be warned about.
+TRANSPORT_WARNED=0
+warn_plain_transport() {
+    ((TRANSPORT_WARNED == 0)) || return 0
+    TRANSPORT_WARNED=1
+    [[ "${SOWA_REPO_URL}" == http://* ]] || return 0
+    warn "${CONFIG} fetches the repository over HTTP; anyone on the path can see what this machine asks for"
+}
+
+# The image's own curl is named by path rather than resolved through PATH:
+# fetching a package index has to go through the build that trusts the system
+# CA bundle, not through whatever a later PATH entry happens to offer.
+select_curl() {
+    if [[ -x /usr/bin/curl ]]; then
+        CURL=/usr/bin/curl
+    else
+        CURL="$(command -v curl)" || die "curl is required and was not found"
+    fi
+}
+
+# Changing the running system needs root. Another root - an image being
+# assembled, or a mounted disk - only needs to be writable, which is what makes
+# --root usable without privilege.
+require_write_access() {
+    local action="$1"
+    if [[ -z "${ROOT}" ]]; then
+        [[ "$(id -u)" -eq 0 ]] || die "${PROGRAM} ${action} must run as root"
+        return 0
+    fi
+    mkdir -p "${STATE_DIR}" 2> /dev/null \
+        || die "${PROGRAM} ${action} cannot write to ${ROOT}"
+    [[ -w "${STATE_DIR}" ]] || die "${PROGRAM} ${action} cannot write to ${ROOT}"
+}
+
+acquire_lock() {
+    mkdir -p "${STATE_DIR}"
+    if ! mkdir "${LOCK_DIR}" 2> /dev/null; then
+        die "another ${PROGRAM} is running (remove ${LOCK_DIR} if it is not)"
+    fi
+    LOCK_HELD=1
+}
+
+release_lock() {
+    ((LOCK_HELD == 1)) || return 0
+    rmdir "${LOCK_DIR}" 2> /dev/null || true
+    LOCK_HELD=0
+}
+
+# One trap for both, installed by main. A transaction that ends any way other
+# than by returning - an interrupted download, a failed tar, errexit - has to
+# drop the lock and has to be the last line in the record, or the next person
+# reads a log whose last entry is a plan that may or may not have happened.
+on_exit() {
+    local status=$?
+    release_lock
+    if ((status == 0)); then
+        audit "finished"
+    else
+        audit "exited with status ${status}"
+    fi
+}
+
+confirm() {
+    local answer
+    if [[ "${ASSUME_YES}" == 1 ]]; then
+        return 0
+    fi
+    printf '%s [Y/n] ' "$1"
+    read -r answer || answer=n
+    case "${answer}" in
+        '' | y | Y | yes | YES) return 0 ;;
+        *) die "aborted at user request" ;;
+    esac
+}
+
+# Runs a command over a long argument list in chunks, so installing a package
+# with thousands of files still costs a handful of processes rather than one
+# per file.
+run_chunked() {
+    local -a command_line=() chunk=()
+    local argument
+    while [[ $# -gt 0 && "$1" != -- ]]; do
+        command_line+=("$1")
+        shift
+    done
+    shift
+    for argument in "$@"; do
+        chunk+=("${argument}")
+        if ((${#chunk[@]} >= CHUNK)); then
+            "${command_line[@]}" "${chunk[@]}"
+            chunk=()
+        fi
+    done
+    if ((${#chunk[@]} > 0)); then
+        "${command_line[@]}" "${chunk[@]}"
+    fi
+}
+
+# As run_chunked, but for commands whose last operand is a destination, so each
+# chunk ends with it: "mv file... directory".
+run_chunked_into() {
+    local destination="$1"
+    shift
+    local -a command_line=() chunk=()
+    local argument
+    while [[ $# -gt 0 && "$1" != -- ]]; do
+        command_line+=("$1")
+        shift
+    done
+    shift
+    for argument in "$@"; do
+        chunk+=("${argument}")
+        if ((${#chunk[@]} >= CHUNK)); then
+            "${command_line[@]}" "${chunk[@]}" "${destination}"
+            chunk=()
+        fi
+    done
+    if ((${#chunk[@]} > 0)); then
+        "${command_line[@]}" "${chunk[@]}" "${destination}"
+    fi
+}
+
+human_size() {
+    local bytes="$1"
+    if ((bytes >= 1048576)); then
+        printf '%s.%s MiB\n' "$((bytes / 1048576))" "$(((bytes % 1048576) * 10 / 1048576))"
+    elif ((bytes >= 1024)); then
+        printf '%s KiB\n' "$((bytes / 1024))"
+    else
+        printf '%s B\n' "${bytes}"
+    fi
+}
+
+# True when the second package version is strictly newer than the first.  A
+# package version is upstream-version followed by the numeric packaging
+# release, and GNU version sort handles both that release and upstream forms
+# such as 10.4p1 or 2026c consistently.
+version_is_newer() {
+    [[ "$1" != "$2" ]] || return 1
+    printf '%s\n%s\n' "$1" "$2" | sort -C -V
+}
+
+file_hash() {
+    local sum _rest
+    read -r sum _rest < <(sha256sum "$1")
+    printf '%s\n' "${sum}"
+}
+
+# --------------------------------------------------------------------- index
+
+require_index() {
+    [[ -f "${INDEX}" ]] || die "no package index; run '${PROGRAM} update' first"
+}
+
+index_names() {
+    local name _rest
+    while IFS='|' read -r name _rest; do
+        if [[ -n "${name}" && "${name}" != \#* ]]; then
+            printf '%s\n' "${name}"
+        fi
+    done < "${INDEX}"
+}
+
+# Fills the IDX_* variables from the index. Callers that recurse must copy what
+# they need first.
+read_index_entry() {
+    local wanted="$1"
+    local name rest build_or_description description
+    while IFS='|' read -r name rest; do
+        if [[ -z "${name}" || "${name}" == \#* ]]; then
+            continue
+        fi
+        if [[ "${name}" == "${wanted}" ]]; then
+            IFS='|' read -r IDX_VERSION IDX_ARCH IDX_ARCHIVE IDX_SHA256 \
+                IDX_SIZE IDX_DEPENDS IDX_LICENSE IDX_COPYRIGHT \
+                build_or_description description <<< "${rest}"
+            # pkgbuild was added immediately before the final free-text field.
+            # An older index has its description in that slot; recognising the
+            # digest makes both layouts readable during the client rollout.
+            if [[ "${build_or_description}" =~ ^[0-9a-f]{64}$ ]]; then
+                IDX_BUILD="${build_or_description}"
+                IDX_DESCRIPTION="${description}"
+            else
+                IDX_BUILD=""
+                IDX_DESCRIPTION="${build_or_description}"
+                [[ -z "${description}" ]] \
+                    || IDX_DESCRIPTION+="|${description}"
+            fi
+            return 0
+        fi
+    done < "${INDEX}"
+    return 1
+}
+
+# Whether the repository is offering a different build of the version this
+# machine already has.
+#
+# A version is an upstream release and a packaging counter, both written by
+# hand, and neither changes when a package is rebuilt: against a new OpenSSL,
+# after a corrected recipe, with a patch added. Comparing versions alone
+# therefore leaves such a rebuild invisible - the machine sees two equal strings
+# and skips bytes that are not the ones it has. The build id is derived from
+# both the installed bytes and their build provenance, so this asks "is what I
+# have the audited build being published" rather than trusting the label.
+#
+# An offered entry with no build id is from an older repository and is treated
+# as matching. The opposite migration is deliberately different: when the
+# repository has an identity and the installed entry predates it, one rebuild
+# is required to make the system's state knowable and convergent.
+build_differs() {
+    local name="$1"
+    local offered="$2"
+    local installed
+    [[ -n "${offered}" ]] || return 1
+    installed="$(installed_field "${name}" pkgbuild || true)"
+    [[ "${installed}" != "${offered}" ]]
+}
+
+# ---------------------------------------------------------- index validation
+#
+# What the index is allowed to say.
+#
+# The signature settles who wrote the index, and the SHA-256 beside each package
+# settles which bytes that writer meant. Neither says the index is well formed.
+# A publishing bug, a corrupted table or a signing key in the wrong hands can
+# all produce a perfectly signed index carrying a package called "../../etc", an
+# archive name with a slash in it, a size that is not a number, or a dependency
+# loop that would send resolve() recursing until bash gave up. Those go through
+# every filesystem operation this program performs, so they are settled here,
+# once, against the whole document, before it replaces the index this machine
+# has been using.
+readonly INDEX_NAME_RE='^[a-z0-9][a-z0-9+._-]*$'
+readonly INDEX_VERSION_RE='^[A-Za-z0-9][A-Za-z0-9+.:~_-]*$'
+readonly INDEX_ARCHIVE_RE='^[A-Za-z0-9][A-Za-z0-9+._-]*\.tar\.(xz|gz)$'
+readonly INDEX_HASH_RE='^[0-9a-f]{64}$'
+# Fifteen digits is a petabyte. A size is used in arithmetic and printed as a
+# download total, and neither wants an unbounded string.
+readonly INDEX_SIZE_RE='^[1-9][0-9]{0,14}$'
+readonly INDEX_MAX_FIELD=64
+
+declare -A INDEX_DEPENDS=()
+INDEX_COUNT=0
+
+# A cycle in a signed index is a defect in whoever published it, not something
+# to discover halfway through a transaction. Kahn's algorithm: take away every
+# package whose dependencies have already been taken away, and if a pass takes
+# nothing away while something is left, what is left is a cycle.
+index_is_acyclic() {
+    local name dependency progress blocked removed=0 total=0
+    local -a dependency_list=()
+    local -A pending=()
+
+    for name in "${!INDEX_DEPENDS[@]}"; do
+        pending["${name}"]=1
+        total=$((total + 1))
+    done
+    while ((removed < total)); do
+        progress=0
+        for name in "${!pending[@]}"; do
+            [[ -n "${pending[${name}]}" ]] || continue
+            blocked=0
+            IFS=, read -r -a dependency_list <<< "${INDEX_DEPENDS[${name}]}"
+            for dependency in "${dependency_list[@]}"; do
+                if [[ -n "${pending[${dependency}]:-}" ]]; then
+                    blocked=1
+                    break
+                fi
+            done
+            if ((blocked == 0)); then
+                # Emptied rather than unset, for the reason given in
+                # verify_staged_tree.
+                pending["${name}"]=""
+                removed=$((removed + 1))
+                progress=1
+            fi
+        done
+        ((progress == 1)) || return 1
+    done
+    return 0
+}
+
+validate_index() {
+    local file="$1"
+    local line name version arch archive checksum size depends license
+    local copyright build dependency number=0 count=0
+    local -a fields=() dependency_list=()
+    local -A archives=()
+
+    INDEX_DEPENDS=()
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        number=$((number + 1))
+        # First, because everything below is quoted back in a message when it
+        # is wrong, and a terminal escape is a control character.
+        [[ "${line}" != *[$'\001'-$'\037'$'\177']* ]] \
+            || die "the repository index has a control character on line ${number}"
+        [[ -n "${line}" && "${line}" != \#* ]] || continue
+        IFS='|' read -r -a fields <<< "${line}"
+        # Ten fields is the layout that predates the build id, eleven is the
+        # current one, and the description is the free-text field that may hold
+        # a "|" of its own and so may make it more.
+        ((${#fields[@]} >= 10)) \
+            || die "the repository index has an incomplete entry on line ${number}"
+        name="${fields[0]}"
+        version="${fields[1]}"
+        arch="${fields[2]}"
+        archive="${fields[3]}"
+        checksum="${fields[4]}"
+        size="${fields[5]}"
+        depends="${fields[6]}"
+        license="${fields[7]}"
+        copyright="${fields[8]}"
+        build="${fields[9]}"
+        [[ "${build}" =~ ${INDEX_HASH_RE} ]] || build=""
+
+        [[ "${name}" =~ ${INDEX_NAME_RE} && ${#name} -le ${INDEX_MAX_FIELD} ]] \
+            || die "the repository index has an unusable package name on line ${number}"
+        [[ -z "${INDEX_DEPENDS[${name}]+set}" ]] \
+            || die "the repository index offers ${name} twice"
+        [[ "${version}" =~ ${INDEX_VERSION_RE} && ${#version} -le ${INDEX_MAX_FIELD} ]] \
+            || die "the repository index has an unusable version for ${name}"
+        [[ "${arch}" == "${SOWA_REPO_ARCH}" ]] \
+            || die "the index offers ${name} for ${arch}, but this system is ${SOWA_REPO_ARCH}"
+        # An archive name is a basename below the repository URL. A slash or a
+        # ".." in it would be a path of the publisher's choosing, both in the
+        # request and in the cache directory it is written to.
+        [[ "${archive}" =~ ${INDEX_ARCHIVE_RE} && ${#archive} -le 160 ]] \
+            || die "the repository index has an unusable archive name for ${name}"
+        [[ -z "${archives[${archive}]:-}" ]] \
+            || die "the repository index names ${archive} for both ${archives[${archive}]} and ${name}"
+        archives["${archive}"]="${name}"
+        [[ "${checksum}" =~ ${INDEX_HASH_RE} ]] \
+            || die "the repository index has no usable checksum for ${name}"
+        [[ "${size}" =~ ${INDEX_SIZE_RE} ]] \
+            || die "the repository index has no usable size for ${name}"
+        [[ "${license}" != *[!\ -~]* && "${copyright}" != *[!\ -~]* ]] \
+            || die "the repository index has an unusable licence field for ${name}"
+
+        if [[ "${depends}" == - || -z "${depends}" ]]; then
+            INDEX_DEPENDS["${name}"]=""
+        else
+            IFS=, read -r -a dependency_list <<< "${depends}"
+            for dependency in "${dependency_list[@]}"; do
+                [[ "${dependency}" =~ ${INDEX_NAME_RE} \
+                    && ${#dependency} -le ${INDEX_MAX_FIELD} ]] \
+                    || die "the repository index has an unusable dependency for ${name}"
+            done
+            INDEX_DEPENDS["${name}"]="${depends}"
+        fi
+        count=$((count + 1))
+    done < "${file}"
+
+    ((count > 0)) || die "the repository index is empty"
+
+    # Closure and shape, once every name is known.
+    for name in "${!INDEX_DEPENDS[@]}"; do
+        [[ -n "${INDEX_DEPENDS[${name}]}" ]] || continue
+        IFS=, read -r -a dependency_list <<< "${INDEX_DEPENDS[${name}]}"
+        for dependency in "${dependency_list[@]}"; do
+            [[ -n "${INDEX_DEPENDS[${dependency}]+set}" ]] \
+                || die "the repository index has ${name} depending on ${dependency}, which it does not offer"
+        done
+    done
+    index_is_acyclic \
+        || die "the repository index has a dependency cycle; it cannot be installed in any order"
+
+    INDEX_COUNT="${count}"
+}
+
+# ----------------------------------------------------------------- freshness
+#
+# A signature says who wrote an index. It does not say this is the newest one
+# they wrote.
+#
+# Anybody who can answer for the repository URL - a network in between, a
+# caching proxy, a mirror, the server itself once it is somebody else's - can
+# hand back last year's index and last year's signed archives, indefinitely and
+# without forging anything. Every signature verifies. Every checksum matches.
+# The machine is simply held at a version whose defects are public, and an
+# unattended "upgrade -y" reports that there is nothing to do.
+#
+# So the index carries two numbers of its own, inside the bytes the signature
+# covers: a serial that never goes backwards, and the moment after which this
+# index is not to be believed at all. The highest serial this machine has ever
+# accepted is kept beside the index. A lower one is a replay. A missing one,
+# once a higher one has been seen, is the same replay with the header taken off.
+# An expired one is a repository that has stopped being published - or a network
+# that has stopped letting this machine reach it - and either way it is not
+# something to keep installing from silently.
+#
+# The header is a comment, so a client that predates it reads the index exactly
+# as before.
+IDX_SERIAL=""
+IDX_EXPIRES=""
+
+# Seconds, so nothing here has to parse a date. The human-readable forms are in
+# the same line for whoever opens the index.
+read_index_freshness() {
+    local file="$1"
+    local line field key value
+    local -a fields=()
+
+    IDX_SERIAL=""
+    IDX_EXPIRES=""
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        # The header is above the first package; there is nothing to look for
+        # past it.
+        [[ "${line}" == \#* || -z "${line}" ]] || break
+        [[ "${line}" == '# sowa-repo '* ]] || continue
+        read -r -a fields <<< "${line#'# sowa-repo '}"
+        for field in "${fields[@]}"; do
+            key="${field%%=*}"
+            value="${field#*=}"
+            case "${key}" in
+                serial) IDX_SERIAL="${value}" ;;
+                expires) IDX_EXPIRES="${value}" ;;
+            esac
+        done
+        # Written without a leading zero, so that arithmetic below reads them
+        # as decimal rather than as octal.
+        [[ "${IDX_SERIAL}" =~ ^(0|[1-9][0-9]{0,17})$ ]] \
+            || die "the repository index has an unreadable serial"
+        [[ "${IDX_EXPIRES}" =~ ^(0|[1-9][0-9]{0,17})$ ]] \
+            || die "the repository index has an unreadable expiry"
+        return 0
+    done < "${file}"
+    return 1
+}
+
+# The machine that most needs an update is sometimes the one that has been
+# switched off for a year, so refusing stale metadata has to be overridable.
+# The override is a flag whose name says what it does, it is not implied by -y,
+# and it says so on the terminal every time it is used.
+stale() {
+    if ((ALLOW_STALE == 1)); then
+        warn "$1"
+        warn "taking it anyway because --allow-stale was given"
+        return 0
+    fi
+    die "$1 (--allow-stale to take it anyway)"
+}
+
+accepted_serial() {
+    local serial=""
+    if [[ -f "${REPO_DIR}/serial" ]]; then
+        read -r serial < "${REPO_DIR}/serial" || serial=""
+    fi
+    [[ "${serial}" =~ ^(0|[1-9][0-9]{0,17})$ ]] || serial=0
+    printf '%s\n' "${serial}"
+}
+
+check_index_freshness() {
+    local file="$1"
+    local accepted now remaining
+    accepted="$(accepted_serial)"
+    now="$(date -u +%s)"
+
+    if ! read_index_freshness "${file}"; then
+        # A repository that has never published a serial is one this client is
+        # newer than: say so once and carry on. A repository that published one
+        # and has stopped is a replay of the index from before it did.
+        ((accepted == 0)) \
+            || stale "the repository index no longer says when it was published, and this machine has already seen one that did"
+        warn "the repository publishes no index serial or expiry; an old index cannot be told from the current one"
+        return 0
+    fi
+
+    ((IDX_SERIAL >= accepted)) \
+        || stale "the repository index is older than the one this machine already accepted (serial ${IDX_SERIAL}, expected at least ${accepted})"
+    ((now <= IDX_EXPIRES)) \
+        || stale "the repository index expired $(((now - IDX_EXPIRES) / 86400)) day(s) ago; the repository has not been republished since"
+
+    # A clock that is wrong is worth saying out loud here, because everything
+    # above and the TLS certificate below depend on it.
+    if ((now + 86400 < IDX_SERIAL)); then
+        warn "the repository index says it was published in the future; this machine's clock may be wrong"
+    fi
+    remaining=$(((IDX_EXPIRES - now) / 86400))
+    if ((now <= IDX_EXPIRES && remaining < 7)); then
+        warn "the repository index expires in ${remaining} day(s); updates will stop until it is republished"
+    fi
+}
+
+# Only after the index it came from has been accepted whole. The serial is the
+# one piece of repository state this machine keeps between updates, and writing
+# it early would let a rejected index raise the floor anyway.
+record_index_serial() {
+    local accepted
+    accepted="$(accepted_serial)"
+    [[ -n "${IDX_SERIAL}" ]] || return 0
+    ((IDX_SERIAL > accepted)) || return 0
+    printf '%s\n' "${IDX_SERIAL}" > "${REPO_DIR}/serial.new"
+    mv "${REPO_DIR}/serial.new" "${REPO_DIR}/serial"
+}
+
+# ------------------------------------------------------------------ database
+
+installed_field() {
+    local name="$1"
+    local wanted="$2"
+    local key value
+    [[ -f "${DB_DIR}/${name}/desc" ]] || return 1
+    while IFS='=' read -r key value; do
+        if [[ "${key}" == "${wanted}" ]]; then
+            printf '%s\n' "${value}"
+            return 0
+        fi
+    done < "${DB_DIR}/${name}/desc"
+    return 1
+}
+
+is_installed() {
+    [[ -f "${DB_DIR}/$1/desc" ]]
+}
+
+installed_names() {
+    local entry name
+    [[ -d "${DB_DIR}" ]] || return 0
+    for entry in "${DB_DIR}"/*; do
+        [[ -f "${entry}/desc" ]] || continue
+        name="${entry##*/}"
+        printf '%s\n' "${name}"
+    done
+}
+
+# Every package that lists the argument among its dependencies.
+installed_dependents() {
+    local wanted="$1"
+    local name depends dependency
+    local -a dependency_list=()
+    while IFS= read -r name; do
+        depends="$(installed_field "${name}" depends)" || continue
+        if [[ "${depends}" == - || -z "${depends}" ]]; then
+            continue
+        fi
+        IFS=, read -r -a dependency_list <<< "${depends}"
+        for dependency in "${dependency_list[@]}"; do
+            if [[ "${dependency}" == "${wanted}" ]]; then
+                printf '%s\n' "${name}"
+            fi
+        done
+    done < <(installed_names)
+}
+
+# ------------------------------------------------------------------ fetching
+
+# curl's progress bar only returns the cursor to column zero.  That is enough
+# until a terminal is resized: an old, wider bar is reflowed into several rows
+# and the next redraw leaves its tail behind.  Package archives have an exact
+# size in the signed index, so render their progress here and clear every row
+# occupied by the previous render before drawing at the current terminal width.
+PROGRESS_WIDTH=0
+
+terminal_columns() {
+    local rows columns
+    if read -r rows columns < <(stty size < /dev/tty 2> /dev/null) \
+        && [[ "${columns}" =~ ^[0-9]+$ ]] && ((columns > 0)); then
+        printf '%s\n' "${columns}"
+    elif [[ "${COLUMNS:-}" =~ ^[0-9]+$ ]] && ((COLUMNS > 0)); then
+        printf '%s\n' "${COLUMNS}"
+    else
+        printf '%s\n' 80
+    fi
+}
+
+clear_download_progress() {
+    local columns rows row
+    ((PROGRESS_WIDTH > 0)) || return 0
+
+    columns="$(terminal_columns)"
+    # A resize can reflow the old line.  Starting on its final row, erase it
+    # and each preceding row so a narrower terminal cannot retain fragments.
+    rows=$(((PROGRESS_WIDTH + columns - 1) / columns))
+    printf '\r\033[K' >&2
+    for ((row = 1; row < rows; row++)); do
+        printf '\033[1A\r\033[K' >&2
+    done
+    PROGRESS_WIDTH=0
+}
+
+render_download_progress() {
+    local output="$1"
+    local total="$2"
+    local current columns bar_width filled empty full remainder percent tenths
+
+    current="$(stat -c '%s' "${output}" 2> /dev/null || printf 0)"
+    [[ "${current}" =~ ^[0-9]+$ ]] || current=0
+    ((current <= total)) || current="${total}"
+    columns="$(terminal_columns)"
+
+    clear_download_progress
+    percent=$((current * 1000 / total))
+    full=$((percent / 10))
+    tenths=$((percent % 10))
+
+    # Keep one spare column: terminals differ on whether a write in the final
+    # column wraps immediately or on the next character.
+    if ((columns < 12)); then
+        printf '\r%6s' "${full}.${tenths}%" >&2
+        PROGRESS_WIDTH=6
+        return 0
+    fi
+
+    # "[", "] ", and the fixed-width percentage take nine columns.
+    bar_width=$((columns - 10))
+    filled=$((current * bar_width / total))
+    remainder=$((bar_width - filled))
+    printf -v empty '%*s' "${filled}" ''
+    empty="${empty// /#}"
+    printf -v remainder '%*s' "${remainder}" ''
+    remainder="${remainder// /-}"
+    printf '\r[%s%s] %6s' "${empty}" "${remainder}" "${full}.${tenths}%" >&2
+    PROGRESS_WIDTH=$((bar_width + 9))
+}
+
+fetch_with_progress() {
+    local url="$1"
+    local output="$2"
+    local total="$3"
+    local error_file="${output}.error"
+    local pid status
+    local -a options=(--fail --location --retry 3 --silent --show-error --output "${output}")
+
+    rm -f "${error_file}"
+    "${CURL}" "${options[@]}" "${url}" 2> "${error_file}" &
+    pid=$!
+    while kill -0 "${pid}" 2> /dev/null; do
+        render_download_progress "${output}" "${total}"
+        sleep 0.1
+    done
+
+    if wait "${pid}"; then
+        render_download_progress "${output}" "${total}"
+        printf '\n' >&2
+        PROGRESS_WIDTH=0
+        rm -f "${error_file}"
+        return 0
+    else
+        status=$?
+        clear_download_progress
+        printf '\n' >&2
+        cat "${error_file}" >&2
+        rm -f "${error_file}"
+        return "${status}"
+    fi
+}
+
+fetch() {
+    local url="$1"
+    local output="$2"
+    local total="${3:-0}"
+    local -a options=(--fail --location --retry 3 --output "${output}")
+    warn_plain_transport
+    if [[ -t 2 && "${TERM:-dumb}" != dumb && "${total}" =~ ^[1-9][0-9]*$ ]]; then
+        fetch_with_progress "${url}" "${output}" "${total}" \
+            || die "could not fetch ${url}"
+        return 0
+    else
+        options+=(--silent --show-error)
+    fi
+    "${CURL}" "${options[@]}" "${url}" \
+        || die "could not fetch ${url}"
+}
+
+verify_signature() {
+    local file="$1"
+    local signature="$2"
+    local key="${ROOT}${SOWA_REPO_KEY}"
+
+    if [[ "${SOWA_REQUIRE_SIGNATURE}" != 1 ]]; then
+        warn "signature checking is disabled in ${CONFIG}"
+        return 0
+    fi
+    [[ -f "${key}" ]] \
+        || die "no repository key at ${key}; the image was built without one"
+    command -v openssl > /dev/null 2>&1 \
+        || die "openssl is required to verify the repository index"
+    openssl pkeyutl -verify -rawin -pubin -inkey "${key}" \
+        -in "${file}" -sigfile "${signature}" > /dev/null 2>&1 \
+        || die "the repository index is not signed by ${key}"
+}
+
+# ------------------------------------------------------------------ manifests
+#
+# Containment.
+#
+# Every path this program creates, moves, chmods or removes is built by joining
+# a string from a manifest onto the root: "${ROOT}/${path}". String
+# concatenation is not a filesystem boundary. It cannot see that the path begins
+# with a slash of its own, that it climbs out with "..", or that a directory
+# somewhere along it is a symbolic link pointing at the host - and --root exists
+# precisely to be aimed at trees somebody else assembled, on an image being
+# repaired, usually by root.
+#
+# There are two checks, and they answer different questions.
+#
+# The first is about the string, and applies everywhere: a manifest path is
+# relative, normalised, and has no component that is "." or ".." and no
+# character that a terminal would act on. That is what stops "/etc/shadow" and
+# "../../etc/shadow" from being paths at all, and it holds for the running
+# system as much as for another root.
+#
+# The second is about the tree, and applies to another root: resolve the
+# directory each entry will be written into and require it to land below the
+# root. That is what stops a "usr/lib" that is a link to "/" from turning an
+# install into a write to the host - the case string checks cannot see. On the
+# running system it is vacuous, because everything is below "/", which is the
+# honest answer there.
+#
+# What this is not is openat2(RESOLVE_BENEATH): bash cannot hold a directory
+# descriptor across a rename, so this resolves names rather than pinning
+# them. It closes the ordinary case - a tree that already contains the link -
+# and not a race against something rewriting the tree while this runs. A root
+# being installed into is not a shared filesystem, and the lock keeps a second
+# sowa-pkg out of it.
+
+assert_relative_path() {
+    local what="$1"
+    local path="$2"
+
+    # First: everything below may name the path in a message.
+    [[ "${path}" != *[$'\001'-$'\037'$'\177']* ]] \
+        || die "${what} has a path containing a control character"
+    [[ -n "${path}" ]] || die "${what} has an entry with no path"
+    [[ "${path}" != /* ]] \
+        || die "${what} has an absolute path: ${path}"
+    [[ "${path}" != *'|'* ]] \
+        || die "${what} has a path containing the field separator: ${path}"
+    case "/${path}/" in
+        */../* | */./* | *//*)
+            die "${what} has a path that is not normalised: ${path}"
+            ;;
+    esac
+}
+
+# The directory each entry will be written into, resolved, and required to be
+# the root or below it. Directories are their own answer, because they are the
+# parent of everything under them; a file, a link or anything else is answered
+# for by the directory it sits in.
+assert_manifest_contained() {
+    local what="$1"
+    local manifest="$2"
+    local type _mode _value _size path parent resolved root_real
+    local at=0
+    local -a parents=()
+    local -A seen=()
+
+    root_real="$(readlink -m -- "${ROOT}")" \
+        || die "${ROOT} cannot be resolved"
+    root_real="${root_real%/}"
+    while IFS='|' read -r type _mode _value _size path; do
+        if [[ "${type}" == d ]]; then
+            parent="${path}"
+        else
+            parent="${path%/*}"
+            [[ "${parent}" != "${path}" ]] || parent=""
+        fi
+        [[ -z "${seen[${parent}]:-}" ]] || continue
+        seen["${parent}"]=1
+        parents+=("${ROOT}/${parent}")
+    done < "${manifest}"
+    ((${#parents[@]} > 0)) || return 0
+
+    # One process per few hundred directories rather than one per directory,
+    # and readlink -m answers for a path whose last components do not exist
+    # yet - which is most of them on a first install, and is exactly where a
+    # link partway along would otherwise be followed by mkdir -p.
+    # One line per argument, in order, so the offending entry can be named.
+    # assert_manifest_safe has already refused every control character in this
+    # manifest, which is what makes printing one of its paths safe.
+    while IFS= read -r resolved; do
+        case "${resolved}" in
+            "${root_real}" | "${root_real}"/*) ;;
+            *)
+                die "${what} would write outside ${ROOT}: ${parents[${at}]}"
+                ;;
+        esac
+        at=$((at + 1))
+    done < <(run_chunked readlink -m -- "${parents[@]}")
+}
+
+# Both checks, at every point where a manifest starts driving the filesystem:
+# the one that comes out of an archive, and the ones already in the database -
+# which on another root were written by whoever assembled that root.
+assert_manifest_safe() {
+    local what="$1"
+    local manifest="$2"
+    local type _mode _value _size path ancestor
+    local -A leaves=()
+
+    [[ -f "${manifest}" ]] || die "${what} has no file manifest"
+    while IFS='|' read -r type _mode _value _size path; do
+        assert_relative_path "${what}" "${path}"
+        [[ "${type}" == d ]] || leaves["${path}"]=1
+    done < "${manifest}"
+
+    # A manifest may not put anything underneath a path it calls a file or a
+    # link. That is how a manifest asks to be written through a symbolic link
+    # it is installing in the same transaction - a link the containment check
+    # cannot see, because at the moment it looks, the link is not there yet.
+    # Directories a package does not own are not in its manifest at all, so an
+    # ancestor that is absent here is an ordinary one somebody else owns.
+    for path in "${!leaves[@]}"; do
+        ancestor="${path}"
+        while [[ "${ancestor}" == */* ]]; do
+            ancestor="${ancestor%/*}"
+            [[ -z "${leaves[${ancestor}]:-}" ]] \
+                || die "${what} puts ${path} below ${ancestor}, which it does not call a directory"
+        done
+    done
+
+    [[ -z "${ROOT}" ]] || assert_manifest_contained "${what}" "${manifest}"
+}
+
+# The paths a manifest owns, directories excluded: those are shared between
+# packages and are never owned exclusively.
+manifest_paths() {
+    local type _mode _value _size path
+    while IFS='|' read -r type _mode _value _size path; do
+        if [[ "${type}" != d ]]; then
+            printf '%s\n' "${path}"
+        fi
+    done < "$1"
+}
+
+# Deepest first, so a directory is only considered once its children are gone.
+manifest_directories() {
+    local type _mode _value _size path
+    while IFS='|' read -r type _mode _value _size path; do
+        if [[ "${type}" == d ]]; then
+            printf '%s\n' "${ROOT}/${path}"
+        fi
+    done < "$1" | sort -r
+}
+
+# The directories other installed packages own, so that removing one package's
+# does not take another's with it. Emptiness looks like the test for that and
+# is not: two packages usually share a directory because there is something
+# from each of them in it, but /root/.ssh and /usr/local/bin are shared and
+# empty by design, and an rmdir there is a directory the surviving package's
+# own manifest then says is missing.
+declare -A CLAIMED_DIRECTORIES=()
+claimed_directories() {
+    local name="$1"
+    local other manifest type _mode _value _size path
+    CLAIMED_DIRECTORIES=()
+    while IFS= read -r other; do
+        manifest="${DB_DIR}/${other}/files"
+        if [[ "${other}" == "${name}" || ! -f "${manifest}" ]]; then
+            continue
+        fi
+        while IFS='|' read -r type _mode _value _size path; do
+            if [[ "${type}" == d ]]; then
+                CLAIMED_DIRECTORIES["${ROOT}/${path}"]=1
+            fi
+        done < "${manifest}"
+    done < <(installed_names)
+}
+
+config_protected() {
+    [[ "$1" == etc/* ]]
+}
+
+# The hashes the installed manifest recorded for this package's configuration
+# files, so a local edit can be told apart from an untouched file.
+load_recorded_config_hashes() {
+    local manifest="${DB_DIR}/$1/files"
+    local type _mode value _size path
+    RECORDED_HASH=()
+    [[ -f "${manifest}" ]] || return 0
+    while IFS='|' read -r type _mode value _size path; do
+        if [[ "${type}" == f ]] && config_protected "${path}"; then
+            RECORDED_HASH["${path}"]="${value}"
+        fi
+    done < "${manifest}"
+}
+
+# Whether the copy on disk is the administrator's rather than the package's:
+# either it was edited since the package placed it, or it was there first and no
+# package ever claimed it. Both are kept.
+keep_local_config() {
+    local path="$1"
+    local target="$2"
+    local recorded
+    config_protected "${path}" || return 1
+    [[ -f "${target}" ]] || return 1
+    recorded="${RECORDED_HASH[${path}]:-}"
+    [[ -n "${recorded}" ]] || return 0
+    [[ "$(file_hash "${target}")" != "${recorded}" ]]
+}
+
+# Moves a staged tree into place. Directories are created first, then files and
+# symbolic links are renamed in, grouped by destination directory so a package
+# with thousands of files costs a few hundred processes rather than thousands.
+apply_manifest() {
+    local name="$1"
+    local staging="$2"
+    local manifest="$3"
+    local type mode value _size path target parent kept=0
+    local -a directories=() sources=() targets=()
+    local -A batches=() modes=()
+
+    while IFS='|' read -r type mode value _size path; do
+        if [[ "${type}" == d ]]; then
+            directories+=("${ROOT}/${path}")
+            modes["${mode}"]+="${ROOT}/${path}${ENTRY_NEWLINE}"
+        fi
+    done < "${manifest}"
+    if ((${#directories[@]} > 0)); then
+        run_chunked mkdir -p -- "${directories[@]}"
+    fi
+
+    load_recorded_config_hashes "${name}"
+    while IFS='|' read -r type mode value _size path; do
+        if [[ "${type}" == d ]]; then
+            continue
+        fi
+        target="${ROOT}/${path}"
+        parent="${target%/*}"
+        if [[ ! -d "${parent}" ]]; then
+            mkdir -p "${parent}"
+        fi
+        if [[ "${type}" == f ]] && keep_local_config "${path}" "${target}"; then
+            mv "${staging}/${path}" "${target}.tpknew"
+            chmod "${mode}" "${target}.tpknew"
+            warn "kept your ${path}; the packaged version is ${path}.tpknew"
+            kept=$((kept + 1))
+            continue
+        fi
+        batches["${parent}"]+="${staging}/${path}${ENTRY_NEWLINE}"
+        if [[ "${type}" == f ]]; then
+            modes["${mode}"]+="${target}${ENTRY_NEWLINE}"
+        fi
+    done < "${manifest}"
+
+    for parent in "${!batches[@]}"; do
+        mapfile -t sources <<< "${batches[${parent}]}"
+        # The here-string adds a newline of its own, leaving one empty field.
+        unset 'sources[-1]'
+        run_chunked_into "${parent}" mv -f -- "${sources[@]}"
+    done
+
+    # A rename carries the mode across, but a staging directory on another
+    # filesystem turns the rename into a copy, so the modes are asserted.
+    for mode in "${!modes[@]}"; do
+        mapfile -t targets <<< "${modes[${mode}]}"
+        unset 'targets[-1]'
+        run_chunked chmod "${mode}" -- "${targets[@]}"
+    done
+
+    if ((kept > 0)); then
+        warn "${kept} configuration file(s) were left as they are"
+    fi
+}
+
+# Files the previous version owned and the new one does not.
+#
+# A package dropping a file is the package's business; the bytes in that file
+# may not be. If what is on disk is no longer what the old version installed,
+# then somebody wrote it - by hand, or with a tool of their own - after the
+# package put its copy there, and an upgrade is not the place to throw that
+# away. Those files stay, and are said out loud, so that anything a package has
+# genuinely finished with can still be taken off by hand.
+prune_removed_files() {
+    local name="$1"
+    local new_manifest="$2"
+    local old_manifest="${DB_DIR}/${name}/files"
+    local type _mode value _size path target sum edited=0
+    local -a obsolete=() directories=() candidates=()
+    local -A kept=() recorded=() retained=()
+
+    [[ -f "${old_manifest}" ]] || return 0
+
+    while IFS= read -r path; do
+        kept["${path}"]=1
+    done < <(manifest_paths "${new_manifest}")
+
+    while IFS='|' read -r type _mode value _size path; do
+        if [[ "${type}" == d ]] || [[ -n "${kept[${path}]:-}" ]]; then
+            continue
+        fi
+        target="${ROOT}/${path}"
+        # Only a regular file that is still there can have been edited: a
+        # symbolic link is its own destination and nothing else, and a path
+        # that has already gone has nothing left to keep.
+        if [[ "${type}" == f && -f "${target}" ]]; then
+            recorded["${target}"]="${value}"
+            candidates+=("${target}")
+            continue
+        fi
+        obsolete+=("${target}")
+    done < "${old_manifest}"
+
+    # One sha256sum over a few hundred paths rather than one per file, for the
+    # same reason apply_manifest batches its renames.
+    if ((${#candidates[@]} > 0)); then
+        while read -r sum target; do
+            if [[ "${sum}" == "${recorded[${target}]:-}" ]]; then
+                obsolete+=("${target}")
+            else
+                warn "kept your ${target#"${ROOT}"/}; ${name} no longer ships it"
+                edited=$((edited + 1))
+            fi
+        done < <(run_chunked sha256sum -- "${candidates[@]}")
+    fi
+
+    if ((${#obsolete[@]} > 0)); then
+        log "removing ${#obsolete[@]} obsolete file(s)"
+        run_chunked rm -f -- "${obsolete[@]}"
+    fi
+    if ((edited > 0)); then
+        warn "${edited} file(s) ${name} dropped were left as they are"
+    fi
+
+    # Directories are only removed when nothing else is left in them, and only
+    # when nothing else says it owns them: the new version of this package may
+    # still carry one, and so may another package altogether.
+    while IFS= read -r path; do
+        retained["${path}"]=1
+    done < <(manifest_directories "${new_manifest}")
+    claimed_directories "${name}"
+    mapfile -t directories < <(manifest_directories "${old_manifest}")
+    for path in "${directories[@]}"; do
+        if [[ -n "${retained[${path}]:-}" ]] \
+            || [[ -n "${CLAIMED_DIRECTORIES[${path}]:-}" ]]; then
+            continue
+        fi
+        rmdir "${path}" 2> /dev/null || true
+    done
+}
+
+# Refuses to write over a file another package owns. A package upgrading itself
+# is the one case where the paths are expected to be taken already.
+check_conflicts() {
+    local name="$1"
+    local manifest="$2"
+    local other path
+    local -A claimed=()
+
+    while IFS= read -r other; do
+        if [[ "${other}" == "${name}" ]]; then
+            continue
+        fi
+        while IFS= read -r path; do
+            claimed["${path}"]="${other}"
+        done < <(manifest_paths "${DB_DIR}/${other}/files")
+    done < <(installed_names)
+
+    while IFS= read -r path; do
+        if [[ -n "${claimed[${path}]:-}" ]]; then
+            die "/${path} is already owned by ${claimed[${path}]}"
+        fi
+        # A path no package claims but that exists anyway was put there by
+        # hand; overwriting it silently would lose someone's work. Under /etc
+        # that is ordinary - it is configuration, and apply_manifest keeps it
+        # and writes the packaged version beside it instead.
+        if ! is_installed "${name}" && ! config_protected "${path}" \
+            && { [[ -e "${ROOT}/${path}" ]] || [[ -L "${ROOT}/${path}" ]]; }; then
+            die "/${path} exists but belongs to no package; move it aside first"
+        fi
+    done < <(manifest_paths "${manifest}")
+}
+
+# --------------------------------------------------------------------- hooks
+
+# A hook runs with the environment an init script gets at boot and with no
+# standard input, so a program that asks a question is answered rather than left
+# reading the manifest the loop above it is in the middle of.
+#
+# The working directory is part of that environment, and at boot it is /. Running
+# the hook from wherever sowa-pkg was typed would leave a daemon holding that
+# directory open, and - because "env -i" drops PWD, leaving the shell to ask the
+# kernel where it is - would print a getcwd(3) failure for every subshell on a
+# root that is an overlay. This is the same reasoning as /sbin/service, which
+# does the same thing for the same reasons; see the comment there.
+# The subshell is what keeps the "cd" from being this program's own: sowa-pkg
+# resolves its cache and staging paths while a transaction is in progress, and a
+# hook must not move the ground under them. "exec" then leaves no extra process
+# behind for the hook to be a child of.
+hook_exec() {
+    ( cd / && exec env -i \
+        PATH="${HOOK_PATH}" \
+        HOME=/ \
+        PWD=/ \
+        TERM="${TERM:-linux}" \
+        LANG="${LANG:-C}" \
+        "$@" < /dev/null )
+}
+
+# Whether the service is running now. Sowa's init scripts answer "status" the
+# way the rc framework does: 0 running, anything else not.
+hook_service_running() {
+    hook_exec "${INITD}/$1" status > /dev/null 2>&1
+}
+
+hook_service() {
+    local name="$1"
+    local action="$2"
+    local service="$3"
+    local script="${INITD}/${service}"
+
+    case "${service}" in
+        '' | *[/[:space:]]* | .*)
+            warn "${name}: '${service}' is not a service name"
+            return 1
+            ;;
+    esac
+    if [[ ! -x "${script}" ]]; then
+        # The init script of a service this machine does not have. Removing a
+        # package whose service was never installed is not a failure, and
+        # neither is a package naming a service an older image did not ship.
+        warn "${name}: no init script for ${service}; skipped ${action}"
+        return 0
+    fi
+
+    case "${action}" in
+        service-start)
+            log "starting ${service}"
+            hook_exec "${script}" start
+            ;;
+        service-stop)
+            # Asked unconditionally, because the point of the hook is that the
+            # daemon must not outlive its program, and a stale pid file is not
+            # a reason to leave a process running.
+            if ! hook_service_running "${service}"; then
+                return 0
+            fi
+            log "stopping ${service}"
+            hook_exec "${script}" stop
+            ;;
+        service-restart)
+            # Only if it is running: an upgrade puts the new program in place
+            # and this is what moves the daemon onto it, but a service that was
+            # deliberately stopped stays stopped.
+            if ! hook_service_running "${service}"; then
+                return 0
+            fi
+            log "restarting ${service}"
+            hook_exec "${script}" restart
+            ;;
+        service-enable)
+            log "enabling ${service} at boot"
+            hook_exec /sbin/chkconfig "${service}" on
+            ;;
+        service-disable)
+            # Before the files go, while the init script chkconfig reads its
+            # header from is still there. What this removes is the rc links -
+            # left behind, they are a service the next boot tries and fails to
+            # start.
+            log "disabling ${service} at boot"
+            hook_exec /sbin/chkconfig --del "${service}"
+            ;;
+    esac
+}
+
+# The one action that runs a program, and the whole of what makes it safe: the
+# path has to be a regular file this package's own manifest claims. A hook can
+# therefore only ever run something that arrived in the same archive, under the
+# same hash, under the same index signature.
+hook_setup() {
+    local name="$1"
+    local program="$2"
+    local type _mode _value _size path found=0
+
+    [[ "${program}" == /* ]] \
+        || { warn "${name}: setup needs an absolute path, not '${program}'"; return 1; }
+    while IFS='|' read -r type _mode _value _size path; do
+        if [[ "/${path}" == "${program}" ]]; then
+            found=1
+            [[ "${type}" == f ]] \
+                || { warn "${name}: ${program} is not a regular file"; return 1; }
+            break
+        fi
+    done < "${DB_DIR}/${name}/files"
+    ((found == 1)) \
+        || { warn "${name}: ${program} is not a file ${name} owns"; return 1; }
+    [[ -x "${program}" ]] \
+        || { warn "${name}: ${program} is not executable"; return 1; }
+
+    log "running ${program}"
+    hook_exec "${program}"
+}
+
+hook_dispatch() {
+    local name="$1"
+    local action="$2"
+    local argument="$3"
+
+    # Checked against the list rather than matched with a pattern, so a
+    # misspelled "service-reolad" is refused instead of quietly doing nothing.
+    # A repository built against a newer client lands here too, and refusing the
+    # line is the only honest answer: the package asked for something this
+    # program cannot do, and pretending otherwise would leave a machine
+    # half-configured without saying so.
+    if ! in_list "${action}" "${HOOK_ACTIONS[@]}"; then
+        warn "${name}: unknown hook action '${action}'"
+        return 1
+    fi
+    case "${action}" in
+        setup) hook_setup "${name}" "${argument}" ;;
+        *) hook_service "${name}" "${action}" "${argument}" ;;
+    esac
+}
+
+# Every hook the package declared for one event, in the order it declared them.
+# Returns non-zero if any of them failed.
+run_hooks() {
+    local name="$1"
+    local event="$2"
+    local file="${DB_DIR}/${name}/hooks"
+    local declared action argument failed=0
+
+    [[ -f "${file}" ]] || return 0
+    if [[ "${RUN_HOOKS}" != 1 ]]; then
+        warn "${name}: not running its ${event} steps (--no-hooks)"
+        return 0
+    fi
+    while IFS='|' read -r declared action argument; do
+        if [[ -z "${declared}" || "${declared}" == \#* ]]; then
+            continue
+        fi
+        if [[ "${declared}" != "${event}" ]]; then
+            if ! in_list "${declared}" "${HOOK_EVENTS[@]}"; then
+                warn "${name}: unknown hook event '${declared}'"
+                HOOK_FAILURES+=("${name}: ${declared}|${action}|${argument}")
+                failed=1
+            fi
+            continue
+        fi
+        audit "${name}: ${event} ${action} ${argument}"
+        if ! hook_dispatch "${name}" "${action}" "${argument}"; then
+            audit "${name}: ${event} ${action} ${argument} FAILED"
+            HOOK_FAILURES+=("${name}: ${event}|${action}|${argument}")
+            failed=1
+        fi
+    done < "${file}"
+    ((failed == 0))
+}
+
+# Whether a package declares anything for an event at all, which is how a
+# removal knows whether it has steps to take before it starts deleting.
+has_hooks() {
+    local file="${DB_DIR}/$1/hooks"
+    local event="$2"
+    local declared _rest
+
+    [[ -f "${file}" ]] || return 1
+    while IFS='|' read -r declared _rest; do
+        [[ "${declared}" == "${event}" ]] && return 0
+    done < "${file}"
+    return 1
+}
+
+# What a package declares, in the words the hook file uses. Printed before it is
+# run and printed again by "hooks" and by "info", because a facility that runs
+# programs as root is only acceptable if what it is going to run can be read
+# beforehand without unpacking an archive.
+print_hooks() {
+    local name="$1"
+    local wanted="${2:-}"
+    local indent="${3:-  }"
+    local file="${DB_DIR}/${name}/hooks"
+    local event action argument
+
+    [[ -f "${file}" ]] || return 0
+    while IFS='|' read -r event action argument; do
+        if [[ -z "${event}" || "${event}" == \#* ]]; then
+            continue
+        fi
+        if [[ -n "${wanted}" && "${event}" != "${wanted}" ]]; then
+            continue
+        fi
+        printf '%s%-14s %s %s\n' "${indent}" "${event}" "${action}" "${argument}"
+    done < "${file}"
+}
+
+report_hook_failures() {
+    local failure
+    ((${#HOOK_FAILURES[@]} > 0)) || return 0
+    warn "${#HOOK_FAILURES[@]} step(s) did not succeed; the files are installed"
+    for failure in "${HOOK_FAILURES[@]}"; do
+        warn "  ${failure}"
+    done
+    warn "the packages are in place; what did not run is above"
+}
+
+# Hooks act on the running system - they start its services and run its
+# programs - so they have nothing to say about a root filesystem that is only
+# being assembled or repaired from here.
+hooks_apply_to_this_root() {
+    [[ -z "${ROOT}" ]]
+}
+
+# ------------------------------------------------------------------ commands
+
+cmd_update() {
+    require_write_access update
+    acquire_lock
+    mkdir -p "${REPO_DIR}"
+
+    log "fetching ${SOWA_REPO_URL}/index"
+    fetch "${SOWA_REPO_URL}/index" "${REPO_DIR}/index.new"
+    fetch "${SOWA_REPO_URL}/index.sig" "${REPO_DIR}/index.sig.new"
+    verify_signature "${REPO_DIR}/index.new" "${REPO_DIR}/index.sig.new"
+
+    # Three questions, in this order, and all of them answered before the index
+    # this machine has been using is replaced: who wrote this one, whether it
+    # says anything this program cannot safely act on, and whether it is the
+    # newest one its author wrote. None of them is answerable from the
+    # signature alone.
+    validate_index "${REPO_DIR}/index.new"
+    check_index_freshness "${REPO_DIR}/index.new"
+
+    mv "${REPO_DIR}/index.new" "${INDEX}"
+    mv "${REPO_DIR}/index.sig.new" "${INDEX}.sig"
+    # Last, so a rejected index cannot raise the floor an accepted one has to
+    # clear.
+    record_index_serial
+    log "${INDEX_COUNT} packages available"
+
+    local name installed upgrades=0 downgrades=0 rebuilds=0
+    while IFS= read -r name; do
+        installed="$(installed_field "${name}" pkgver)" || continue
+        read_index_entry "${name}" || continue
+        if version_is_newer "${installed}" "${IDX_VERSION}"; then
+            upgrades=$((upgrades + 1))
+        elif version_is_newer "${IDX_VERSION}" "${installed}"; then
+            downgrades=$((downgrades + 1))
+        elif build_differs "${name}" "${IDX_BUILD}"; then
+            rebuilds=$((rebuilds + 1))
+        fi
+    done < <(installed_names)
+    if ((upgrades > 0)); then
+        log "${upgrades} installed package(s) are out of date; run '${PROGRAM} upgrade'"
+    elif ((rebuilds == 0)); then
+        log "no installed packages need an upgrade"
+    fi
+    # A package rebuilt at the same version. The repository is publishing bytes
+    # this machine does not have, under a label that says it does, and only the
+    # build id can tell - so it is reported in its own words rather than
+    # counted as an upgrade.
+    #
+    # Said in two lines because one is not enough to be understood. The first
+    # names who has what: a version is not an identity, and the reader has to
+    # be told that the repository's copy of a package they already have is a
+    # different build of it. The second answers the question that follows - the
+    # version will look untouched afterwards, and this is still worth doing.
+    if ((rebuilds > 0)); then
+        log "the repository has a different build of ${rebuilds} installed package(s)"
+        log "the version is the same; run '${PROGRAM} upgrade' to replace them"
+    fi
+    # Said as a fact about the repository rather than as something about to
+    # happen: an upgrade leaves these alone, and going back to an older version
+    # is a thing to ask for by name.
+    if ((downgrades > 0)); then
+        warn "${downgrades} installed package(s) are newer than the repository; upgrade will leave them alone"
+    fi
+}
+
+cmd_list() {
+    local mode="${1:---installed}"
+    local name installed available description
+
+    case "${mode}" in
+        --available)
+            # What this machine could be given, which is the question the word
+            # asks: a package that is already installed is not something to
+            # install, and listing it here only buries the ones that are. What
+            # the repository offers in full is --all.
+            require_index
+            while IFS= read -r name; do
+                if is_installed "${name}"; then
+                    continue
+                fi
+                read_index_entry "${name}"
+                printf '%-18s %-14s %s\n' \
+                    "${name}" "${IDX_VERSION}" "${IDX_DESCRIPTION}"
+            done < <(index_names)
+            ;;
+        --all)
+            # Both sides at once, in two version columns rather than in a word
+            # for each combination of them: "-" under installed is a package
+            # this system does not have, and "-" under repository is one the
+            # index no longer carries. The second loop is what prints those
+            # last ones - without it --all would be missing packages that
+            # "list" on its own shows, which is not what it says.
+            require_index
+            printf '%-18s %-14s %-14s %s\n' \
+                package installed repository description
+            while IFS= read -r name; do
+                read_index_entry "${name}"
+                installed="$(installed_field "${name}" pkgver)" || installed=-
+                printf '%-18s %-14s %-14s %s\n' \
+                    "${name}" "${installed}" "${IDX_VERSION}" "${IDX_DESCRIPTION}"
+            done < <(index_names)
+            while IFS= read -r name; do
+                if read_index_entry "${name}"; then
+                    continue
+                fi
+                installed="$(installed_field "${name}" pkgver)" || installed=-
+                description="$(installed_field "${name}" description)" \
+                    || description=""
+                printf '%-18s %-14s %-14s %s\n' \
+                    "${name}" "${installed}" - "${description}"
+            done < <(installed_names)
+            ;;
+        --upgradable)
+            [[ -f "${INDEX}" ]] || return 0
+            while IFS= read -r name; do
+                installed="$(installed_field "${name}" pkgver)" || continue
+                read_index_entry "${name}" || continue
+                if version_is_newer "${installed}" "${IDX_VERSION}"; then
+                    printf '%-18s upgrade %s -> %s\n' \
+                        "${name}" "${installed}" "${IDX_VERSION}"
+                elif version_is_newer "${IDX_VERSION}" "${installed}"; then
+                    printf '%-18s downgrade %s -> %s\n' \
+                        "${name}" "${installed}" "${IDX_VERSION}"
+                elif build_differs "${name}" "${IDX_BUILD}"; then
+                    printf '%-18s rebuild %s (build %s)\n' \
+                        "${name}" "${installed}" "${IDX_BUILD:0:12}"
+                fi
+            done < <(installed_names)
+            ;;
+        --installed)
+            while IFS= read -r name; do
+                installed="$(installed_field "${name}" pkgver)"
+                available=""
+                if [[ -f "${INDEX}" ]] && read_index_entry "${name}"; then
+                    if version_is_newer "${installed}" "${IDX_VERSION}"; then
+                        available="  (${IDX_VERSION} available)"
+                    elif version_is_newer "${IDX_VERSION}" "${installed}"; then
+                        available="  (${IDX_VERSION} available; downgrade)"
+                    elif build_differs "${name}" "${IDX_BUILD}"; then
+                        available="  (different build available)"
+                    fi
+                fi
+                printf '%-18s %s%s\n' "${name}" "${installed}" "${available}"
+            done < <(installed_names)
+            ;;
+        *) die "unknown option for list: ${mode}" ;;
+    esac
+}
+
+cmd_info() {
+    local name key value
+    (($# > 0)) || die "info needs a package name"
+    for name in "$@"; do
+        if is_installed "${name}"; then
+            printf 'installed:\n'
+            while IFS='=' read -r key value; do
+                printf '  %-12s %s\n' "${key}" "${value}"
+            done < "${DB_DIR}/${name}/desc"
+            printf '  %-12s %s\n' files \
+                "$(wc -l < "${DB_DIR}/${name}/files") paths"
+            if [[ -f "${DB_DIR}/${name}/hooks" ]]; then
+                printf 'steps:\n'
+                print_hooks "${name}"
+            fi
+            if [[ -f "${DB_DIR}/${name}/message" ]]; then
+                printf 'notes:\n'
+                print_message "${DB_DIR}/${name}/message"
+            fi
+        fi
+        if [[ -f "${INDEX}" ]] && read_index_entry "${name}"; then
+            printf 'repository:\n'
+            printf '  %-12s %s\n' pkgver "${IDX_VERSION}"
+            printf '  %-12s %s\n' pkgbuild "${IDX_BUILD}"
+            printf '  %-12s %s\n' arch "${IDX_ARCH}"
+            printf '  %-12s %s\n' depends "${IDX_DEPENDS}"
+            printf '  %-12s %s\n' license "${IDX_LICENSE}"
+            printf '  %-12s %s\n' copyright "${IDX_COPYRIGHT}"
+            printf '  %-12s %s\n' archive "${IDX_ARCHIVE}"
+            printf '  %-12s %s\n' download "$(human_size "${IDX_SIZE}")"
+            printf '  %-12s %s\n' description "${IDX_DESCRIPTION}"
+        elif ! is_installed "${name}"; then
+            die "unknown package: ${name}"
+        fi
+    done
+}
+
+cmd_files() {
+    local name="${1:-}"
+    [[ -n "${name}" ]] || die "files needs a package name"
+    is_installed "${name}" || die "${name} is not installed"
+    manifest_paths "${DB_DIR}/${name}/files"
+}
+
+cmd_owns() {
+    local wanted="${1:-}"
+    local name path found=0
+    [[ -n "${wanted}" ]] || die "owns needs a path"
+    wanted="${wanted#/}"
+    while IFS= read -r name; do
+        while IFS= read -r path; do
+            if [[ "${path}" == "${wanted}" ]]; then
+                printf '%s owns /%s\n' "${name}" "${path}"
+                found=1
+            fi
+        done < <(manifest_paths "${DB_DIR}/${name}/files")
+    done < <(installed_names)
+    ((found == 1)) || die "no installed package owns /${wanted}"
+}
+
+# Depth-first over the dependency graph. RESOLVED ends up in install order.
+resolve() {
+    local name="$1"
+    local depends dependency
+    if [[ -n "${VISITED[${name}]:-}" ]]; then
+        return 0
+    fi
+    VISITED["${name}"]=1
+    read_index_entry "${name}" || die "unknown package: ${name}"
+    depends="${IDX_DEPENDS}"
+    if [[ "${depends}" != - && -n "${depends}" ]]; then
+        local -a dependency_list=()
+        IFS=, read -r -a dependency_list <<< "${depends}"
+        for dependency in "${dependency_list[@]}"; do
+            resolve "${dependency}"
+        done
+    fi
+    RESOLVED+=("${name}")
+}
+
+# Downloads an archive into the cache and checks it against the index.
+fetch_archive() {
+    local name="$1"
+    read_index_entry "${name}"
+    local archive="${CACHE_DIR}/${IDX_ARCHIVE}"
+    local expected="${IDX_SHA256}"
+
+    if [[ -f "${archive}" && "$(file_hash "${archive}")" == "${expected}" ]]; then
+        return 0
+    fi
+    mkdir -p "${CACHE_DIR}"
+    log "downloading ${IDX_ARCHIVE} ($(human_size "${IDX_SIZE}"))"
+    fetch "${SOWA_REPO_URL}/${IDX_ARCHIVE}" "${archive}.part" "${IDX_SIZE}"
+    if [[ "$(file_hash "${archive}.part")" != "${expected}" ]]; then
+        rm -f "${archive}.part"
+        die "checksum mismatch for ${IDX_ARCHIVE}"
+    fi
+    mv "${archive}.part" "${archive}"
+}
+
+verify_archive_metadata() {
+    local info="$1"
+    local expected_name="$2"
+    local expected_version="$3"
+    local expected_arch="$4"
+    local expected_build="$5"
+    local archive="$6"
+    local key value staged_name="" staged_version="" staged_arch="" staged_build=""
+
+    while IFS='=' read -r key value; do
+        case "${key}" in
+            pkgname) staged_name="${value}" ;;
+            pkgver) staged_version="${value}" ;;
+            arch) staged_arch="${value}" ;;
+            pkgbuild) staged_build="${value}" ;;
+        esac
+    done < "${info}"
+
+    [[ "${staged_name}" == "${expected_name}" ]] \
+        || die "${archive} contains ${staged_name:-no package name}, not ${expected_name}"
+    [[ "${staged_version}" == "${expected_version}" ]] \
+        || die "${archive} contains ${staged_name} ${staged_version:-no version}, not ${expected_version}"
+    [[ "${staged_arch}" == "${expected_arch}" ]] \
+        || die "${archive} is for ${staged_arch:-no architecture}, not ${expected_arch}"
+
+    # Old indexes and archives predate pkgbuild and remain installable. Once a
+    # signed index advertises an identity, however, the package metadata must
+    # make the same claim; otherwise installing it would immediately plan the
+    # same rebuild again forever.
+    if [[ -n "${expected_build}" ]]; then
+        [[ "${staged_build}" == "${expected_build}" ]] \
+            || die "${archive} carries build ${staged_build:-none}, not ${expected_build}"
+    fi
+}
+
+# The members an archive may carry that are not files the package owns.
+readonly ARCHIVE_METADATA=(.PKGINFO .FILES .MESSAGE .HOOKS)
+
+# What has to be true of an archive before tar is allowed to write any of it
+# out.
+#
+# The signed index already says these are the bytes the repository published.
+# It does not say they are a well-formed package. A publishing defect, a
+# corrupted staging tree or a signing key in the wrong hands can all produce a
+# signed archive whose member names walk out of the directory they are unpacked
+# into. GNU tar happens to refuse "..", and happens to strip a leading "/", but
+# that is GNU tar's policy rather than this program's, and there is no reason
+# for a package manager's containment to be a property of which tar it was run
+# with.
+verify_archive_members() {
+    local archive="$1"
+    local member
+    local -A seen=()
+
+    while IFS= read -r member; do
+        # tar writes a directory with a trailing slash; a manifest does not.
+        member="${member%/}"
+        assert_relative_path "${archive}" "${member}"
+        [[ -z "${seen[${member}]:-}" ]] \
+            || die "${archive} carries ${member} more than once"
+        seen["${member}"]=1
+    done < <(tar -tf "${archive}")
+    ((${#seen[@]} > 0)) || die "${archive} is empty"
+}
+
+# What has to be true of the unpacked tree before a single file of it is moved
+# into the root.
+#
+# The manifest is a separate document from the archive: mv, chmod, rm and
+# rmdir are driven from it, "sowa-pkg verify" checks the installed system
+# against it, and the package's build identity is computed over it. Until now
+# nothing checked that it described the archive it travelled in. So: the tree
+# has to be exactly what the manifest says, path for path, with the same types,
+# the same modes, the same sizes and the same contents - no member the manifest
+# does not list, no path the archive does not carry, and nothing that is not a
+# file, a directory or a symbolic link.
+#
+# The cost is one find and one sha256sum over bytes that were written moments
+# ago and are still in the page cache. What it buys is that an installed system
+# and its manifest cannot disagree from the first minute, which is the state
+# "verify" would otherwise report forever without being able to say why.
+verify_staged_tree() {
+    local name="$1"
+    local staging="$2"
+    local manifest="$3"
+    local archive="$4"
+    local checklist="${STAGING_DIR}/.${name}.sha256"
+    local type mode value size path ancestor expected actual failures
+    local -a checks=()
+    local -A wanted=() implied=()
+
+    while IFS='|' read -r type mode value size path; do
+        case "${type}" in
+            f)
+                expected="f|${mode}|${size}"
+                checks+=("${value}  ${path}")
+                ;;
+            d) expected="d|${mode}|" ;;
+            # find reports a link's own mode, which Linux does not use and
+            # always reports as 777; the manifest writes the same thing.
+            l) expected="l|777|${value}" ;;
+            *) die "${archive} has a manifest entry that is not a file, a directory or a link" ;;
+        esac
+        [[ -z "${wanted[${path}]:-}" ]] \
+            || die "${archive} lists ${path} in its manifest twice"
+        in_list "${path}" "${ARCHIVE_METADATA[@]}" \
+            && die "${archive} claims to own ${path}, which is package metadata"
+        wanted["${path}"]="${expected}"
+        # tar makes the directories on the way to a member whether or not the
+        # archive carries them, and a package that owns /usr/bin/nano does not
+        # own /usr or /usr/bin. Those appear in the unpacked tree, belong to
+        # nobody, are never moved anywhere by themselves, and are noted here so
+        # that finding one is not mistaken for finding a member the manifest
+        # does not list.
+        ancestor="${path}"
+        while [[ "${ancestor}" == */* ]]; do
+            ancestor="${ancestor%/*}"
+            implied["${ancestor}"]=1
+        done
+    done < "${manifest}"
+
+    while IFS='|' read -r type mode size value path; do
+        if [[ "${path}" != */* ]] && in_list "${path}" "${ARCHIVE_METADATA[@]}"; then
+            continue
+        fi
+        case "${type}" in
+            f) actual="f|${mode}|${size}" ;;
+            d) actual="d|${mode}|" ;;
+            l) actual="l|${mode}|${value}" ;;
+            *) die "${archive} carries ${path}, which is not a file, a directory or a link" ;;
+        esac
+        if [[ -z "${wanted[${path}]+listed}" ]]; then
+            [[ "${type}" == d && -n "${implied[${path}]:-}" ]] \
+                || die "${archive} carries ${path}, which its manifest does not list"
+            continue
+        fi
+        expected="${wanted[${path}]}"
+        [[ -n "${expected}" ]] || die "${archive} carries ${path} twice"
+        [[ "${expected}" == "${actual}" ]] \
+            || die "${archive} carries ${path} as ${actual}, and its manifest calls it ${expected}"
+        # Emptied rather than unset. bash cannot unset an array element whose
+        # key holds an unbalanced bracket - it counts them while parsing the
+        # subscript, finds no match and does nothing, without an error - and
+        # coreutils ships a program called "[". Every value put in above is
+        # non-empty, so an empty one means "already accounted for".
+        wanted["${path}"]=""
+    done < <(find "${staging}" -mindepth 1 -printf '%y|%m|%s|%l|%P\n')
+
+    for path in "${!wanted[@]}"; do
+        [[ -z "${wanted[${path}]}" ]] \
+            || die "${archive} does not carry ${path}, which its manifest lists"
+    done
+
+    ((${#checks[@]} > 0)) || return 0
+    printf '%s\n' "${checks[@]}" > "${checklist}"
+    failures="$(cd "${staging}" \
+        && sha256sum --quiet --strict --check "${checklist}" 2>&1)" || {
+        rm -f "${checklist}"
+        printf '%s\n' "${failures}" >&2
+        die "${archive} does not contain the bytes its manifest records"
+    }
+    rm -f "${checklist}"
+}
+
+install_archive() {
+    local name="$1"
+    read_index_entry "${name}"
+    local archive="${CACHE_DIR}/${IDX_ARCHIVE}"
+    local version="${IDX_VERSION}"
+    local staging="${STAGING_DIR}/${name}"
+
+    rm -rf "${staging}"
+    mkdir -p "${staging}"
+    verify_archive_members "${archive}"
+    # GNU tar detects the compressor while reading. New repositories publish
+    # .tar.xz, while auto-detection keeps an older cached .tar.gz installable
+    # after the package manager itself has been updated.
+    #
+    # -p because the modes are about to be compared against the manifest: run
+    # as an ordinary user against another root, tar would otherwise apply the
+    # umask and every mode would differ from the one that was packaged. And
+    # --delay-directory-restore with it, because a package can own a directory
+    # nothing may write into - the Guix store is full of them - and setting that
+    # mode before its contents are unpacked would leave tar unable to finish
+    # unpacking them.
+    tar -xp --delay-directory-restore -f "${archive}" -C "${staging}"
+
+    [[ -f "${staging}/.PKGINFO" && -f "${staging}/.FILES" ]] \
+        || die "${IDX_ARCHIVE} is not a Sowa package"
+    verify_archive_metadata "${staging}/.PKGINFO" "${name}" "${version}" \
+        "${IDX_ARCH}" "${IDX_BUILD}" "${IDX_ARCHIVE}"
+
+    # Everything below drives the filesystem from these two manifests: the new
+    # one out of the archive, and - in prune_removed_files - the one this
+    # machine recorded when the package was last installed. Both are checked
+    # before either is acted on, so a package that would write outside the root
+    # is refused while nothing has been moved yet.
+    assert_manifest_safe "${IDX_ARCHIVE}" "${staging}/.FILES"
+    if [[ -f "${DB_DIR}/${name}/files" ]]; then
+        assert_manifest_safe "the recorded manifest of ${name}" \
+            "${DB_DIR}/${name}/files"
+    fi
+    verify_staged_tree "${name}" "${staging}" "${staging}/.FILES" \
+        "${IDX_ARCHIVE}"
+
+    check_conflicts "${name}" "${staging}/.FILES"
+    apply_manifest "${name}" "${staging}" "${staging}/.FILES"
+    prune_removed_files "${name}" "${staging}/.FILES"
+
+    mkdir -p "${DB_DIR}/${name}"
+    {
+        cat "${staging}/.PKGINFO"
+        printf 'installdate=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        printf 'origin=%s\n' "${SOWA_REPO_URL}"
+    } > "${DB_DIR}/${name}/desc.new"
+    mv "${DB_DIR}/${name}/desc.new" "${DB_DIR}/${name}/desc"
+    cp "${staging}/.FILES" "${DB_DIR}/${name}/files.new"
+    mv "${DB_DIR}/${name}/files.new" "${DB_DIR}/${name}/files"
+
+    # Kept rather than only printed, so "sowa-pkg info" can say it again to
+    # whoever comes back to the machine a week later. A version that has
+    # nothing to say clears what the version before it left behind.
+    if [[ -f "${staging}/.MESSAGE" ]]; then
+        cp "${staging}/.MESSAGE" "${DB_DIR}/${name}/message.new"
+        mv "${DB_DIR}/${name}/message.new" "${DB_DIR}/${name}/message"
+        ANNOUNCED+=("${name}")
+    else
+        rm -f "${DB_DIR}/${name}/message"
+    fi
+
+    # Kept for the same reason as the note, and for one more: pre-remove runs
+    # long after the archive it came from is gone, so what a package wants done
+    # before it is taken off the machine has to be on the machine.
+    if [[ -f "${staging}/.HOOKS" ]]; then
+        cp "${staging}/.HOOKS" "${DB_DIR}/${name}/hooks.new"
+        mv "${DB_DIR}/${name}/hooks.new" "${DB_DIR}/${name}/hooks"
+    else
+        rm -f "${DB_DIR}/${name}/hooks"
+    fi
+
+    rm -rf "${staging}"
+}
+
+# A stored note, indented under whatever introduced it. The trailing test in the
+# loop prints a last line that ends without a newline, which read reports as end
+# of input, and a blank line is printed blank rather than as two spaces.
+print_message() {
+    local line
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ -n "${line}" ]]; then
+            printf '  %s\n' "${line}"
+        else
+            printf '\n'
+        fi
+    done < "$1"
+}
+
+# What the packages just installed asked to have said, once the last of them is
+# in place. Under the package name, because a transaction may install more than
+# one thing that has something to say.
+print_messages() {
+    local name
+    ((${#ANNOUNCED[@]} > 0)) || return 0
+    for name in "${ANNOUNCED[@]}"; do
+        printf '\n%s:\n' "${name}"
+        print_message "${DB_DIR}/${name}/message"
+    done
+    printf '\n'
+}
+
+# What this transaction will do about one package, given what the machine has
+# and what the index offers. Read on its own so that the policy - and
+# particularly the one decision here that refuses to follow the repository -
+# can be asserted without a repository, a network or a filesystem.
+#
+# Sets PLAN_ACTION to what will be done and PLAN_EVENT to the hook event that
+# goes with it, or PLAN_HELD to why nothing will be done; all three empty means
+# there is nothing to do. read_index_entry has already filled IDX_*.
+PLAN_ACTION=""
+PLAN_EVENT=""
+PLAN_HELD=""
+plan_package() {
+    local name="$1"
+    local installed="$2"
+
+    PLAN_ACTION=""
+    PLAN_HELD=""
+    # Which of the two install events this package will get is decided here,
+    # while what was on the machine before is still known: install_archive has
+    # overwritten the database entry by the time the hooks run.
+    PLAN_EVENT=post-upgrade
+    if [[ -z "${installed}" ]]; then
+        PLAN_ACTION="install ${IDX_VERSION}"
+        PLAN_EVENT=post-install
+    elif version_is_newer "${installed}" "${IDX_VERSION}"; then
+        PLAN_ACTION="upgrade ${installed} -> ${IDX_VERSION}"
+    elif version_is_newer "${IDX_VERSION}" "${installed}"; then
+        # The repository is behind this machine. That is either somebody
+        # rolling a package back deliberately, or a repository that has been
+        # rolled back for them - a replayed index, a mirror that stopped being
+        # updated, a restored backup - and nothing here can tell those apart.
+        # So it is never done because a server offered it: typed on the command
+        # line with --allow-downgrade it is a decision, and anything else keeps
+        # what is installed.
+        if ((ALLOW_DOWNGRADE == 0)); then
+            if in_list "${name}" "${NAMED[@]}"; then
+                die "the repository has ${name} ${IDX_VERSION}, older than the installed ${installed}; --allow-downgrade to go back to it"
+            fi
+            PLAN_HELD="${name} ${installed} (repository has ${IDX_VERSION})"
+            return 0
+        fi
+        PLAN_ACTION="downgrade ${installed} -> ${IDX_VERSION}"
+    elif build_differs "${name}" "${IDX_BUILD}"; then
+        # The same version, built again. Nothing about the label changed, so
+        # this is the one action a person did not ask for by name and the plan
+        # says so in as many words.
+        PLAN_ACTION="rebuild ${IDX_VERSION} (build ${IDX_BUILD:0:12})"
+    elif [[ "${REINSTALL}" == 1 ]] && in_list "${name}" "${NAMED[@]}"; then
+        PLAN_ACTION="reinstall ${IDX_VERSION}"
+    fi
+}
+
+# Shared by install and upgrade: work out what to do, show it, then do it.
+run_transaction() {
+    local -a requested=("$@")
+    local name installed held_entry total=0
+    local -a plan=() actions=() events=() held=()
+
+    require_index
+    RESOLVED=()
+    VISITED=()
+    for name in "${requested[@]}"; do
+        resolve "${name}"
+    done
+
+    for name in "${RESOLVED[@]}"; do
+        read_index_entry "${name}"
+        installed="$(installed_field "${name}" pkgver)" || installed=""
+        plan_package "${name}" "${installed}"
+        if [[ -n "${PLAN_HELD}" ]]; then
+            held+=("${PLAN_HELD}")
+            continue
+        fi
+        [[ -n "${PLAN_ACTION}" ]] || continue
+        plan+=("${name}")
+        actions+=("${PLAN_ACTION}")
+        events+=("${PLAN_EVENT}")
+        total=$((total + IDX_SIZE))
+    done
+
+    for held_entry in "${held[@]}"; do
+        warn "keeping ${held_entry}"
+    done
+
+    if ((${#plan[@]} == 0)); then
+        log "nothing to do"
+        return 0
+    fi
+
+    printf '\n'
+    local index
+    for index in "${!plan[@]}"; do
+        printf '  %-18s %s\n' "${plan[${index}]}" "${actions[${index}]}"
+    done
+    for index in "${!plan[@]}"; do
+        if [[ "${actions[${index}]}" == downgrade\ * ]]; then
+            warn "${plan[${index}]} is being put back to a version older than the one installed"
+        fi
+    done
+    printf '\ntotal download: %s\n\n' "$(human_size "${total}")"
+    confirm "Proceed?"
+
+    # The plan reaches the record whole, before anything is fetched: an install
+    # that is interrupted halfway is exactly the case where what was *intended*
+    # is worth having written down.
+    for index in "${!plan[@]}"; do
+        audit "plan: ${plan[${index}]} ${actions[${index}]}"
+    done
+
+    for name in "${plan[@]}"; do
+        fetch_archive "${name}"
+    done
+    if [[ "${DOWNLOAD_ONLY}" == 1 ]]; then
+        log "archives are in ${CACHE_DIR}; nothing was installed"
+        return 0
+    fi
+    for name in "${plan[@]}"; do
+        log "installing ${name}"
+        install_archive "${name}"
+        audit "installed ${name} $(installed_field "${name}" pkgver) build $(installed_field "${name}" pkgbuild || printf unknown)"
+    done
+    log "${#plan[@]} package(s) done"
+
+    # After the last package rather than after each one. A transaction that
+    # upgrades openssl and openssh restarts sshd once, against a system that is
+    # already whole, instead of restarting it onto half an upgrade.
+    if hooks_apply_to_this_root; then
+        for index in "${!plan[@]}"; do
+            run_hooks "${plan[${index}]}" "${events[${index}]}" || true
+        done
+    elif hooks_declared "${plan[@]}"; then
+        warn "not running install steps for another root; run them there"
+    fi
+
+    report_hook_failures
+    print_messages
+}
+
+# Whether any package in a list declares a hook at all, so a skipped hook run
+# is only mentioned when something was actually skipped.
+hooks_declared() {
+    local name
+    for name in "$@"; do
+        [[ -f "${DB_DIR}/${name}/hooks" ]] && return 0
+    done
+    return 1
+}
+
+in_list() {
+    local wanted="$1"
+    shift
+    local candidate
+    for candidate in "$@"; do
+        if [[ "${candidate}" == "${wanted}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+cmd_install() {
+    (($# > 0)) || die "install needs a package name"
+    require_write_access install
+    acquire_lock
+    NAMED=("$@")
+    run_transaction "$@"
+}
+
+cmd_upgrade() {
+    require_write_access upgrade
+    acquire_lock
+    require_index
+
+    local -a targets=()
+    local name installed missing=0
+
+    if (($# > 0)); then
+        targets=("$@")
+        NAMED=("$@")
+    else
+        while IFS= read -r name; do
+            installed="$(installed_field "${name}" pkgver)" || continue
+            read_index_entry "${name}" || continue
+            if version_is_newer "${installed}" "${IDX_VERSION}" \
+                || version_is_newer "${IDX_VERSION}" "${installed}" \
+                || build_differs "${name}" "${IDX_BUILD}"; then
+                targets+=("${name}")
+            fi
+        done < <(installed_names)
+
+        while IFS= read -r name; do
+            if ! is_installed "${name}"; then
+                missing=$((missing + 1))
+            fi
+        done < <(index_names)
+    fi
+
+    if ((${#targets[@]} == 0)); then
+        log "the system is up to date"
+    else
+        run_transaction "${targets[@]}"
+    fi
+    if ((missing > 0)); then
+        log "${missing} package(s) in the repository are not installed"
+        log "see '${PROGRAM} list --available'"
+    fi
+}
+
+# The order a set of packages is taken off in: each one before anything it
+# depends on, so a step that runs before a removal still has the libraries it
+# needs while it runs. Anything still left when a pass makes no progress is a
+# cycle among installed packages - which a validated index cannot produce, but
+# an older one could have installed - and is put back in the order it was given.
+removal_order() {
+    local -a queue=("$@")
+    local name dependant progress held emitted=0
+    local -a order=()
+    local -A pending=()
+
+    for name in "${queue[@]}"; do
+        pending["${name}"]=1
+    done
+    while ((emitted < ${#queue[@]})); do
+        progress=0
+        for name in "${queue[@]}"; do
+            [[ -n "${pending[${name}]}" ]] || continue
+            held=0
+            while IFS= read -r dependant; do
+                if [[ -n "${pending[${dependant}]:-}" ]]; then
+                    held=1
+                    break
+                fi
+            done < <(installed_dependents "${name}")
+            ((held == 0)) || continue
+            # Emptied rather than unset, for the reason given in
+            # verify_staged_tree.
+            pending["${name}"]=""
+            order+=("${name}")
+            emitted=$((emitted + 1))
+            progress=1
+        done
+        ((progress == 1)) || break
+    done
+    for name in "${queue[@]}"; do
+        [[ -z "${pending[${name}]}" ]] || order+=("${name}")
+    done
+    printf '%s\n' "${order[@]}"
+}
+
+cmd_remove() {
+    (($# > 0)) || die "remove needs a package name"
+    require_write_access remove
+    acquire_lock
+
+    local name path dependant kept=0
+    local -a obsolete=() directories=() outside=() ordered=()
+    local -A removing=()
+
+    for name in "$@"; do
+        removing["${name}"]=1
+    done
+    for name in "$@"; do
+        is_installed "${name}" || die "${name} is not installed"
+        # Before a single rm: on another root this database was written by
+        # whoever assembled that root, and it is what the removal is driven
+        # from.
+        assert_manifest_safe "the recorded manifest of ${name}" \
+            "${DB_DIR}/${name}/files"
+        if in_list "${name}" "${ESSENTIAL[@]}"; then
+            die "${name} is part of the base system and cannot be removed"
+        fi
+        # Only dependants that are staying. "remove consumer library" is a
+        # complete instruction: refusing it because consumer is installed at the
+        # moment the question is asked would be answering about a machine that
+        # is not the one this transaction leaves behind.
+        outside=()
+        while IFS= read -r dependant; do
+            [[ -z "${removing[${dependant}]:-}" ]] || continue
+            outside+=("${dependant}")
+        done < <(installed_dependents "${name}")
+        if ((${#outside[@]} > 0)); then
+            die "${name} is required by: ${outside[*]}"
+        fi
+    done
+
+    mapfile -t ordered < <(removal_order "$@")
+
+    printf '\n'
+    for name in "${ordered[@]}"; do
+        printf '  %-18s remove %s\n' "${name}" "$(installed_field "${name}" pkgver)"
+        if has_hooks "${name}" pre-remove; then
+            print_hooks "${name}" pre-remove '    '
+        fi
+    done
+    printf '\n'
+    confirm "Proceed?"
+
+    for name in "${ordered[@]}"; do
+        audit "plan: ${name} remove $(installed_field "${name}" pkgver) build $(installed_field "${name}" pkgbuild || printf unknown)"
+    done
+
+    # Everything that has to happen while the package is still there, and for
+    # every package named, before a single file is deleted. A daemon whose
+    # program has been unlinked keeps running from the inode it opened - that is
+    # the same rename(2) property that makes an upgrade safe - so a package that
+    # ships one says here that it has to be stopped first. This is also the last
+    # moment /sbin/chkconfig can read the init script's header, which is what it
+    # needs in order to take the rc links away.
+    #
+    # A step that fails here stops the removal: nothing has been destroyed yet,
+    # so there is still something to stop.
+    if hooks_apply_to_this_root; then
+        for name in "${ordered[@]}"; do
+            run_hooks "${name}" pre-remove \
+                || die "${name}: a step before removal failed; nothing was removed (--no-hooks to remove anyway)"
+        done
+    else
+        for name in "${ordered[@]}"; do
+            if has_hooks "${name}" pre-remove; then
+                warn "${name}: not running its removal steps on another root"
+            fi
+        done
+    fi
+
+    for name in "${ordered[@]}"; do
+        load_recorded_config_hashes "${name}"
+        obsolete=()
+        while IFS= read -r path; do
+            if keep_local_config "${path}" "${ROOT}/${path}"; then
+                warn "kept your ${path}"
+                kept=$((kept + 1))
+                continue
+            fi
+            obsolete+=("${ROOT}/${path}")
+        done < <(manifest_paths "${DB_DIR}/${name}/files")
+        if ((${#obsolete[@]} > 0)); then
+            run_chunked rm -f -- "${obsolete[@]}"
+        fi
+
+        claimed_directories "${name}"
+        mapfile -t directories < <(manifest_directories "${DB_DIR}/${name}/files")
+        for path in "${directories[@]}"; do
+            if [[ -n "${CLAIMED_DIRECTORIES[${path}]:-}" ]]; then
+                continue
+            fi
+            rmdir "${path}" 2> /dev/null || true
+        done
+
+        # While the entry is still there: after the rm below nothing on the
+        # machine can say what version was taken off it.
+        audit "removing ${name} $(installed_field "${name}" pkgver) build $(installed_field "${name}" pkgbuild || printf unknown)"
+        rm -rf "${DB_DIR:?}/${name}"
+        log "removed ${name}"
+    done
+}
+
+cmd_verify() {
+    local -a targets=()
+    local name type mode value _size path target
+    local problems=0 checked=0
+
+    if (($# > 0)); then
+        targets=("$@")
+    else
+        mapfile -t targets < <(installed_names)
+    fi
+
+    for name in "${targets[@]}"; do
+        is_installed "${name}" || die "${name} is not installed"
+        assert_manifest_safe "the recorded manifest of ${name}" \
+            "${DB_DIR}/${name}/files"
+        local -A expected=()
+        local -a files=()
+        while IFS='|' read -r type mode value _size path; do
+            target="${ROOT}/${path}"
+            case "${type}" in
+                d)
+                    if [[ ! -d "${target}" ]]; then
+                        printf 'missing directory  %s (%s)\n' "/${path}" "${name}"
+                        problems=$((problems + 1))
+                    fi
+                    ;;
+                l)
+                    if [[ ! -L "${target}" ]]; then
+                        printf 'missing link       %s (%s)\n' "/${path}" "${name}"
+                        problems=$((problems + 1))
+                    elif [[ "$(readlink "${target}")" != "${value}" ]]; then
+                        printf 'link changed       %s (%s)\n' "/${path}" "${name}"
+                        problems=$((problems + 1))
+                    fi
+                    ;;
+                f)
+                    if [[ ! -f "${target}" ]]; then
+                        printf 'missing file       %s (%s)\n' "/${path}" "${name}"
+                        problems=$((problems + 1))
+                    else
+                        expected["${target}"]="${value}"
+                        files+=("${target}")
+                    fi
+                    ;;
+            esac
+        done < "${DB_DIR}/${name}/files"
+
+        if ((${#files[@]} > 0)); then
+            local sum actual
+            while read -r sum actual; do
+                checked=$((checked + 1))
+                if [[ "${sum}" != "${expected[${actual}]:-}" ]]; then
+                    path="${actual#"${ROOT}"/}"
+                    if config_protected "${path}"; then
+                        printf 'modified config    /%s (%s)\n' "${path}" "${name}"
+                    else
+                        printf 'checksum mismatch  /%s (%s)\n' "${path}" "${name}"
+                        problems=$((problems + 1))
+                    fi
+                fi
+            done < <(run_chunked sha256sum -- "${files[@]}")
+        fi
+    done
+
+    log "checked ${checked} file(s) in ${#targets[@]} package(s)"
+    if ((problems > 0)); then
+        die "${problems} problem(s) found"
+    fi
+    log "no problems found"
+}
+
+cmd_hooks() {
+    local -a targets=()
+    local name found=0
+
+    if (($# > 0)); then
+        targets=("$@")
+        for name in "${targets[@]}"; do
+            is_installed "${name}" || die "${name} is not installed"
+        done
+    else
+        mapfile -t targets < <(installed_names)
+    fi
+
+    for name in "${targets[@]}"; do
+        [[ -f "${DB_DIR}/${name}/hooks" ]] || continue
+        printf '%s:\n' "${name}"
+        print_hooks "${name}"
+        found=$((found + 1))
+    done
+    if ((found == 0)); then
+        log "no installed package declares any steps"
+    fi
+}
+
+cmd_clean() {
+    require_write_access clean
+    local mode="${1:-}"
+    local archive name keep removed=0
+    local -A wanted=()
+
+    [[ -d "${CACHE_DIR}" ]] || return 0
+    if [[ "${mode}" != --all && -f "${INDEX}" ]]; then
+        while IFS= read -r name; do
+            read_index_entry "${name}"
+            wanted["${IDX_ARCHIVE}"]=1
+        done < <(index_names)
+    fi
+    for archive in "${CACHE_DIR}"/*; do
+        [[ -f "${archive}" ]] || continue
+        keep="${wanted[${archive##*/}]:-}"
+        if [[ -z "${keep}" ]]; then
+            rm -f "${archive}"
+            removed=$((removed + 1))
+        fi
+    done
+    log "removed ${removed} cached archive(s)"
+}
+
+# ---------------------------------------------------------------------- main
+
+main() {
+    local command=""
+    local invocation="$*"
+    local -a operands=()
+
+    while (($# > 0)); do
+        case "$1" in
+            -y | --yes) ASSUME_YES=1 ;;
+            --reinstall) REINSTALL=1 ;;
+            --download-only) DOWNLOAD_ONLY=1 ;;
+            --no-hooks) RUN_HOOKS=0 ;;
+            --allow-downgrade) ALLOW_DOWNGRADE=1 ;;
+            --allow-stale) ALLOW_STALE=1 ;;
+            --root)
+                shift
+                [[ $# -gt 0 ]] || die "--root needs a directory"
+                ROOT="${1%/}"
+                ;;
+            -h | --help | help) command=help ;;
+            --installed | --upgradable | --available | --all) operands+=("$1") ;;
+            -*) die "unknown option: $1" ;;
+            *)
+                if [[ -z "${command}" ]]; then
+                    command="$1"
+                else
+                    operands+=("$1")
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    # Before set_paths, because every path below is built from it, and before
+    # load_config, because the first thing read out of another root is that
+    # root's configuration file.
+    canonicalize_root
+    set_paths
+    # Before load_config, so that a machine with no repository configured says
+    # so in the record as well as on the terminal, and before the trap, so the
+    # trap has somewhere to write.
+    if in_list "${command}" "${LOGGED_COMMANDS[@]}"; then
+        open_log
+        audit "run: ${PROGRAM} ${invocation}"
+    fi
+    trap on_exit EXIT
+    load_config
+    select_curl
+
+    case "${command}" in
+        update) cmd_update ;;
+        list) cmd_list "${operands[@]}" ;;
+        info) cmd_info "${operands[@]}" ;;
+        files) cmd_files "${operands[@]}" ;;
+        owns) cmd_owns "${operands[@]}" ;;
+        add | install) cmd_install "${operands[@]}" ;;
+        upgrade) cmd_upgrade "${operands[@]}" ;;
+        # "uninstall" is the same command under the name people who have used
+        # anything else reach for first.
+        remove | uninstall) cmd_remove "${operands[@]}" ;;
+        hooks) cmd_hooks "${operands[@]}" ;;
+        verify) cmd_verify "${operands[@]}" ;;
+        clean) cmd_clean "${operands[@]}" ;;
+        help) usage ;;
+        '')
+            usage
+            exit 1
+            ;;
+        *) die "unknown command: ${command} (try '${PROGRAM} help')" ;;
+    esac
+
+    # A package whose files are in place and whose steps did not all run is
+    # neither a success nor a failed transaction, and answering "0" would let a
+    # script go on to use something that was never finished being set up. It
+    # gets a status of its own, so "install && use it" stops and
+    # "install || reinstall" does not confuse the two.
+    ((${#HOOK_FAILURES[@]} == 0)) || exit 2
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

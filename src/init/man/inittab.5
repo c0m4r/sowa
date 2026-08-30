@@ -1,0 +1,186 @@
+.Dd August 17, 2026
+.Dt INITTAB 5
+.Os Sowa
+.Sh NAME
+.Nm inittab
+.Nd what init starts, and when
+.Sh SYNOPSIS
+.Pa /etc/inittab
+.Sh DESCRIPTION
+.Pa /etc/inittab
+is the whole of
+.Xr init 8 Ns 's
+configuration.
+Each line is a colon-separated record:
+.Pp
+.Dl id : runlevels : action : process
+.Pp
+Blank lines and lines whose first non-blank character is
+.Sq #
+are ignored.
+The fields are:
+.Bl -tag -width runlevels
+.It Ar id
+Up to eight characters, unique in the file.
+It is how
+.Xr init 8
+tells one entry from another across a reread, so keeping it stable across an
+edit matters more than what it says.
+.It Ar runlevels
+The runlevels the entry belongs to, written together with no separator:
+.Ql 12345 .
+Empty means every runlevel.
+.It Ar action
+What
+.Xr init 8
+should do with the process; see below.
+.It Ar process
+The command.
+It is executed directly unless it contains a shell metacharacter, in which case
+.Pa /bin/sh -c
+runs it.
+A leading
+.Sq @
+is not part of the command: it tells
+.Xr init 8
+to give the process no terminal at all, which is what a getty needs, because a
+getty opens its own device and makes it the controlling terminal of the session
+it hands to
+.Xr login 1 .
+An entry already holding
+.Pa /dev/console
+could not do that.
+.El
+.Ss Actions
+.Bl -tag -width powerokwait
+.It Cm initdefault
+The runlevel to enter at boot.
+The process field is not used.
+Without this entry
+.Xr init 8
+has nothing to enter and the boot goes nowhere.
+.It Cm sysinit
+Run once, before any runlevel, whatever the runlevel is.
+.Xr init 8
+waits for it.
+.It Cm boot
+Run once at boot, without waiting.
+.It Cm bootwait
+Run once at boot, and wait for it.
+.It Cm wait
+Run on entering one of the entry's runlevels, and wait for it.
+This is what the
+.Pa /etc/rc.d/rc
+entries use.
+.It Cm once
+Run on entering one of the entry's runlevels, without waiting, and do not
+restart it.
+.It Cm respawn
+Run on entering one of the entry's runlevels, and start it again whenever it
+exits.
+A respawn entry that starts more than ten times in two minutes is disabled for
+five minutes, with a line on the console, and then tried again.
+.It Cm ondemand
+Run when
+.Xr telinit 8
+is asked for
+.Cm a ,
+.Cm b
+or
+.Cm c ,
+which are not runlevels: the current runlevel does not change and nothing else
+is started or stopped.
+The entry's runlevel field holds those letters rather than digits.
+.It Cm off
+Ignore the entry.
+.It Cm ctrlaltdel
+Run when the kernel reports Ctrl-Alt-Del, which it does by sending
+.Xr init 8
+a
+.Dv SIGINT .
+.It Cm powerfail
+Run on
+.Dv SIGPWR ,
+without waiting.
+.It Cm powerwait
+Run on
+.Dv SIGPWR ,
+and wait for it.
+.It Cm powerokwait
+Run on
+.Dv SIGPWR
+when power has come back, and wait for it.
+.It Cm kbrequest
+Run when the kernel asks for the KeyboardSignal keymap action, which reaches
+.Xr init 8
+as a
+.Dv SIGWINCH .
+.El
+.Ss Runlevels
+.Bl -tag -width "S  " -compact -offset indent
+.It 0
+halt or power off
+.It 1
+single user with the rc scripts run: services stopped, console login
+.It 2
+multi user
+.It 3
+multi user, and the Sowa default
+.It 4
+multi user, free for local use
+.It 5
+multi user, free for local use
+.It 6
+reboot
+.It S
+single user without the rc scripts, which is what
+.Cm single
+on the kernel command line gets
+.El
+.Sh FILES
+.Bl -tag -width "/etc/rc.d/rc.sysinit" -compact
+.It Pa /etc/inittab
+this file.
+.It Pa /etc/rc.d/rc.sysinit
+the
+.Cm sysinit
+entry in the shipped file.
+.It Pa /etc/rc.d/rc
+the runlevel driver the
+.Cm wait
+entries run.
+.El
+.Sh EXAMPLES
+The shape of the shipped file, which is a complete configuration:
+.Bd -literal -offset indent
+id:3:initdefault:
+si::sysinit:/etc/rc.d/rc.sysinit
+l3:3:wait:/etc/rc.d/rc 3
+su:S:respawn:/bin/sh -l
+1:12345:respawn:@/usr/sbin/agetty --noclear -l /usr/bin/login tty1 38400 linux
+s0:12345:respawn:@/usr/sbin/serial-getty ttyS0 115200
+ca::ctrlaltdel:/sbin/shutdown -r now
+.Ed
+.Pp
+After editing the file, ask
+.Xr init 8
+to read it again.
+Nothing is restarted by this; an entry whose command has changed is left alone
+until it exits on its own:
+.Pp
+.Dl telinit q
+.Sh SEE ALSO
+.Xr chkconfig 8 ,
+.Xr init 8 ,
+.Xr serial-getty 8 ,
+.Xr service 8 ,
+.Xr telinit 8
+.Sh CAVEATS
+The file is
+.Xr init 8 Ns 's
+only configuration and it is read at boot before anything else exists, so a
+line that cannot be parsed is a machine that may not reach a login prompt.
+Booting with
+.Cm emergency
+on the kernel command line gets a root shell without reading this file at all,
+which is how a bad edit is undone.

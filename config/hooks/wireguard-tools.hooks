@@ -1,0 +1,13 @@
+# wireguard-tools.
+#
+# There is no daemon here: WireGuard is in the kernel and wg-quick is a script
+# that configures an interface and exits. So there is nothing running from the
+# old program after an upgrade and nothing to restart - an upgrade of this
+# package leaves the tunnels alone, which is the right answer rather than a
+# missing one.
+#
+# A removal is different. wg-quick is what takes an interface down, and once the
+# package is gone there is no way left to do it: the interface, its routes and
+# its firewall rules would outlive everything that knows about them.
+pre-remove|service-stop|wg-quick
+pre-remove|service-disable|wg-quick

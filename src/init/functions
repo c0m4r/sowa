@@ -1,0 +1,452 @@
+#!/bin/bash
+#
+# /etc/rc.d/init.d/functions - what every Sowa init script sources.
+#
+# The System V ancestors of these helpers found a running daemon with pidof(1)
+# and remembered which services were up with lock files under /var/lock/subsys.
+# Both ideas are kept. The lock directory moved to /run/lock/subsys, because
+# /run is the tmpfs rc.sysinit mounts and a lock that survives a reboot is a
+# lie, and a daemon is identified by the program it is running rather than by
+# its name - see pids_running below for why that distinction matters.
+#
+# Services are started in the foreground, under setsid(1), with their output
+# appended to a log file. A daemon that puts itself in the background takes its
+# diagnostics with it - including the ones it produces before it is far enough
+# along to log anywhere - so keeping it in the foreground is what keeps them.
+# This is separate from syslog: syslog-ng collects what programs send to
+# /dev/log, and this collects what a service writes on its own descriptors,
+# which is where the reason it would not start is.
+#
+# Nothing here sleeps for a fixed length of time to let a process appear or go.
+# Every wait polls at poll_interval instead, and stops as soon as the thing it
+# is waiting for has happened: a daemon execs in about two milliseconds and
+# crond and sshd are gone within a couple of milliseconds of a SIGTERM, so the
+# half second each of those used to cost was the whole of it. See daemon() and
+# killproc().
+#
+# Each action is timed, and what it cost is recorded. See timing_emit and
+# sowa-boottime(8).
+
+subsys_dir=/run/lock/subsys
+
+# Column the [  OK  ] markers line up in.
+status_column=60
+
+# The interval every wait in this file polls at - as sleep(1) takes it, and as
+# the centisecond arithmetic below counts it. The two have to say the same
+# thing. It is short enough that a service that starts in ten milliseconds is
+# not billed for half a second, and long enough that a wait costs a handful of
+# forks rather than hundreds.
+poll_interval=0.02
+poll_interval_cs=2
+
+# The limits daemon() and killproc() work to, in hundredths of a second, which
+# is the resolution /proc/uptime reports and the resolution the timing records
+# are kept in. An init script that needs a different answer assigns to these
+# after sourcing this file; see the comments at each use for what they mean.
+daemon_exec_timeout_cs=500
+daemon_settle_cs=10
+killproc_timeout_cs=1000
+killproc_kill_cs=200
+
+# Where the timings go: the record of this boot on the tmpfs, which goes away
+# with the boot it describes, and the history on disk, which is what makes a
+# boot that got slower comparable with the one before it.
+timing_file=/run/sowa/timing
+timing_log=/var/log/service-timing.log
+
+uptime_cs=0
+timing_began=""
+timing_label=""
+# The service that sourced this file. Inside begin() the positional parameters
+# are begin's own, and by then $0 is no help either, so it is taken here.
+#
+# The S04/K90 a runlevel link carries is stripped: at boot $0 is
+# /etc/rc.d/rc3.d/S04zram rather than the script's own path, and the service is
+# called zram either way. Leaving the prefix on would file the same service under
+# two names - "S04zram" coming up and "K96zram" going down - and neither is what
+# anyone would look for.
+timing_service="${0##*/}"
+if [[ "${timing_service}" =~ ^[SK][0-9][0-9](.+)$ ]]; then
+    timing_service="${BASH_REMATCH[1]}"
+fi
+
+# Which boot a record belongs to: the kernel's own per-boot UUID, first field
+# only. Eight hex digits tell one boot from the next in a log and are short
+# enough to put at the front of every line.
+boot_tag=unknown
+if read -r timing_boot_id < /proc/sys/kernel/random/boot_id 2>/dev/null; then
+    boot_tag="${timing_boot_id%%-*}"
+fi
+unset timing_boot_id
+
+# Hundredths of a second since the kernel started, into ${uptime_cs}.
+#
+# Not $EPOCHREALTIME, which is the wall clock: chronyd steps that during the
+# boot these numbers describe, and a service that straddled the step would come
+# out having taken a negative amount of time. Not date(1) either - this is read
+# twice per action and reading a file into a variable costs no fork at all.
+#
+# The kernel writes exactly two decimals, which is what lets the arithmetic stay
+# integer, since bash has no floating point. A kernel that wrote a different
+# number of them would make "0.6" into six hundredths rather than sixty, so the
+# width is checked rather than assumed. The 10# prefixes are what stop a
+# fraction like "08" being read as an invalid octal number.
+read_uptime_cs() {
+    local up rest fraction
+
+    read -r up rest < /proc/uptime 2>/dev/null || return 1
+    [[ "${up}" == *.* ]] || return 1
+    fraction="${up#*.}"
+    [[ "${#fraction}" -eq 2 ]] || return 1
+    uptime_cs=$(( 10#${up%.*} * 100 + 10#${fraction} ))
+    return 0
+}
+
+# A timing record that cannot be written is not worth failing a boot over: one
+# of these files is on a filesystem that a rescue boot may have mounted read
+# only, and the point of these numbers is to describe a boot rather than to
+# shape it. The directory is only made when the append has already failed, so
+# the common path costs no fork.
+timing_append() {
+    local file="$1" record="$2"
+
+    if ! printf '%s\n' "${record}" >> "${file}" 2>/dev/null; then
+        mkdir -p "${file%/*}" 2>/dev/null || return 0
+        printf '%s\n' "${record}" >> "${file}" 2>/dev/null || return 0
+    fi
+    return 0
+}
+
+# timing_emit BEGAN_CS OUTCOME LABEL...
+#
+# One line per timed action:
+#
+#   <boot> <at> <took> <outcome> <service> <label...>
+#
+# where <at> is when the action started, in seconds since the kernel did, and
+# <took> is how long it ran. Both are fixed point with two decimals, which is
+# all /proc/uptime offers. The label runs to the end of the line, so it is last.
+#
+# Nothing rotates the history. It grows by about a hundred bytes per boot, which
+# is the same bargain /var/log/wtmp is already on in this image.
+timing_emit() {
+    local began="$1" outcome="$2" elapsed record
+    shift 2
+
+    [[ -n "${began}" ]] || return 0
+    read_uptime_cs || return 0
+    elapsed=$(( uptime_cs - began ))
+    (( elapsed >= 0 )) || elapsed=0
+    printf -v record '%s %d.%02d %d.%02d %s %s %s' \
+        "${boot_tag}" \
+        "$(( began / 100 ))" "$(( began % 100 ))" \
+        "$(( elapsed / 100 ))" "$(( elapsed % 100 ))" \
+        "${outcome}" "${timing_service}" "$*"
+    timing_append "${timing_file}" "${record}"
+    timing_append "${timing_log}" "${record}"
+    return 0
+}
+
+# The outcome of the action begin() announced. Clearing the start time is what
+# keeps a second marker for the same action - result() calls ok() or failed(),
+# and a script may also print one of its own - from filing a second record.
+timing_record() {
+    local began="${timing_began}"
+
+    timing_began=""
+    timing_emit "${began}" "$1" "${timing_label}"
+}
+
+begin() {
+    timing_label="$*"
+    timing_began=""
+    read_uptime_cs && timing_began="${uptime_cs}"
+    printf '%-*s' "${status_column}" "$*"
+}
+
+ok() {
+    printf '[  OK  ]\n'
+    timing_record ok
+    return 0
+}
+
+failed() {
+    printf '[FAILED]\n'
+    timing_record failed
+    return 1
+}
+
+skipped() {
+    printf '[ SKIP ]\n'
+    timing_record skip
+    return 0
+}
+
+# Reports the outcome of the command that just ran, and passes its status on.
+result() {
+    local status=$1
+
+    if [[ "${status}" -eq 0 ]]; then
+        ok
+    else
+        failed
+    fi
+    return "${status}"
+}
+
+subsys_mark() {
+    mkdir -p "${subsys_dir}"
+    : > "${subsys_dir}/$1"
+}
+
+subsys_clear() {
+    rm -f "${subsys_dir}/$1"
+}
+
+subsys_marked() {
+    [[ -f "${subsys_dir}/$1" ]]
+}
+
+checkpid() {
+    [[ -n "$1" && -d "/proc/$1" ]]
+}
+
+# The program a process is running, or nothing if it has none - which is what a
+# kernel thread looks like. The " (deleted)" a replaced binary leaves behind is
+# stripped, so a daemon still running from a package that has been upgraded is
+# still recognised.
+program_of() {
+    local target
+
+    target="$(readlink "/proc/$1/exe" 2>/dev/null)" || return 1
+    printf '%s\n' "${target% (deleted)}"
+}
+
+# Every process running the program $1, which is a path.
+#
+# Neither the process name nor its command line can answer this. An init script
+# is named after the service it manages and the kernel names a process after
+# the script it runs, so /etc/rc.d/init.d/sshd - and every subshell it forks -
+# is called "sshd" too; sshd for its part rewrites its own argv to say what it
+# is doing. /proc/PID/exe is the one thing that still says which program is
+# running. The name is only used to keep the scan cheap: it is compared first,
+# without forking, and the link is only read for the processes that match.
+pids_running() {
+    local program="$1"
+    local wanted="${program##*/}"
+    local entry
+    local pid
+    local name
+
+    wanted="${wanted:0:15}"
+    for entry in /proc/[0-9]*; do
+        [[ -r "${entry}/comm" ]] || continue
+        read -r name < "${entry}/comm" 2>/dev/null || continue
+        [[ "${name}" == "${wanted}" ]] || continue
+        pid="${entry#/proc/}"
+        [[ "$(program_of "${pid}")" == "${program}" ]] || continue
+        printf '%s\n' "${pid}"
+    done
+}
+
+# The pid of a running service: the pid file if it still describes a live
+# process running the right program, and a scan if it does not.
+pidofproc() {
+    local pidfile="$1"
+    local program="$2"
+    local pid=""
+
+    if [[ -n "${pidfile}" && -r "${pidfile}" ]]; then
+        read -r pid < "${pidfile}" 2>/dev/null || pid=""
+        if checkpid "${pid}" && [[ "$(program_of "${pid}")" == "${program}" ]]; then
+            printf '%s\n' "${pid}"
+            return 0
+        fi
+    fi
+
+    pid="$(pids_running "${program}" | sed -n '1p')"
+    [[ -n "${pid}" ]] || return 1
+    printf '%s\n' "${pid}"
+}
+
+# daemon [--name NAME] [--pidfile FILE] [--log FILE] -- PROGRAM [ARGUMENT...]
+#
+# Starts a service and records its pid. The program is expected to stay in the
+# foreground; one that puts itself in the background is still handled, by
+# looking for it again once the fork has happened.
+daemon() {
+    local name=""
+    local pidfile=""
+    local logfile=/dev/null
+    local program=""
+    local pid=""
+    local waited=0
+    local started=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) name="$2"; shift 2 ;;
+            --pidfile) pidfile="$2"; shift 2 ;;
+            --log) logfile="$2"; shift 2 ;;
+            --) shift; break ;;
+            *) break ;;
+        esac
+    done
+    [[ $# -gt 0 ]] || return 2
+    program="$1"
+    [[ -n "${name}" ]] || name="${program##*/}"
+
+    # setsid puts the service in a session of its own. Without it the daemon
+    # keeps the session - and possibly the controlling terminal - of whatever
+    # ran the init script, and dies with it: a service started by hand from a
+    # login shell would not survive the logout.
+    setsid "$@" >> "${logfile}" 2>&1 &
+    pid=$!
+
+    # setsid(1) execs the service in place of itself - it is not a process group
+    # leader here, since a non-interactive shell has no job control to put a
+    # background child in one, so it has no reason to fork - which makes this pid
+    # the service's as soon as that exec has happened.
+    #
+    # Waiting for the exec is not the same as sleeping for as long as one might
+    # take. This used to be a flat half second, which was the largest single cost
+    # in a Sowa boot and was spent whether the service had started in two
+    # milliseconds or was never going to start at all.
+    while :; do
+        if [[ "$(program_of "${pid}")" == "${program}" ]]; then
+            started=yes
+            break
+        fi
+        # The pid is gone. Either the service put itself in the background, in
+        # which case what was started here is a parent that has already exited
+        # and the scan is what finds the child it left behind, or it could not
+        # start at all and there is nothing to find.
+        if ! checkpid "${pid}"; then
+            pid="$(pids_running "${program}" | sed -n '1p')"
+            [[ -n "${pid}" ]] && started=yes
+            break
+        fi
+        (( waited < daemon_exec_timeout_cs )) || break
+        sleep "${poll_interval}"
+        waited=$(( waited + poll_interval_cs ))
+    done
+    [[ -n "${started}" ]] || return 1
+
+    # A service that execs and then exits straight away - a configuration file it
+    # could not parse is the usual reason - has started as far as anything above
+    # can tell. Watching it for a moment longer is what turns that into the
+    # [FAILED] it should be. A tenth of a second is long enough for an exit(2)
+    # after a failed parse and short enough not to be the cost of the boot.
+    waited=0
+    while (( waited < daemon_settle_cs )); do
+        sleep "${poll_interval}"
+        waited=$(( waited + poll_interval_cs ))
+        # A daemon that forks once more during this window has not died; the
+        # scan is what tells the two apart.
+        if ! checkpid "${pid}"; then
+            pid="$(pids_running "${program}" | sed -n '1p')"
+            [[ -n "${pid}" ]] || return 1
+        fi
+    done
+
+    [[ -n "${pidfile}" ]] && printf '%s\n' "${pid}" > "${pidfile}"
+    subsys_mark "${name}"
+    return 0
+}
+
+# killproc [--name NAME] [--pidfile FILE] [--signal SIG] PROGRAM
+#
+# Asks the service to stop, and insists after ten seconds.
+killproc() {
+    local name=""
+    local pidfile=""
+    local signal=TERM
+    local program=""
+    local pid=""
+    local waited=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) name="$2"; shift 2 ;;
+            --pidfile) pidfile="$2"; shift 2 ;;
+            --signal) signal="$2"; shift 2 ;;
+            --) shift; break ;;
+            *) break ;;
+        esac
+    done
+    program="$1"
+    [[ -n "${program}" ]] || return 2
+    [[ -n "${name}" ]] || name="${program##*/}"
+
+    pid="$(pidofproc "${pidfile}" "${program}")" || {
+        [[ -n "${pidfile}" ]] && rm -f "${pidfile}"
+        subsys_clear "${name}"
+        return 1
+    }
+
+    kill "-${signal}" "${pid}" 2>/dev/null || true
+
+    # Any other signal is a message to a service that is expected to still be
+    # there afterwards - SIGHUP to reread a configuration, most of the time -
+    # so the pid file and the lock stay where they are.
+    if [[ "${signal}" != TERM ]]; then
+        return 0
+    fi
+
+    # Ten seconds, as before, but noticed at the resolution a daemon actually
+    # exits at rather than in half-second steps. crond and sshd are gone within a
+    # couple of milliseconds of the signal, and the old loop billed each of them
+    # half a second of the shutdown for it.
+    waited=0
+    while checkpid "${pid}" && (( waited < killproc_timeout_cs )); do
+        sleep "${poll_interval}"
+        waited=$(( waited + poll_interval_cs ))
+    done
+    if checkpid "${pid}"; then
+        kill -KILL "${pid}" 2>/dev/null || true
+        # SIGKILL is not instant either - the kernel still has to tear the
+        # process down - and waiting for it here is what keeps the pid file from
+        # being removed while the process it names is still there.
+        waited=0
+        while checkpid "${pid}" && (( waited < killproc_kill_cs )); do
+            sleep "${poll_interval}"
+            waited=$(( waited + poll_interval_cs ))
+        done
+    fi
+
+    [[ -n "${pidfile}" ]] && rm -f "${pidfile}"
+    subsys_clear "${name}"
+    return 0
+}
+
+# status [--pidfile FILE] PROGRAM - the conventional exit codes: 0 running,
+# 1 dead but the pid file is still there, 3 stopped.
+status() {
+    local pidfile=""
+    local program=""
+    local name=""
+    local pid=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pidfile) pidfile="$2"; shift 2 ;;
+            --) shift; break ;;
+            *) break ;;
+        esac
+    done
+    program="$1"
+    [[ -n "${program}" ]] || return 2
+    name="${program##*/}"
+
+    if pid="$(pidofproc "${pidfile}" "${program}")"; then
+        printf '%s is running (pid %s)\n' "${name}" "${pid}"
+        return 0
+    fi
+    if [[ -n "${pidfile}" && -f "${pidfile}" ]]; then
+        printf '%s is not running, but %s is still there\n' "${name}" "${pidfile}"
+        return 1
+    fi
+    printf '%s is not running\n' "${name}"
+    return 3
+}

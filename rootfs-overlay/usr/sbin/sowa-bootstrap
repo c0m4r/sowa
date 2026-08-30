@@ -1,0 +1,365 @@
+#!/bin/bash
+#
+# sowa-bootstrap - install Sowa into a filesystem someone else has mounted.
+#
+# This is sowa-setup with the disk half removed. sowa-setup owns the whole
+# device: it chooses one of its whole-disk layouts, formats, installs GRUB and
+# writes a boot menu. sowa-bootstrap takes a directory instead and copies the
+# live root into it, leaving the
+# partitioning, the filesystems and the boot loader to whoever ran it - which is
+# the way to get Sowa onto LVM, onto RAID, onto an encrypted root, into a custom
+# multiboot layout, or into a plain directory to be used as a chroot.
+#
+# The one part of the layout it does write is /etc/fstab, because that part is
+# not a guess: whatever belongs in the file is already mounted under the
+# destination, so it is read back rather than chosen. --no-fstab declines.
+#
+# It ends by printing what is left to do, filled in with the real device names
+# where it can work them out, because the part it does not do is the part that
+# decides whether the machine boots.
+#
+#   sowa-bootstrap /mnt
+#   sowa-bootstrap --from-tarball sowa-0.1-x86_64-rootfs.tar.xz /mnt
+#
+# With --from-tarball the source is a rootfs tarball made by 'make
+# rootfs-tarball' (or fetched from a mirror) instead of the running system, so
+# the copy installs that image as it was built rather than the live root as it
+# now stands. Everything else is the same: the copy, the host-key reset, and
+# the three steps left for whoever made the layout.
+#
+# Interactive by default: it confirms the destination and asks for the root
+# password the installed system will have. For unattended use set:
+#   SOWA_BOOTSTRAP_ASSUME_YES=1     skip the confirmation and the root password
+#                                   prompt
+#   SOWA_BOOTSTRAP_ROOT_PASSWORD    set the installed root password without
+#                                   being asked (default: ask; unattended: none)
+#   SOWA_BOOTSTRAP_HOSTNAME         hostname for the installed system
+#   SOWA_BOOTSTRAP_QUIET=1          do not print the closing instructions
+
+set -Eeuo pipefail
+
+# shellcheck source=../lib/sowa/install-functions
+source "${SOWA_INSTALL_LIB:-/usr/lib/sowa}/install-functions"
+
+usage() {
+    printf 'usage: %s [--from-tarball TARBALL] [--no-fstab] DESTINATION\n\n' "${0##*/}"
+    printf 'Copy the running Sowa system into DESTINATION, which must already\n'
+    printf 'be mounted (or be an ordinary directory, for a chroot tree).\n'
+    printf '\n--from-tarball TARBALL\n'
+    printf '    install from a rootfs tarball (make rootfs-tarball) instead of\n'
+    printf '    copying the running system.\n'
+    printf '\n--no-fstab\n'
+    printf '    do not write DESTINATION/etc/fstab from the mounts under it.\n'
+    exit "${1:-1}"
+}
+
+require_tools() {
+    local tarball="${1:-}"
+    local missing=()
+    mapfile -t missing < <(missing_tools tar du df awk sed findmnt lsblk mknod mkdir)
+    # GNU tar invokes the matching external decompressor. A live-root copy is
+    # an uncompressed pipe and needs neither one. New release tarballs use XZ,
+    # while the extractor still accepts gzip artifacts made by an older build.
+    case "${tarball}" in
+        *.xz | *.txz)
+            command -v xz >/dev/null 2>&1 || missing+=(xz)
+            ;;
+        *.gz | *.tgz)
+            command -v gzip >/dev/null 2>&1 || missing+=(gzip)
+            ;;
+    esac
+    # blkid is not in that list on purpose. It is wanted for one thing - the
+    # swap areas the generated fstab lists commented out - and swap is the part
+    # of the file the operator has to decide about anyway, so a rescue system
+    # without blkid gets an fstab with no swap section rather than no install.
+    # openssl hashes the root password. Told one, this cannot go ahead without
+    # it; left to ask for one, it drops the question instead - which matters
+    # here more than in sowa-setup, because this program is the one that runs on
+    # somebody else's rescue system, where openssl may genuinely be absent.
+    if [[ -n "${SOWA_BOOTSTRAP_ROOT_PASSWORD:-}" ]]; then
+        command -v openssl >/dev/null 2>&1 || missing+=(openssl)
+    fi
+    ((${#missing[@]} == 0)) || die "missing required tools: ${missing[*]}"
+}
+
+# Whether to ask. A password given in the environment is the answer already, an
+# unattended run has nobody to ask, a stdin that is not a terminal cannot carry
+# the question, and without openssl there is nothing to hash the answer with.
+will_ask_for_password() {
+    [[ -z "${SOWA_BOOTSTRAP_ROOT_PASSWORD:-}" ]] || return 1
+    [[ "${SOWA_BOOTSTRAP_ASSUME_YES:-}" != 1 ]] || return 1
+    [[ -t 0 ]] || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+}
+
+# What is already in the destination, ignoring the conventional lost+found
+# directory some filesystem creators leave. A non-empty destination is not refused -
+# installing beside an existing system is one of the reasons this program exists
+# - but it is what the confirmation is for.
+destination_entries() {
+    local destination="$1" entry count=0
+    for entry in "${destination}"/* "${destination}"/.[!.]*; do
+        [[ -e "${entry}" || -L "${entry}" ]] || continue
+        [[ "${entry##*/}" == "lost+found" ]] && continue
+        count=$(( count + 1 ))
+    done
+    printf '%s\n' "${count}"
+}
+
+check_space() {
+    local destination="$1" live_mib="${2:-}" available_mib needed_mib
+    if [[ -z "${live_mib}" ]]; then
+        live_mib="$(live_root_mib)"
+    fi
+    # df answers for the filesystem holding the destination, which is the one
+    # about to be written to. Unlike sowa-setup, there is no filesystem to make
+    # here, so what is left after mkfs is already accounted for and only a
+    # little room on top of the tree itself is wanted.
+    # "|| true" because a df that cannot answer must leave the check to be
+    # skipped, not kill the program: the assignment itself is what set -e would
+    # otherwise trip on, before the test below gets to decide anything.
+    available_mib="$(df -Pk "${destination}" 2>/dev/null | awk 'NR == 2 { print int($4 / 1024) }' || true)"
+    needed_mib=$(( live_mib + live_mib / 20 ))
+    [[ "${available_mib}" =~ ^[0-9]+$ ]] || return 0
+    [[ "${available_mib}" -ge "${needed_mib}" ]] \
+        || die "not enough room on ${destination}: the live system is ${live_mib} MiB and wants ${needed_mib} MiB, but only ${available_mib} MiB is free"
+}
+
+confirm() {
+    local destination="$1" entries="$2" tarball="${3:-}"
+    if [[ "${SOWA_BOOTSTRAP_ASSUME_YES:-}" == 1 ]]; then
+        return
+    fi
+    if [[ -n "${tarball}" ]]; then
+        printf '\nThis will install Sowa from %s into %s.\n' "${tarball}" "${destination}"
+    else
+        printf '\nThis will copy the running Sowa system into %s.\n' "${destination}"
+    fi
+    if [[ "${entries}" -gt 0 ]]; then
+        printf 'That directory is NOT empty (%s entries): files with the same\n' "${entries}"
+        printf 'names as the ones being copied will be OVERWRITTEN.\n'
+    fi
+    printf 'Type "yes" to continue: '
+    local answer
+    read -r answer
+    [[ "${answer}" == yes ]] || die "aborted at user request"
+}
+
+# What is left to do, with the device names filled in wherever they can be
+# established. Everything below is deliberately printed rather than done: the
+# layout is the caller's, and a boot loader written to a disk this program only
+# guessed at is the one mistake it must not make.
+next_steps() {
+    local destination="$1" fstab_written="${2:-0}"
+    local root_device root_uuid root_partuuid root_fstype root_pass disk
+
+    # How to name sowa-chroot in the instructions below. Run from the image it
+    # is a command on PATH and this is just its name; run from the bundled
+    # sowa-install it is not, because the bundle unpacked it into a temporary
+    # directory that is deleted before anyone reads this. The bundle passes in
+    # the name that will still work.
+    local chroot_command="${SOWA_INSTALL_CHROOT_COMMAND:-sowa-chroot}"
+
+    # Every one of these is allowed to come back empty - a destination that is
+    # not a mount point has no device behind it, and a whole-disk filesystem has
+    # no PARTUUID and no parent - so each ends in "|| true". Without it the
+    # failing command substitution, not the empty answer, is what would be
+    # reported.
+    root_device="$(mount_source "${destination}" || true)"
+    if [[ -n "${root_device}" ]]; then
+        root_uuid="$(lsblk -d -n -o UUID "${root_device}" 2>/dev/null || true)"
+        root_partuuid="$(lsblk -d -n -o PARTUUID "${root_device}" 2>/dev/null || true)"
+        root_fstype="$(lsblk -d -n -o FSTYPE "${root_device}" 2>/dev/null || true)"
+        disk="$(lsblk -n -o PKNAME "${root_device}" 2>/dev/null | awk 'NF { print; exit }' || true)"
+        [[ -n "${disk}" ]] && disk="/dev/${disk}"
+    fi
+
+    printf '\n'
+    if (( fstab_written == 1 )); then
+        log "Sowa is installed in ${destination}. Two things are left, and this"
+        log "program does neither, because they depend on a layout only you know."
+        log "The one file it did write is the first thing below, to be read over."
+    else
+        log "Sowa is installed in ${destination}. Three things are left, and this"
+        log "program does none of them, because they depend on a layout only you know."
+    fi
+    printf '\n'
+
+    if (( fstab_written == 1 )); then
+        printf '1. /etc/fstab, written from the filesystems you had mounted under %s:\n\n' \
+            "${destination}"
+        # Indented so the file is clearly the file and not more prose. sed
+        # rather than a read loop: a line here can hold a backslash, which read
+        # would eat and printf %s would not put back.
+        sed 's/^./     &/' "${destination}/etc/fstab"
+        printf '\n   Read it before the first boot. Anything that was not mounted when\n'
+        printf '   this ran is not in it, and swap never is - swap is not a mount, so\n'
+        printf '   what was found on the machine is listed commented out, for you to\n'
+        printf '   turn on once you know it is yours.\n'
+    else
+        printf '1. /etc/fstab. Nothing wrote one - the image ships none - and a system\n'
+        printf '   that boots without one mounts nothing beyond the root the kernel was\n'
+        printf '   handed on its command line.\n'
+        if [[ -n "${root_uuid:-}" ]]; then
+            printf '   The root filesystem you mounted is %s, UUID=%s:\n\n' \
+                "${root_device}" "${root_uuid}"
+            root_pass=0
+            case "${root_fstype:-}" in ext2|ext3|ext4) root_pass=1 ;; esac
+            printf '     UUID=%s  /  %s  defaults  0  %s\n' \
+                "${root_uuid}" "${root_fstype:-<type>}" "${root_pass}"
+            printf '\n   Add a line for the EFI System Partition too if this machine boots UEFI:\n\n'
+            printf '     UUID=<esp>  /boot/efi  vfat  defaults,noauto  0  2\n'
+        elif [[ -n "${root_device:-}" ]]; then
+            printf '   The filesystem you mounted is %s. Name it by UUID or PARTUUID\n' "${root_device}"
+            printf '   rather than by /dev/sdXN, which is not stable across boots:\n\n'
+            printf '     lsblk -n -o NAME,UUID,PARTUUID %s\n' "${root_device}"
+        else
+            printf '   %s is not a mount point, so there is no device to name in one.\n' "${destination}"
+            printf '   If this tree is going to be a chroot rather than a bootable system,\n'
+            printf '   that is fine and steps 2 and 3 do not apply.\n'
+        fi
+    fi
+
+    # Both of the remaining steps are given as sowa-chroot commands, and the
+    # paths in them are the installed system's own rather than this one's.
+    # Running them from out here would work on a machine whose GRUB is as new as
+    # Sowa's, and quietly not on one whose GRUB is older - a rescue environment
+    # shipping GRUB 0.97 is the case that made this worth changing. Inside the
+    # chroot it is Sowa's own grub-install and grub-mkconfig either way, so the
+    # commands below are the same on every host.
+    printf '\n2. GRUB. Run both if the machine should boot either firmware:\n\n'
+    printf '     %s %s grub-install --target=i386-pc %s\n' \
+        "${chroot_command}" "${destination}" "${disk:-<disk>}"
+    printf '     %s %s grub-install --target=x86_64-efi \\\n' "${chroot_command}" "${destination}"
+    printf '                 --efi-directory=/boot/efi --removable --no-nvram\n'
+    printf '\n   The UEFI line needs the ESP mounted at %s/boot/efi first.\n' "${destination}"
+    printf '   --removable writes EFI/BOOT/BOOTX64.EFI, which firmware boots with\n'
+    printf '   no NVRAM entry, so no efibootmgr is needed.\n'
+
+    printf '\n3. A boot menu at %s/boot/grub/grub.cfg. Sowa boots its kernel\n' "${destination}"
+    printf '   directly, with no initramfs. grub-mkconfig can write it from the\n'
+    printf '   system'\''s own settings - after step 2, which is what creates the\n'
+    printf '   /boot/grub the file goes in:\n\n'
+    printf '     %s %s grub-mkconfig -o /boot/grub/grub.cfg\n' "${chroot_command}" "${destination}"
+    printf '\n   Or write it by hand:\n\n'
+    printf '     set default=0\n'
+    printf '     set timeout=5\n'
+    printf '     menuentry "Sowa Linux" {\n'
+    printf '         linux /boot/vmlinuz root=PARTUUID=%s rw console=tty0 console=ttyS0,115200 init=/sbin/init panic=-1\n' \
+        "${root_partuuid:-<root-partuuid>}"
+    printf '     }\n'
+
+    printf '\nTo do any of this from inside the installed system rather than from here:\n\n'
+    printf '     %s %s\n\n' "${chroot_command}" "${destination}"
+}
+
+main() {
+    local tarball="" write_fstab=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) usage 0 ;;
+            --from-tarball)
+                [[ $# -ge 2 ]] || usage
+                tarball="$2"
+                shift 2 ;;
+            --from-tarball=*)
+                tarball="${1#*=}"
+                shift ;;
+            --no-fstab)
+                write_fstab=0
+                shift ;;
+            -*) usage ;;
+            *) break ;;
+        esac
+    done
+    [[ $# -eq 1 ]] || usage
+    case "$1" in
+        -h|--help) usage 0 ;;
+        -*) usage ;;
+    esac
+
+    require_root
+    require_supported_host_kernel
+    require_tools "${tarball}"
+
+    [[ -d "$1" ]] || die "not a directory: $1"
+    local destination
+    destination="$(normalize_path "$1")" || die "cannot resolve: $1"
+    [[ "${destination}" != / ]] || die "refusing to bootstrap onto the running root filesystem"
+    [[ -w "${destination}" ]] || die "not writable: ${destination}"
+
+    if [[ -n "${tarball}" ]]; then
+        [[ -f "${tarball}" ]] || die "no such file: ${tarball}"
+    else
+        # Without a tarball the source is the running system, which is only the
+        # right source when the running system is Sowa. copy_system refuses this
+        # too, but it refuses it several minutes too late: live_root_mib runs
+        # "du -sx /" first, so on a non-Sowa host the program would walk that
+        # system's entire root - potentially hundreds of gigabytes - to size a
+        # copy it was never going to make.
+        is_sowa_root / \
+            || die "this is not a Sowa system, so there is no live root to copy; use --from-tarball TARBALL to install from a rootfs tarball"
+    fi
+
+    if ! is_mount_point "${destination}"; then
+        warn "${destination} is not a mount point; the copy will land on the filesystem that already holds it"
+    fi
+
+    local source_mib=""
+    [[ -n "${tarball}" ]] && source_mib="$(tarball_root_mib "${tarball}")"
+
+    check_space "${destination}" "${source_mib}"
+    confirm "${destination}" "$(destination_entries "${destination}")" "${tarball}"
+
+    # Asked before the copy and applied after it: the copy takes minutes, and a
+    # question waiting at the end of them is a question nobody is there for. The
+    # declaration and the assignment are separate on purpose - see
+    # prompt_root_password, whose exit status "local password=$(...)" would eat.
+    local root_password="${SOWA_BOOTSTRAP_ROOT_PASSWORD:-}"
+    if will_ask_for_password; then
+        printf '\n'
+        root_password="$(prompt_root_password)"
+        [[ -n "${root_password}" ]] \
+            || warn "no root password set; the installed system's console will let root in without one"
+    elif [[ -z "${root_password}" ]]; then
+        warn "no root password set; set one with '${SOWA_INSTALL_CHROOT_COMMAND:-sowa-chroot} ${destination} passwd' or after the first boot"
+    fi
+
+    if [[ -n "${tarball}" ]]; then
+        log "extracting ${tarball} into ${destination} (this can take a while)"
+        extract_rootfs_tarball "${tarball}" "${destination}"
+        is_sowa_root "${destination}" \
+            || die "${tarball} does not contain a Sowa system"
+    else
+        log "copying the system into ${destination} (this can take a while)"
+        copy_system "${destination}"
+    fi
+    reset_host_keys "${destination}"
+    create_mount_points "${destination}"
+
+    # Written over whatever the copy brought, which is the point: an fstab that
+    # came from a running installation names that machine's disks, and one that
+    # came from the image or a tarball does not exist at all - the live system
+    # ships none, because its root is a squashfs the kernel command line found.
+    # Either way the file describing this layout is the one to have, and
+    # --no-fstab is there for the operator who has already written it.
+    local fstab_written=0
+    if (( write_fstab == 1 )) && is_mount_point "${destination}"; then
+        log "writing /etc/fstab from the filesystems mounted under ${destination}"
+        generate_fstab "${destination}"
+        fstab_written=1
+    fi
+
+    if [[ -n "${SOWA_BOOTSTRAP_HOSTNAME:-}" ]]; then
+        set_target_hostname "${destination}" "${SOWA_BOOTSTRAP_HOSTNAME}"
+    fi
+    if [[ -n "${root_password}" ]]; then
+        log "setting the root password"
+        set_target_root_password "${destination}" "${root_password}"
+    fi
+
+    sync
+    [[ "${SOWA_BOOTSTRAP_QUIET:-}" == 1 ]] || next_steps "${destination}" "${fstab_written}"
+}
+
+main "$@"

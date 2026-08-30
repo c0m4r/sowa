@@ -1,0 +1,6 @@
+# The monitor ships off by default: installing a telemetry service does not
+# decide who may see the machine. An administrator first places authenticated
+# TLS nginx in front of its Unix socket, then enables and starts it explicitly.
+post-upgrade|service-restart|sowa-monitor
+pre-remove|service-stop|sowa-monitor
+pre-remove|service-disable|sowa-monitor

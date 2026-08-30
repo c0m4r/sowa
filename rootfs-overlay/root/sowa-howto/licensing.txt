@@ -1,0 +1,85 @@
+Licensing
+=========
+
+This system is a small amount of Sowa's own code wrapped around some eighty
+upstream projects. Four packages are Sowa's work - sowa-init, sowa-release,
+custom-installers and the optional sowa-monitor - and all are
+GPL-3.0-or-later, as is the build system that produced the image. Everything
+else belongs to the people who wrote it, is compiled from unmodified upstream
+sources, and is shipped under their terms.
+
+sowa-license is how the machine says which is which. The full reference is
+"man sowa-license"; this is the part worth reading first.
+
+    sowa-license                  what this system as a whole is under
+    sowa-license sowa             the parts Sowa itself wrote
+    sowa-license list             every package, its copyright, licence and class
+    sowa-license list --available the same for what the repository offers
+    sowa-license show gcc         the full text gcc ships
+    sowa-license gcc              the same thing
+    sowa-license files gcc        just the paths
+
+None of it touches the network and none of it needs root: what a system is
+licensed under is something it should be able to state about itself while
+offline and while logged in as anybody.
+
+The class is local and applies to the complete SPDX expression a package
+ships: osi-approved means every applicable licence is OSI-approved; foss means
+free and open source but not OSI-approved; foss-mixed means both kinds apply;
+and source-available-non-free means source-available terms that are not free.
+New, unreviewed identifiers are conservatively shown as
+source-available-non-free.
+
+The texts themselves
+--------------------
+
+Every package installs the licences it was given to you under into
+
+    /usr/share/licenses/<package>/
+
+They are ordinary files the package owns, which means they behave like the rest
+of it:
+
+    sowa-pkg files bash | grep licenses    # they are in the manifest
+    sowa-pkg owns /usr/share/licenses/bash/COPYING
+    sowa-pkg verify bash                   # they are checked by SHA-256
+
+and they are removed when the package is. A package that carried no licence
+would not have been published: the build refuses one, and so does "make
+packages".
+
+The texts are the ones that came in the upstream tarball the package was built
+from, copied out of it unchanged - not a copy kept somewhere in Sowa and
+allowed to drift. Where a package is several upstream projects in one - GnuPG
+is eight tarballs, git links a static PCRE2 - every one of their licences is in
+that directory, under a name saying which project it came from.
+
+Reading a licence expression
+----------------------------
+
+What "sowa-pkg info" and "sowa-license list" print is an SPDX expression:
+
+    GPL-3.0-or-later                       one licence
+    BSD-3-Clause OR GPL-2.0-only           either, at your choice
+    ISC AND GPL-2.0-or-later               both, to different files
+    GPL-2.0-only WITH Linux-syscall-note   a licence and its exception
+
+An AND is not a choice. It means the package carries files under each of those
+licences and all of them apply; the licence directory has a text for each.
+
+The summary counts identifiers rather than packages, so a package under several
+licences appears under each of them. That is the honest count of what is on the
+machine, not of how many packages there are.
+
+Redistributing this system
+--------------------------
+
+If you pass on an image, a disk, or a container built from this: the licences
+are already in it, at /usr/share/licenses, which is what most of them require.
+The corresponding sources are pinned by URL and SHA-256 in the build system's
+config/sources.lock, and every package records the exact upstream version it
+was built from.
+
+Sowa's own parts are GPL-3.0-or-later. The text is at
+
+    /usr/share/licenses/sowa-release/LICENSE

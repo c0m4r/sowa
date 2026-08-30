@@ -1,0 +1,51 @@
+Compressed swap in RAM
+======================
+
+zram is a block device whose contents are kept compressed in memory. The
+machine swaps to it, so pages it is not using stop taking a page each and start
+taking about a third of one. Nothing leaves RAM, and no disk is involved - which
+is the point on the live medium, whose root is a tmpfs and whose "disk" is a
+read-only ISO.
+
+It is on from boot, first service up and last down:
+
+    service zram status     # what it holds, and what that cost
+    free -m                 # the Swap line is this
+    zramctl                 # DATA is uncompressed, COMPR is what it takes
+    swapon --show
+
+The default is a device that will accept uncompressed data up to half the
+machine's memory, compressed with zstd, at swap priority 100. Because that is a
+ceiling and not a reservation, an idle machine gives up nothing for it.
+
+Changing it is /etc/sowa/zram.conf - size, compressor, priority, and the
+swappiness the kernel runs with while the service is up - and then:
+
+    service zram restart
+
+Turning it off for good:
+
+    chkconfig zram off      # not at the next boot
+    service zram stop       # nor now
+
+"service zram stop" has to read every page on the device back into memory
+before the device can go, so on a machine that is short of memory it is the one
+command here that can fail. It says so and leaves the swap where it is; nothing
+is lost, since the pages were never anywhere else.
+
+A disk swap partition is the other kind and the two coexist. Put it in
+/etc/fstab in the ordinary way:
+
+    /dev/sda2    none    swap    sw    0 0
+
+rc.sysinit runs "swapon -a" after it mounts /etc/fstab, so that is all it takes.
+zram holds the higher priority, so it is filled first and the disk only takes
+the overflow.
+
+The kernel is built with zstd, lzo and lzo-rle;
+/sys/block/zram0/comp_algorithm lists what this one has and marks the one in
+use. zstd is the default because the thing it is being compared against is a
+disk that is not there.
+
+See also: man zram.conf, services.txt for chkconfig and service, and
+installing.txt for the fstab an installed system gets.

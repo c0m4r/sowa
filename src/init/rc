@@ -1,0 +1,68 @@
+#!/bin/bash
+#
+# /etc/rc.d/rc - the runlevel driver.
+#
+# init runs this from the "l<N>" inittab entries and waits for it. It stops the
+# services the runlevel being entered says to stop, then starts the ones it says
+# to start, in the order the two-digit prefixes give.
+#
+# What "already running" means is the System V lock file: a service that
+# started leaves one in /run/lock/subsys, so entering a runlevel twice does not
+# start anything twice, and a K link for a service that was never running is a
+# no-op rather than a spurious "stopping".
+
+set -u
+
+runlevel="${1:-${RUNLEVEL:-}}"
+previous="${PREVLEVEL:-N}"
+rc_directory="/etc/rc.d/rc${runlevel}.d"
+subsys_dir=/run/lock/subsys
+
+[[ -n "${runlevel}" ]] || exit 1
+mkdir -p "${subsys_dir}"
+
+# For read_uptime_cs and timing_emit: the pass as a whole is timed the same way
+# the services in it are, so that "the runlevel took this long" and "the
+# services in it took this much of it" are the same kind of number and can be
+# subtracted. Nothing else in this file uses the library, and sourcing it has no
+# effect beyond defining functions.
+pass_began=""
+if [[ -r /etc/rc.d/init.d/functions ]]; then
+    # The library is this directory's own functions file, installed at the path
+    # below by stage packages/init; SCRIPTDIR is what lets shellcheck find it
+    # from wherever the lint runs rather than only from here.
+    # shellcheck source-path=SCRIPTDIR
+    # shellcheck source=functions
+    . /etc/rc.d/init.d/functions
+    read_uptime_cs && pass_began="${uptime_cs}"
+fi
+
+if [[ ! -d "${rc_directory}" ]]; then
+    printf 'rc: no %s; nothing to do for runlevel %s\n' "${rc_directory}" \
+        "${runlevel}"
+    exit 0
+fi
+
+printf '\nEntering runlevel %s (from %s)\n\n' "${runlevel}" "${previous}"
+
+for script in "${rc_directory}"/K*; do
+    [[ -x "${script}" ]] || continue
+    service="${script##*/K??}"
+    [[ -f "${subsys_dir}/${service}" ]] || continue
+    "${script}" stop
+done
+
+for script in "${rc_directory}"/S*; do
+    [[ -x "${script}" ]] || continue
+    service="${script##*/S??}"
+    [[ -f "${subsys_dir}/${service}" ]] && continue
+    "${script}" start
+done
+
+# The pass is recorded last, so its line sits after the services it ran in both
+# timing files and sowa-boottime(8) can print it as the total it is.
+if [[ -n "${pass_began}" ]]; then
+    timing_emit "${pass_began}" ok "Runlevel ${runlevel}" || true
+fi
+
+exit 0

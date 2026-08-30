@@ -1,0 +1,170 @@
+#!/bin/bash
+#
+# chkconfig: - 44 56
+# description: WireGuard interfaces, one for each /etc/wireguard/*.conf
+#
+# Off by default, like the openvpn service and for the same reason: the image
+# ships no interfaces, and a machine that wants one says so:
+#
+#     chkconfig wg-quick on
+#
+# What it manages is one WireGuard interface per configuration file in
+# /etc/wireguard, named after the file: /etc/wireguard/wg0.conf is the
+# interface wg0. A single interface can be brought up, taken down or asked
+# about on its own by naming it - "service wg-quick restart wg0" - and any
+# action with no name applies to all of them.
+#
+# There is no daemon here at all. WireGuard is in the kernel, and wg-quick
+# applies a configuration and exits, so there is no pid to track: the subsystem
+# lock is what records that an interface was brought up and can be taken down
+# again. That makes this script much more like the network service than like
+# sshd or openvpn.
+#
+# What wg-quick has to say goes to /var/log/wg-quick.log; "wg show" is the live
+# view, and it is what "status" prints.
+
+. /etc/rc.d/init.d/functions
+
+name=wg-quick
+program=/usr/bin/wg-quick
+config_dir=/etc/wireguard
+logfile=/var/log/wg-quick.log
+
+# The interfaces this script manages, in the order the shell sorts their files.
+interfaces() {
+    local config
+
+    for config in "${config_dir}"/*.conf; do
+        [[ -f "${config}" ]] || continue
+        config="${config##*/}"
+        printf '%s\n' "${config%.conf}"
+    done
+}
+
+# Fills "chosen" with the interfaces an action applies to: the ones named on
+# the command line, or all of them. A name with no configuration behind it is
+# an error, not a silent no-op.
+chosen=()
+resolve_interfaces() {
+    local interface
+
+    chosen=()
+    if [[ $# -eq 0 ]]; then
+        while IFS= read -r interface; do
+            chosen+=("${interface}")
+        done < <(interfaces)
+        return 0
+    fi
+    for interface in "$@"; do
+        if [[ ! -f "${config_dir}/${interface}.conf" ]]; then
+            printf '%s: no such interface: %s.conf is not in %s\n' \
+                "${name}" "${interface}" "${config_dir}" >&2
+            return 1
+        fi
+        chosen+=("${interface}")
+    done
+}
+
+start() {
+    local interface
+    local started=0
+    local outcome=0
+
+    resolve_interfaces "$@" || return 1
+    if [[ "${#chosen[@]}" -eq 0 ]]; then
+        printf 'No interfaces are configured in %s; nothing to bring up.\n' \
+            "${config_dir}"
+        return 0
+    fi
+    for interface in "${chosen[@]}"; do
+        begin "Bringing up WireGuard interface ${interface}"
+        if subsys_marked "${name}-${interface}"; then
+            skipped
+            started=1
+            continue
+        fi
+        if "${program}" up "${interface}" >> "${logfile}" 2>&1; then
+            subsys_mark "${name}-${interface}"
+            started=1
+            ok
+        else
+            failed
+            outcome=1
+        fi
+    done
+    [[ "${started}" -eq 1 ]] && subsys_mark "${name}"
+    return "${outcome}"
+}
+
+stop() {
+    local interface
+    local down_status
+    local outcome=0
+
+    resolve_interfaces "$@" || return 1
+    for interface in "${chosen[@]}"; do
+        begin "Taking down WireGuard interface ${interface}"
+        if ! subsys_marked "${name}-${interface}"; then
+            skipped
+            continue
+        fi
+        # The lock is cleared whether or not that worked. "wg-quick down"
+        # fails when the interface is already gone - somebody ran "ip link
+        # delete" - and a lock left behind for an interface that is not there
+        # is one this script would never try to take down again.
+        "${program}" down "${interface}" >> "${logfile}" 2>&1
+        down_status=$?
+        subsys_clear "${name}-${interface}"
+        result "${down_status}" || outcome=1
+    done
+    while IFS= read -r interface; do
+        subsys_marked "${name}-${interface}" && return "${outcome}"
+    done < <(interfaces)
+    subsys_clear "${name}"
+    return "${outcome}"
+}
+
+report() {
+    local interface
+    local outcome=3
+
+    resolve_interfaces "$@" || return 1
+    if [[ "${#chosen[@]}" -eq 0 ]]; then
+        printf 'No interfaces are configured in %s.\n' "${config_dir}"
+        return 3
+    fi
+    for interface in "${chosen[@]}"; do
+        # "wg show" answers from the kernel rather than from a lock file, so
+        # this is the state of the tunnel itself: the peers, their endpoints,
+        # and how long ago each one was last heard from.
+        if wg show "${interface}" 2>/dev/null; then
+            outcome=0
+        else
+            printf 'interface %s is not up\n' "${interface}"
+        fi
+    done
+    return "${outcome}"
+}
+
+action="${1:-}"
+shift || true
+
+case "${action}" in
+    start)
+        start "$@"
+        ;;
+    stop)
+        stop "$@"
+        ;;
+    restart)
+        stop "$@"
+        start "$@"
+        ;;
+    status)
+        report "$@"
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|status} [INTERFACE...]\n' "$0" >&2
+        exit 2
+        ;;
+esac

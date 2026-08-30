@@ -1,0 +1,32 @@
+# Put this inside nginx's http {} block. Replace the server name, certificate
+# paths and password file before enabling it. The dashboard reports host data;
+# it should not be anonymously exposed to the Internet.
+upstream sowa_monitor {
+    server unix:/run/sowa-monitor/sowa-monitor.sock;
+    keepalive 4;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name monitor.example.invalid;
+
+    ssl_certificate     /etc/nginx/tls/monitor.crt;
+    ssl_certificate_key /etc/nginx/tls/monitor.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    auth_basic "Sowa monitor";
+    auth_basic_user_file /etc/nginx/sowa-monitor.htpasswd;
+
+    location / {
+        limit_except GET HEAD { deny all; }
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://sowa_monitor;
+    }
+}

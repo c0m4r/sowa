@@ -1,0 +1,139 @@
+.Dd August 17, 2026
+.Dt SOWA-CHROOT 8
+.Os Sowa
+.Sh NAME
+.Nm sowa-chroot
+.Nd enter an installed Sowa system with its kernel filesystems in place
+.Sh SYNOPSIS
+.Nm
+.Ar destination
+.Op Ar command Op Ar argument ...
+.Sh DESCRIPTION
+.Xr chroot 8
+alone changes the root directory and nothing else, which leaves the new root
+without
+.Pa /proc ,
+.Pa /sys
+or
+.Pa /dev .
+Almost everything worth running in there needs at least one of them:
+.Xr grub-install 8
+reads
+.Pa /sys
+and
+.Pa /dev
+to find the disk it is being pointed at,
+.Xr sowa-pkg 8
+wants
+.Pa /dev/urandom ,
+and
+.Xr ps 1
+and
+.Xr mount 8
+read
+.Pa /proc .
+.Pp
+.Nm
+mounts the four of them, runs a shell - or the command given after the
+destination - and unmounts them again on the way out, in reverse order and
+whether the shell exited cleanly or not.
+A filesystem something inside is still holding is detached lazily rather than
+left bind-mounted under a directory forever.
+.Pp
+With no
+.Ar command
+it runs
+.Ic /bin/bash -l ,
+so the shell reads
+.Pa /etc/profile
+and the
+.Ev PATH
+and prompt inside the chroot are its own.
+With a command, it runs that one and leaves.
+The exit status is the command's.
+.Pp
+What is mounted, and why each is what it is:
+.Bl -tag -width /dev -offset indent
+.It Pa /proc , Pa /sys
+mounted fresh rather than bound.
+They are the same filesystem wherever they appear and a second mount costs
+nothing.
+.It Pa /dev
+bound recursively from the host, and made a slave mount.
+A fresh devtmpfs would carry the device nodes but not
+.Pa /dev/pts ,
+which is a separate filesystem mounted over it, and without a pty there is no
+job control in the chroot's shell.
+The slave marking is what keeps the recursive unmount from propagating back out
+and taking the host's
+.Pa /dev/pts
+with it.
+.It Pa /run
+a tmpfs of its own, not a bind.
+.Pa /run
+holds the state of the processes running
+.Em now ,
+and the chroot's are not those.
+This is also what the installed system gets from
+.Pa rc.sysinit
+at boot, so anything run in here sees the
+.Pa /run
+it would see for real.
+.It Pa /sys/firmware/efi/efivars
+only when the host itself booted UEFI, and only because
+.Xr grub-install 8
+writes an NVRAM boot entry through it.
+.El
+.Sh OPTIONS
+.Bl -tag -width "-h, --help"
+.It Fl h , Fl -help
+Print usage and exit.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width SOWA_INSTALL_LIB
+.It Ev SOWA_INSTALL_LIB
+Where to find
+.Pa install-functions .
+The default is
+.Pa /usr/lib/sowa .
+.It Ev SOWA_INSTALL_IGNORE_KERNEL
+Set to 1 to run on a kernel older than 6.1 anyway; see
+.Xr sowa-bootstrap 8 .
+.El
+.Sh EXIT STATUS
+The exit status is the command's, or the shell's.
+.Nm
+itself exits 1 when it will not enter the destination at all.
+.Sh EXAMPLES
+Finish an install from inside it:
+.Bd -literal -offset indent
+sowa-chroot /mnt
+.Ed
+.Pp
+One command, and out again:
+.Bd -literal -offset indent
+sowa-chroot /mnt grub-install --target=i386-pc /dev/sda
+sowa-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
+sowa-chroot /mnt passwd
+.Ed
+.Sh SEE ALSO
+.Xr sowa-bootstrap 8 ,
+.Xr sowa-pkg 8 ,
+.Xr sowa-setup 8
+.Sh CAVEATS
+Must run as root.
+.Pp
+The destination has to hold a Sowa system - what
+.Xr sowa-setup 8
+or
+.Xr sowa-bootstrap 8
+leaves behind - because the alternative is bind-mounting
+.Pa /dev
+over a directory that was a typo.
+It does not have to be a mount point; a tree bootstrapped into a plain
+directory is entered with a warning and nothing more.
+.Pp
+This is a chroot, not a container.
+Everything inside shares the host's kernel, its process table and its network,
+and runs as root over the host's own
+.Pa /dev .

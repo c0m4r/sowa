@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+UV_VERSION="0.12.5"
+UV_TARBALL="uv-x86_64-unknown-linux-gnu.tar.gz"
+UV_URL="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_TARBALL}"
+UV_SHA256="68a509da24b06b4223a1c0175fb5eb5bc79342b76cbeff0cfe51ac3f5b17b6b2"
+
+if [ -f "/tmp/${UV_TARBALL}" ]; then
+	echo "File already downloaded: /tmp/${UV_TARBALL}"
+	printf "Remove existing file and download again? [y/N] "
+	read -r answer
+	case "${answer}" in
+		y|Y|yes|YES)
+			rm -f "/tmp/${UV_TARBALL}"
+			curl -fL -o "/tmp/${UV_TARBALL}" "${UV_URL}"
+			;;
+		*)
+			echo "Keeping existing file."
+			;;
+	esac
+else
+	curl -fL -o "/tmp/${UV_TARBALL}" "${UV_URL}"
+fi
+
+echo "${UV_SHA256}  /tmp/${UV_TARBALL}" | sha256sum -c -
+
+rm -rf /opt/uv
+
+tar -C /opt -xzf "/tmp/${UV_TARBALL}"
+mv "/opt/uv-x86_64-unknown-linux-gnu" /opt/uv
+rm -f "/tmp/${UV_TARBALL}"
+
+ln -sf /opt/uv/uv /usr/bin/uv
+ln -sf /opt/uv/uvx /usr/bin/uvx

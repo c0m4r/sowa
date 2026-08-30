@@ -1,0 +1,92 @@
+Packages
+========
+
+sowa-pkg is the package manager. The full reference is "man sowa-pkg", and
+"man sowa-pkg.conf" is the file that says where the repository is; this is the
+part worth reading first.
+
+    sowa-pkg update              # fetch and verify the index
+    sowa-pkg list                # what is installed, and whether the repository differs
+    sowa-pkg list --available    # what the repository has and this system lacks
+    sowa-pkg install nginx       # it and everything it depends on
+    sowa-pkg upgrade             # everything, or name packages to be specific
+    sowa-pkg remove nginx
+
+Every one of those prints what it is about to do and asks before doing it; -y
+answers in advance, which is what a script wants.
+
+The system is made of the same packages the repository serves - the image and
+the packages are cut from one build - so an installed machine knows what it is
+made of before it has ever reached the repository:
+
+    sowa-pkg owns /usr/bin/dig     # which package a file came from
+    sowa-pkg files bind            # everything that package owns
+    sowa-pkg info bash             # version, size, where it came from
+    sowa-pkg verify                # every file, against its recorded SHA-256
+
+A version says which release a package is; it does not say which build. The
+same upstream version rebuilt against a new OpenSSL has different provenance
+under the same label, so every package also carries a build id derived from its
+contents, recipe, toolchain and dependency identities, and sowa-pkg compares
+that as well:
+
+    curl               rebuild 8.21.0-1 (3f9c1a04be77)
+
+That is what makes "sowa-pkg upgrade" converge this machine onto what the
+repository is actually publishing, rather than onto what it says it is.
+
+Everything that changes something is recorded in /var/log/sowa-pkg.log: what
+was asked for, the plan, each package that went in or came out with its version
+and build id, every step a package declared, and how the run ended. The
+database says what is installed now; the log says how it got that way.
+
+    tail -n 50 /var/log/sowa-pkg.log
+    grep 'installed openssl' /var/log/sowa-pkg.log
+
+A package is an XZ-compressed tar archive and a repository is a plain HTTPS
+directory: an index, a signature over it, and the archives. The index is signed
+with Ed25519 and pins every archive by SHA-256, so that one signature covers
+the whole repository - and it is the signature, not the transport, that an
+update trusts. A machine without the key in /etc/sowa/keys refuses every index
+rather than accepting an unsigned one.
+
+Nothing is ever written through: an archive is unpacked to one side and its
+files are then renamed into place, so a running program keeps the inode it
+started with and an interrupted install cannot leave half a binary behind. It
+is also why sowa-pkg can upgrade itself while it is running.
+
+Anything under /etc is configuration. A file you have edited is kept, and the
+packaged version is written beside it as <file>.tpknew with a line saying so.
+
+An upgrade also removes what the old version of a package owned and the new one
+no longer ships - unless the file on disk is not the one the package put there.
+Anything you have written over, anywhere, is kept and reported rather than
+taken away with it.
+
+A package cannot ship a post-install script. What it can declare is a hook: an
+event and one of a fixed set of actions sowa-pkg implements itself - start,
+stop or restart a service, enable or disable it at boot, or run a setup program
+the package itself owns. They can be read before anything is installed, and
+declined:
+
+    sowa-pkg hooks               # everything installed packages declare
+    sowa-pkg hooks guix          # for one package
+    sowa-pkg install --no-hooks guix
+
+An install whose files landed but whose steps did not all run exits 2, so
+"sowa-pkg install foo && use-foo" stops rather than using something that was
+never finished being set up.
+
+Two things sowa-pkg does not do: it does not remember which packages were
+installed only as a dependency, so nothing removes them again, and it refuses
+to remove the base system - sowa-base, bash, linux, sowa-init, sowa-release,
+tar and xz. The last two are on that list because every package is an
+XZ-compressed tar archive, so a system without them could never install them
+back.
+
+The same database records what each package is licensed under, which is what
+sowa-license reads - see licensing.txt.
+
+See also: servers.txt and guix.txt for what is in the repository,
+installing.txt for "sowa-pkg --root", which installs into a disk mounted
+somewhere else, and logging.txt for the log above and what rotates it.

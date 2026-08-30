@@ -1,0 +1,20 @@
+# OpenSSH.
+#
+# An upgrade replaces /usr/sbin/sshd by renaming the new one over it, so the
+# listener that is running keeps the inode it started with and goes on serving
+# the old program until something moves it. This is that something - and only if
+# it is running, so a machine that deliberately has sshd stopped keeps it that
+# way.
+#
+# What is restarted is the listener alone: killproc signals the pid in
+# /run/sshd.pid, and the per-session sshd processes are not it. Upgrading
+# OpenSSH over an SSH connection therefore does not end the connection, and
+# neither does removing the package - which is the only reason stopping it here
+# is safe to do without asking.
+post-upgrade|service-restart|sshd
+# Removing the program does not stop the daemon: an unlinked binary keeps
+# running. Without this, "sowa-pkg remove openssh" leaves a listener on port 22
+# serving a program that is no longer on the disk, and rc links that make the
+# next boot try to start it.
+pre-remove|service-stop|sshd
+pre-remove|service-disable|sshd

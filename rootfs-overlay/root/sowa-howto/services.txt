@@ -1,0 +1,62 @@
+Services and runlevels
+======================
+
+PID 1 is sowa-init, System V style. The default runlevel is 3, where zram, the
+network, chronyd, sshd and crond start in that order; /etc/inittab says so, and
+/etc/rc.d/rc3.d is where the links that do it live.
+
+    runlevel                    # previous and current
+    service --status-all
+    service sshd restart
+    chkconfig --list
+    chkconfig crond off         # and not at the next boot either
+    telinit 1                   # stop the services, keep the console
+    telinit 3                   # start them again
+    shutdown -r +5 "message"    # reboot in five minutes; -c cancels it
+    poweroff
+
+The two commands do different jobs and are deliberately separate: service acts
+on the machine as it is now, chkconfig on what the next boot does. Turning a
+service on and starting it is both of them.
+
+A service of your own is an init script in /etc/rc.d/init.d that sources
+/etc/rc.d/init.d/functions and carries a chkconfig header saying which
+runlevels it belongs in:
+
+    # chkconfig: 2345 60 40
+    # description: what the service is
+
+Copy /etc/rc.d/init.d/crond, which is the shortest complete one, then
+"chkconfig --add yourservice". Services are kept in the foreground under the
+daemon helper and their output is appended to /var/log/<name>.log - that is
+what a service says on its own account, and it is separate from what syslog-ng
+collects from everything that calls syslog(3). See logging.txt for both.
+
+A package that has a daemon brings its own init script - nginx and haproxy both
+do - and ships it switched off, so installing one never starts a listener
+nobody asked for. "chkconfig NAME on" is the whole of that decision, and
+"sowa-pkg hooks NAME" prints what the package does on its own account: an
+upgrade restarts a daemon that is running, and a removal stops it and takes its
+runlevel links away before the files go.
+
+Nothing respawns a service that dies - that is what System V init is - but the
+console login is a respawn entry in /etc/inittab and does come back. Booting
+with "single" on the kernel command line stops at runlevel S: everything
+mounted, nothing started, a root shell here.
+
+Every one of those actions is timed as it runs, so "why did that take so long"
+has an answer rather than an opinion:
+
+    sowa-boottime               # this boot, service by service
+    sowa-boottime --history     # one line per boot: startup, shutdown, failures
+    sowa-boottime --slowest 5   # the worst actions on record, any boot
+
+The records are /run/sowa/timing for this boot and
+/var/log/service-timing.log for every boot the machine has had - which is the
+one with the shutdowns in it, since /run does not survive one. A service of
+your own is timed too, without doing anything: it comes with begin() and ok()
+from the function library.
+
+The reference for all of it is on the machine: man service, man chkconfig,
+man init, man 5 inittab, man shutdown, man telinit, man runlevel,
+man sowa-boottime.

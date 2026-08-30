@@ -1,0 +1,72 @@
+#!/bin/bash
+#
+# chkconfig: 2345 05 95
+# description: syslog-ng, the system logger
+#
+# Fifth in, ninety-fifth out, which is as early and as late as a service can
+# usefully be here. Everything after it in the start order may have something
+# to say while it is starting, and everything before it in the stop order may
+# have something to say while it is stopping; a logger that came up after the
+# network or went down before it would miss exactly the messages worth having.
+# Only zram is earlier, because swap has to exist before anything allocates.
+#
+# -F keeps the daemon in the foreground, which is what the rc framework's
+# daemon helper supervises and what lets it own the pid file. --stderr sends
+# syslog-ng's own complaints - a configuration it cannot parse, a socket it
+# cannot bind - to the helper, which appends them to /var/log/syslog-ng.log.
+# That file is deliberately not one of the ones syslog-ng itself writes: a
+# daemon that cannot start cannot log its own failure through itself.
+
+. /etc/rc.d/init.d/functions
+
+name=syslog-ng
+program=/usr/sbin/syslog-ng
+pidfile=/run/syslog-ng.pid
+logfile=/var/log/syslog-ng.log
+
+start() {
+    begin "Starting ${name}"
+    # A configuration error takes the daemon down a second after it starts,
+    # and the rc framework would report that start as a success. Syntax is
+    # checked first so the failure is reported where it happened.
+    if ! "${program}" --syntax-only >> "${logfile}" 2>&1; then
+        failed
+        return 1
+    fi
+    daemon --pidfile "${pidfile}" --log "${logfile}" -- \
+        "${program}" -F --stderr --no-caps
+    result $?
+}
+
+stop() {
+    begin "Stopping ${name}"
+    killproc --pidfile "${pidfile}" "${program}"
+    result $?
+}
+
+case "${1:-}" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    reload)
+        # syslog-ng rereads its configuration on SIGHUP and keeps the
+        # destinations it already has open.
+        begin "Reloading ${name}"
+        killproc --pidfile "${pidfile}" --signal HUP "${program}"
+        result $?
+        ;;
+    status)
+        status --pidfile "${pidfile}" "${program}"
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|reload|status}\n' "$0" >&2
+        exit 2
+        ;;
+esac

@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+
+NODE_VERSION="24.19.0"
+NODE_TARBALL="node-v${NODE_VERSION}-linux-x64.tar.xz"
+NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/${NODE_TARBALL}"
+NODE_SHA256="14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647"
+
+if [ -f "/tmp/${NODE_TARBALL}" ]; then
+	echo "File already downloaded: /tmp/${NODE_TARBALL}"
+	printf "Remove existing file and download again? [y/N] "
+	read -r answer
+	case "${answer}" in
+		y|Y|yes|YES)
+			rm -f "/tmp/${NODE_TARBALL}"
+			curl -fL -o "/tmp/${NODE_TARBALL}" "${NODE_URL}"
+			;;
+		*)
+			echo "Keeping existing file."
+			;;
+	esac
+else
+	curl -fL -o "/tmp/${NODE_TARBALL}" "${NODE_URL}"
+fi
+
+echo "${NODE_SHA256}  /tmp/${NODE_TARBALL}" | sha256sum -c -
+
+rm -rf /opt/node
+
+tar -C /opt -xJf "/tmp/${NODE_TARBALL}"
+mv "/opt/node-v${NODE_VERSION}-linux-x64" /opt/node
+rm -f "/tmp/${NODE_TARBALL}"
+
+ln -sf /opt/node/bin/node /usr/bin/node
+ln -sf /opt/node/bin/npm /usr/bin/npm
+ln -sf /opt/node/bin/npx /usr/bin/npx

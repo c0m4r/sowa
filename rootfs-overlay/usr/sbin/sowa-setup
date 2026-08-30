@@ -1,0 +1,545 @@
+#!/bin/bash
+#
+# sowa-setup - install Sowa from the live environment onto a disk.
+#
+# Booted from the ISO, Sowa's root filesystem is a read-only squashfs on the
+# medium with a tmpfs overlaid on it. This script lays that root filesystem
+# down onto a target disk and installs GRUB so the machine
+# boots Sowa on its own, on both legacy BIOS and UEFI firmware. What is copied
+# is the merged view, so anything changed since boot is copied as it is now.
+#
+# MBR and GPT partition tables are supported, as are ext4, XFS and Btrfs roots.
+# GPT gets a BIOS Boot Partition; MBR reserves the post-MBR gap. The UEFI image
+# is installed to the ESP in removable mode (EFI/BOOT/BOOTX64.EFI), so no
+# firmware NVRAM entry is required. The installed system boots the on-disk
+# kernel directly with root=PARTUUID=..., with no separate initramfs.
+#
+# Interactive by default: it asks which disk, confirms the erase, and asks for
+# the root password the installed system will have. For unattended use set:
+#   SOWA_SETUP_DISK           target device, e.g. /dev/sda (skips the menu)
+#   SOWA_SETUP_ASSUME_YES=1   skip the destructive-wipe confirmation and the
+#                             root password prompt
+#   SOWA_SETUP_ROOT_PASSWORD  set the installed root password without being
+#                             asked (default: ask; unattended: none)
+#   SOWA_SETUP_ESP_SIZE_MB    ESP size in MiB (default 512)
+#   SOWA_SETUP_HOSTNAME       hostname for the installed system
+#   SOWA_SETUP_PARTITION_TABLE  mbr or gpt (default mbr)
+#   SOWA_SETUP_ROOT_FILESYSTEM  ext4, xfs or btrfs (default ext4; brfs alias)
+#   SOWA_SETUP_NIC_CONFIG_FILE  complete nic.conf to install, or use the
+#                               guided SOWA_SETUP_NIC_* variables documented
+#                               in sowa-setup(8)
+
+set -Eeuo pipefail
+
+TARGET_MNT=/mnt
+ESP_SIZE_MB="${SOWA_SETUP_ESP_SIZE_MB:-512}"
+PARTITION_TABLE="${SOWA_SETUP_PARTITION_TABLE:-}"
+ROOT_FILESYSTEM="${SOWA_SETUP_ROOT_FILESYSTEM:-}"
+NIC_MODE="${SOWA_SETUP_NIC_MODE:-}"
+NIC_INTERFACE="${SOWA_SETUP_NIC_INTERFACE:-}"
+NIC_ADDRESS="${SOWA_SETUP_NIC_ADDRESS:-}"
+NIC_GATEWAY="${SOWA_SETUP_NIC_GATEWAY:-}"
+NIC_DNS="${SOWA_SETUP_NIC_DNS:-}"
+NIC_CONFIG_SOURCE="${SOWA_SETUP_NIC_CONFIG_FILE:-}"
+GENERATED_NIC_CONFIG=""
+# A directory rather than a bare file, because the generated configuration ends
+# with "include nic.d/*.conf" and is validated before it is installed: nic
+# resolves that relative to the file it is reading, so the check has to be run
+# against the same shape the installed system will have.
+GENERATED_NIC_DIR=""
+# The root filesystem has to be built with -O, so this has to be e2fsprogs'
+# mkfs.ext4 and nothing else. It is named by path rather than resolved through
+# PATH, where an installed system may since have grown something else.
+MKFS_EXT4=/usr/sbin/mkfs.ext4
+MKFS_XFS=/usr/sbin/mkfs.xfs
+MKFS_BTRFS=/usr/sbin/mkfs.btrfs
+
+# Everything that writes the live root onto a mounted filesystem is shared with
+# sowa-bootstrap and sowa-chroot; this script is the part that gets a disk into
+# a state where that can happen, and the part that makes the result bootable.
+# shellcheck source=../lib/sowa/install-functions
+source "${SOWA_INSTALL_LIB:-/usr/lib/sowa}/install-functions"
+
+cleanup() {
+    umount "${TARGET_MNT}/boot/efi" 2>/dev/null || true
+    umount "${TARGET_MNT}" 2>/dev/null || true
+    [[ -z "${GENERATED_NIC_DIR}" ]] || rm -rf "${GENERATED_NIC_DIR}"
+}
+trap cleanup EXIT
+
+# Everything the install needs whatever it is asked for, checked before the
+# first question rather than after: choose_install_options validates a nic
+# configuration with nic itself, so a missing nic has to be reported as a
+# missing tool here and not as an invalid configuration there.
+require_tools() {
+    local missing=()
+    mapfile -t missing < <(missing_tools sfdisk mkfs.fat grub-install blockdev \
+        tar dd du lsblk mknod mktemp mount umount sync seq awk findmnt install nic)
+    # openssl hashes the root password. An install that was told one cannot go
+    # ahead without it; an install that would have asked for one drops the
+    # question instead, which will_ask_for_password answers by looking for the
+    # same program.
+    if [[ -n "${SOWA_SETUP_ROOT_PASSWORD:-}" ]]; then
+        command -v openssl >/dev/null 2>&1 || missing+=(openssl)
+    fi
+    ((${#missing[@]} == 0)) || die "missing required tools: ${missing[*]}"
+}
+
+# The one tool that cannot be checked until the root filesystem has been chosen.
+# Checked by path, not by name, so the selected implementation cannot be
+# shadowed by a different program earlier on PATH.
+require_root_filesystem_tool() {
+    case "${ROOT_FILESYSTEM}" in
+        ext4) [[ -x "${MKFS_EXT4}" ]] || die "missing required tools: ${MKFS_EXT4} (e2fsprogs)" ;;
+        xfs) [[ -x "${MKFS_XFS}" ]] || die "missing required tools: ${MKFS_XFS} (xfsprogs)" ;;
+        btrfs) [[ -x "${MKFS_BTRFS}" ]] || die "missing required tools: ${MKFS_BTRFS} (btrfs-progs)" ;;
+    esac
+}
+
+is_interactive() {
+    [[ "${SOWA_SETUP_ASSUME_YES:-}" != 1 && -t 0 ]]
+}
+
+default_interface() {
+    local interface=""
+    if command -v ip >/dev/null 2>&1; then
+        interface="$(ip -o route show default 2>/dev/null \
+            | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')"
+    fi
+    if [[ -z "${interface}" ]]; then
+        local path
+        for path in /sys/class/net/*; do
+            [[ -e "${path}" ]] || continue
+            interface="${path##*/}"
+            [[ "${interface}" == lo ]] || break
+            interface=""
+        done
+    fi
+    printf '%s\n' "${interface:-eth0}"
+}
+
+choose_install_options() {
+    local answer=""
+    if [[ -z "${PARTITION_TABLE}" ]]; then
+        if is_interactive; then
+            printf 'Partition table [mbr/gpt] (mbr): '
+            read -r answer
+            PARTITION_TABLE="${answer:-mbr}"
+        else
+            PARTITION_TABLE=mbr
+        fi
+    fi
+    PARTITION_TABLE="${PARTITION_TABLE,,}"
+    [[ "${PARTITION_TABLE}" == dos ]] && PARTITION_TABLE=mbr
+    case "${PARTITION_TABLE}" in
+        mbr|gpt) ;;
+        *) die "SOWA_SETUP_PARTITION_TABLE must be mbr or gpt" ;;
+    esac
+
+    if [[ -z "${ROOT_FILESYSTEM}" ]]; then
+        if is_interactive; then
+            printf 'Root filesystem [ext4/xfs/btrfs] (ext4): '
+            read -r answer
+            ROOT_FILESYSTEM="${answer:-ext4}"
+        else
+            ROOT_FILESYSTEM=ext4
+        fi
+    fi
+    ROOT_FILESYSTEM="${ROOT_FILESYSTEM,,}"
+    # "brfs" is accepted as a compatibility spelling for the filesystem whose
+    # actual name and tools are Btrfs/btrfs-progs.
+    [[ "${ROOT_FILESYSTEM}" == brfs ]] && ROOT_FILESYSTEM=btrfs
+    case "${ROOT_FILESYSTEM}" in
+        ext4|xfs|btrfs) ;;
+        *) die "SOWA_SETUP_ROOT_FILESYSTEM must be ext4, xfs or btrfs" ;;
+    esac
+
+    if [[ -n "${NIC_CONFIG_SOURCE}" && -n "${NIC_MODE}" ]]; then
+        die "set either SOWA_SETUP_NIC_CONFIG_FILE or SOWA_SETUP_NIC_MODE, not both"
+    fi
+    if [[ -n "${NIC_CONFIG_SOURCE}" ]]; then
+        [[ -f "${NIC_CONFIG_SOURCE}" && -r "${NIC_CONFIG_SOURCE}" ]] \
+            || die "cannot read NIC configuration: ${NIC_CONFIG_SOURCE}"
+        nic show --config="${NIC_CONFIG_SOURCE}" >/dev/null \
+            || die "invalid NIC configuration: ${NIC_CONFIG_SOURCE}"
+        return
+    fi
+
+    if [[ -z "${NIC_MODE}" ]]; then
+        if is_interactive; then
+            printf 'NIC configuration [keep/dhcp/static/firewall-only] (keep): '
+            read -r answer
+            NIC_MODE="${answer:-keep}"
+        else
+            NIC_MODE=keep
+        fi
+    fi
+    NIC_MODE="${NIC_MODE,,}"
+    case "${NIC_MODE}" in
+        none|disabled) NIC_MODE=firewall-only ;;
+    esac
+    case "${NIC_MODE}" in
+        keep) return ;;
+        dhcp|static|firewall-only) ;;
+        *) die "SOWA_SETUP_NIC_MODE must be keep, dhcp, static or firewall-only" ;;
+    esac
+
+    if [[ "${NIC_MODE}" == dhcp || "${NIC_MODE}" == static ]]; then
+        if [[ -z "${NIC_INTERFACE}" ]]; then
+            local proposed
+            proposed="$(default_interface)"
+            if is_interactive; then
+                printf 'Network interface (%s): ' "${proposed}"
+                read -r answer
+                NIC_INTERFACE="${answer:-${proposed}}"
+            else
+                NIC_INTERFACE="${proposed}"
+            fi
+        fi
+        [[ "${NIC_INTERFACE}" =~ ^[[:alnum:]_.:-]+$ ]] \
+            || die "SOWA_SETUP_NIC_INTERFACE contains invalid characters"
+    fi
+
+    if [[ "${NIC_MODE}" == static ]]; then
+        if [[ -z "${NIC_ADDRESS}" ]] && is_interactive; then
+            printf 'Static address with prefix (for example 192.0.2.10/24): '
+            read -r NIC_ADDRESS
+        fi
+        [[ -n "${NIC_ADDRESS}" && "${NIC_ADDRESS}" != *[[:space:]]* ]] \
+            || die "SOWA_SETUP_NIC_ADDRESS is required for static mode"
+        if [[ -z "${NIC_GATEWAY}" ]] && is_interactive; then
+            printf 'Default gateway (blank for none): '
+            read -r NIC_GATEWAY
+        fi
+        [[ "${NIC_GATEWAY}" != *[[:space:]]* ]] \
+            || die "SOWA_SETUP_NIC_GATEWAY must be one address"
+        if [[ -z "${NIC_DNS}" ]] && is_interactive; then
+            printf 'DNS servers, separated by spaces (blank to keep current resolvers): '
+            read -r NIC_DNS
+        fi
+    fi
+
+    GENERATED_NIC_DIR="$(mktemp -d)"
+    GENERATED_NIC_CONFIG="${GENERATED_NIC_DIR}/nic.conf"
+    mkdir -p "${GENERATED_NIC_DIR}/nic.d"
+    {
+        printf '# /etc/nic.conf - generated by sowa-setup\n'
+        printf 'iptables /etc/nic.rules.v4\n'
+        printf 'ip6tables /etc/nic.rules.v6\n'
+        if [[ "${NIC_MODE}" == dhcp ]]; then
+            printf 'up %s\ndhcp %s\n' "${NIC_INTERFACE}" "${NIC_INTERFACE}"
+        elif [[ "${NIC_MODE}" == static ]]; then
+            printf 'up %s\nip %s %s\n' \
+                "${NIC_INTERFACE}" "${NIC_ADDRESS}" "${NIC_INTERFACE}"
+            if [[ -n "${NIC_GATEWAY}" ]]; then
+                printf 'route default via %s %s\n' "${NIC_GATEWAY}" "${NIC_INTERFACE}"
+            fi
+            local resolver dns_values
+            local -a resolvers=()
+            dns_values="${NIC_DNS//,/ }"
+            read -r -a resolvers <<< "${dns_values}"
+            for resolver in "${resolvers[@]}"; do
+                printf 'ns %s\n' "${resolver}"
+            done
+        fi
+        # The shipped /etc/nic.conf ends with this and /etc/nic.d exists because
+        # of it. A generated configuration that left it out would take the
+        # drop-in directory away from the installed system without saying so,
+        # and anything put there afterwards would be ignored in silence.
+        printf '\n# Include additional config files (loaded in alphanumeric / natural order)\n'
+        printf 'include nic.d/*.conf\n'
+    } > "${GENERATED_NIC_CONFIG}"
+    chmod 0600 "${GENERATED_NIC_CONFIG}"
+    nic show --config="${GENERATED_NIC_CONFIG}" >/dev/null \
+        || die "the requested NIC settings do not form a valid nic configuration"
+    NIC_CONFIG_SOURCE="${GENERATED_NIC_CONFIG}"
+}
+
+# Whether to ask. A password given in the environment is the answer already, an
+# unattended run has nobody to ask, a stdin that is not a terminal cannot carry
+# the question, and without openssl there is nothing to hash the answer with.
+will_ask_for_password() {
+    [[ -z "${SOWA_SETUP_ROOT_PASSWORD:-}" ]] || return 1
+    [[ "${SOWA_SETUP_ASSUME_YES:-}" != 1 ]] || return 1
+    [[ -t 0 ]] || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+}
+
+list_disks() {
+    # Whole disks only. -d stops lsblk at the top level, and the TYPE filter
+    # drops what is at the top level without being a disk: an optical drive
+    # (rom), a loop device, a device-mapper target. zram reports TYPE=disk
+    # too, but it is RAM-backed and already in use as swap on the live
+    # system, so it is excluded by name rather than by type.
+    lsblk -d -n -o NAME,SIZE,TYPE 2>/dev/null | awk '$3 == "disk" && $1 !~ /^zram[0-9]*$/'
+}
+
+is_whole_disk() {
+    # The same question list_disks answers for every device, asked about one:
+    # a partition reports "part" here, and the caller has already established
+    # that the name is a block device that exists.
+    [[ "$(lsblk -d -n -o TYPE "$1" 2>/dev/null)" == disk ]]
+}
+
+choose_disk() {
+    if [[ -n "${SOWA_SETUP_DISK:-}" ]]; then
+        DISK="${SOWA_SETUP_DISK}"
+        return
+    fi
+    printf 'Available disks:\n'
+    list_disks | awk '{printf "  /dev/%s\t%s\n", $1, $2}'
+    printf 'Target disk (e.g. /dev/sda): '
+    read -r DISK
+}
+
+partition_suffix() {
+    # nvme/mmc devices insert a "p" before the partition number.
+    [[ "$1" =~ [0-9]$ ]] && printf 'p' || printf ''
+}
+
+confirm_wipe() {
+    if [[ "${SOWA_SETUP_ASSUME_YES:-}" == 1 ]]; then
+        return
+    fi
+    printf '\nThis will ERASE ALL DATA on %s and install Sowa.\n' "${DISK}"
+    printf 'Type "yes" to continue: '
+    local answer
+    read -r answer
+    [[ "${answer}" == yes ]] || die "aborted at user request"
+}
+
+main() {
+    require_root
+    require_supported_host_kernel
+    require_tools
+    choose_disk
+    choose_install_options
+    require_root_filesystem_tool
+
+    [[ -b "${DISK}" ]] || die "not a block device: ${DISK}"
+    is_whole_disk "${DISK}" || die "${DISK} is not a whole disk; pass the disk, not a partition"
+    # Not in list_disks, but reachable via SOWA_SETUP_DISK or a hand-typed
+    # answer: zram is RAM-backed and already carrying the live system's swap.
+    [[ "${DISK}" =~ ^/dev/zram[0-9]*$ ]] \
+        && die "${DISK} is zram, a RAM-backed device with nothing to install onto"
+    if grep -q "^${DISK}" /proc/mounts 2>/dev/null; then
+        die "${DISK} has mounted partitions; unmount them first"
+    fi
+    [[ -f /boot/vmlinuz ]] || die "/boot/vmlinuz is missing from the live system"
+    [[ "${ESP_SIZE_MB}" =~ ^[0-9]+$ ]] \
+        || die "SOWA_SETUP_ESP_SIZE_MB must be a whole number of MiB"
+    # mkfs.fat -F32 needs 65525 clusters, which no smaller ESP can provide.
+    [[ "${ESP_SIZE_MB}" -ge 34 ]] || die "the ESP must be at least 34 MiB"
+
+    confirm_wipe
+
+    # Asked here, before the first write, and applied after the copy: the copy
+    # takes minutes and there is nobody to answer a question at the end of them.
+    # The declaration and the assignment are separate on purpose - see
+    # prompt_root_password, whose exit status "local password=$(...)" would eat.
+    local root_password="${SOWA_SETUP_ROOT_PASSWORD:-}"
+    if will_ask_for_password; then
+        printf '\n'
+        root_password="$(prompt_root_password)"
+        [[ -n "${root_password}" ]] \
+            || warn "no root password set; the installed system's console will let root in without one"
+    elif [[ -z "${root_password}" ]]; then
+        warn "no root password set; set one with passwd after the first boot"
+    fi
+
+    local suffix esp root esp_number root_number
+    suffix="$(partition_suffix "${DISK}")"
+    if [[ "${PARTITION_TABLE}" == gpt ]]; then
+        esp_number=2
+        root_number=3
+    else
+        esp_number=1
+        root_number=2
+    fi
+    esp="${DISK}${suffix}${esp_number}"
+    root="${DISK}${suffix}${root_number}"
+
+    local total_sectors esp_start esp_size root_start root_size total_mib tail_size
+    total_sectors="$(blockdev --getsz "${DISK}")"
+    esp_size=$(( ESP_SIZE_MB * 2048 ))
+    tail_size=0
+    if [[ "${PARTITION_TABLE}" == gpt ]]; then
+        # Sector 2048 begins a 1 MiB BIOS Boot Partition. The ESP starts on the
+        # next MiB boundary, and another MiB is left for GPT's backup header and
+        # alignment at the end of the disk.
+        esp_start=4096
+        tail_size=2048
+    else
+        # The first MiB is the embedding area GRUB's i386-pc core uses.
+        esp_start=2048
+    fi
+    root_start=$(( esp_start + esp_size ))
+    root_size=$(( total_sectors - root_start - tail_size ))
+
+    # The whole live root is copied to the target, so size the check against
+    # what it actually occupies plus room for filesystem metadata and operating
+    # headroom; otherwise the copy fails part-way through a disk that passed a
+    # fixed minimum.
+    local live_mib root_mib needed_mib
+    live_mib="$(live_root_mib)"
+    needed_mib=$(( live_mib + live_mib / 2 + 64 ))
+    root_mib=$(( root_size / 2048 ))
+    [[ "${root_mib}" -ge "${needed_mib}" ]] \
+        || die "disk too small; the root partition needs ${needed_mib} MiB for a ${live_mib} MiB system, but only ${root_mib} MiB is left after a ${ESP_SIZE_MB} MiB ESP"
+
+    log "wiping existing signatures on ${DISK}"
+    dd if=/dev/zero of="${DISK}" bs=1M count=1 status=none
+    total_mib=$(( total_sectors / 2048 ))
+    if [[ "${total_mib}" -gt 1 ]]; then
+        dd if=/dev/zero of="${DISK}" bs=1M seek=$(( total_mib - 1 )) count=1 \
+            status=none 2>/dev/null || true
+    fi
+    sync
+
+    log "partitioning ${DISK} (${PARTITION_TABLE}, ESP ${ESP_SIZE_MB} MiB + ${ROOT_FILESYSTEM} root)"
+    if [[ "${PARTITION_TABLE}" == gpt ]]; then
+        printf 'label: gpt\n\nstart=2048, size=2048, type=21686148-6449-6E6F-744E-656564454649, name="BIOS boot"\nstart=%s, size=%s, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="EFI System"\nstart=%s, size=%s, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name="Sowa root"\n' \
+            "${esp_start}" "${esp_size}" "${root_start}" "${root_size}" \
+            | sfdisk --force "${DISK}"
+    else
+        printf 'label: dos\n\nstart=%s, size=%s, type=ef\nstart=%s, size=%s, type=83\n' \
+            "${esp_start}" "${esp_size}" "${root_start}" "${root_size}" \
+            | sfdisk --force "${DISK}"
+
+        # Give every MBR install a stable, non-zero identity. PARTUUID is this
+        # four-byte signature plus the partition number.
+        log "writing a random MBR disk signature"
+        local sig_file
+        sig_file="$(mktemp)"
+        dd if=/dev/urandom of="${sig_file}" bs=4 count=1 status=none
+        dd if="${sig_file}" of="${DISK}" bs=1 seek=440 count=4 conv=notrunc status=none
+        rm -f "${sig_file}"
+    fi
+    sync
+
+    blockdev --rereadpt "${DISK}"
+    for _ in $(seq 1 10); do
+        [[ -b "${esp}" && -b "${root}" ]] && break
+        sleep 1
+    done
+    [[ -b "${esp}" && -b "${root}" ]] \
+        || die "partition device nodes did not appear (${esp}, ${root})"
+
+    # Read identifiers back from the table for both formats. GPT uses partition
+    # GUIDs; DOS uses the disk signature written above and a partition suffix.
+    local root_partuuid="" esp_partuuid=""
+    for _ in $(seq 1 10); do
+        root_partuuid="$(lsblk -n -o PARTUUID "${root}" 2>/dev/null \
+            | awk 'NF {print $1; exit}')"
+        esp_partuuid="$(lsblk -n -o PARTUUID "${esp}" 2>/dev/null \
+            | awk 'NF {print $1; exit}')"
+        [[ -n "${root_partuuid}" && -n "${esp_partuuid}" ]] && break
+        sleep 1
+    done
+    [[ -n "${root_partuuid}" && -n "${esp_partuuid}" ]] \
+        || die "could not read PARTUUIDs for ${esp} and ${root}"
+
+    log "creating filesystems"
+    mkfs.fat -F32 -n SOWA_ESP "${esp}" >/dev/null
+    case "${ROOT_FILESYSTEM}" in
+        ext4)
+            # These features are disabled so GRUB can read /boot directly.
+            "${MKFS_EXT4}" -F -O '^orphan_file,^metadata_csum_seed' \
+                -L sowa-root "${root}" >/dev/null
+            ;;
+        xfs)
+            "${MKFS_XFS}" -f -L sowa-root "${root}" >/dev/null
+            ;;
+        btrfs)
+            "${MKFS_BTRFS}" -f -L sowa-root "${root}" >/dev/null
+            ;;
+    esac
+
+    log "copying the system to ${root} (this can take a while)"
+    mkdir -p "${TARGET_MNT}"
+    mount -t "${ROOT_FILESYSTEM}" "${root}" "${TARGET_MNT}"
+    copy_system "${TARGET_MNT}"
+    reset_host_keys "${TARGET_MNT}"
+    create_mount_points "${TARGET_MNT}"
+
+    # Mount the ESP only after the copy so it does not shadow /mnt/boot.
+    mkdir -p "${TARGET_MNT}/boot/efi"
+    mount -t vfat "${esp}" "${TARGET_MNT}/boot/efi"
+
+    log "writing /etc/fstab"
+    local root_pass=0
+    [[ "${ROOT_FILESYSTEM}" == ext4 ]] && root_pass=1
+    # printf rather than a heredoc: the type column holds "ext4", "xfs" or
+    # "btrfs", and a heredoc can only line the header up with one of them. The
+    # widths are install-functions' constant, so this file and the one
+    # sowa-bootstrap generates are laid out identically.
+    # shellcheck disable=SC2059 # the format is that constant, not outside input
+    {
+        printf "${SOWA_FSTAB_FORMAT}" \
+            '# <file system>' '<mount point>' '<type>' '<options>' '<dump>' '<pass>'
+        printf "${SOWA_FSTAB_FORMAT}" \
+            "PARTUUID=${root_partuuid}" / "${ROOT_FILESYSTEM}" defaults 0 "${root_pass}"
+        printf "${SOWA_FSTAB_FORMAT}" \
+            "PARTUUID=${esp_partuuid}" /boot/efi vfat defaults,noauto 0 2
+    } > "${TARGET_MNT}/etc/fstab"
+
+    if [[ -n "${NIC_CONFIG_SOURCE}" ]]; then
+        log "installing the requested NIC configuration"
+        install -m 0600 "${NIC_CONFIG_SOURCE}" "${TARGET_MNT}/etc/nic.conf"
+    fi
+
+    if [[ -n "${SOWA_SETUP_HOSTNAME:-}" ]]; then
+        set_target_hostname "${TARGET_MNT}" "${SOWA_SETUP_HOSTNAME}"
+    fi
+
+    if [[ -n "${root_password}" ]]; then
+        log "setting the root password"
+        set_target_root_password "${TARGET_MNT}" "${root_password}"
+    fi
+
+    log "installing GRUB for BIOS (i386-pc)"
+    grub-install --target=i386-pc --boot-directory="${TARGET_MNT}/boot" \
+        --recheck "${DISK}"
+
+    log "installing GRUB for UEFI (x86_64-efi, removable)"
+    grub-install --target=x86_64-efi --efi-directory="${TARGET_MNT}/boot/efi" \
+        --boot-directory="${TARGET_MNT}/boot" --removable --no-nvram --recheck
+
+    log "writing the boot menu"
+    # One entry, naming both consoles. There used to be a second that differed
+    # only in the order of the "console=" arguments, because the order decides
+    # /dev/console and /dev/console was the only terminal with a login prompt.
+    # The inittab runs a getty per console now, so the screen and the serial
+    # line each have one whichever way round these are written.
+    #
+    # The serial probe stays, guarded: it decides where GRUB draws its own menu,
+    # and naming a terminal GRUB never registered - which is what "serial" fails
+    # to do on a machine with no UART - is an error.
+    cat > "${TARGET_MNT}/boot/grub/grub.cfg" <<EOF
+set default=0
+set timeout=5
+
+if serial --unit=0 --speed=115200; then
+    terminal_input serial console
+    terminal_output serial console
+fi
+
+menuentry "Sowa Linux" {
+    linux /boot/vmlinuz root=PARTUUID=${root_partuuid} rw console=tty0 console=ttyS0,115200 init=/sbin/init panic=-1
+}
+EOF
+
+    sync
+    umount "${TARGET_MNT}/boot/efi"
+    umount "${TARGET_MNT}"
+    sync
+    # Everything the trap would have done, done here, because clearing the trap
+    # is what stops it running on the way out of a successful install.
+    cleanup
+    trap - EXIT
+
+    log "Sowa is installed on ${DISK}."
+    log "Remove the installation media and reboot."
+}
+
+main "$@"

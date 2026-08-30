@@ -1,0 +1,100 @@
+.Dd August 17, 2026
+.Dt TELINIT 8
+.Os Sowa
+.Sh NAME
+.Nm telinit
+.Nd change the runlevel
+.Sh SYNOPSIS
+.Nm
+.Op Fl t Ar seconds
+.Ar runlevel
+.Sh DESCRIPTION
+.Nm
+asks
+.Xr init 8
+for a runlevel.
+The request goes down
+.Pa /run/initctl ,
+and everything that follows from it - stopping the services the old runlevel
+started, starting the ones the new one asks for, taking the machine down -
+belongs to
+.Xr init 8 .
+.Nm
+returns as soon as the request is written; it does not wait for the runlevel to
+be reached.
+.Pp
+The argument is one character:
+.Bl -tag -width "1, S, s" -offset indent
+.It Cm 0
+halt or power the system off.
+.It Cm 1 , S , s
+single user: a root shell on the console.
+.Cm 1
+runs the rc scripts on the way, so the services are stopped;
+.Cm S
+does not.
+.It Cm 2-5
+multi user.
+.Cm 3
+is the Sowa default.
+.It Cm 6
+reboot.
+.It Cm Q , q
+reread
+.Xr inittab 5
+without changing the runlevel.
+Nothing is restarted by this: an entry whose command changed is left alone
+until it exits on its own, and one that has been deleted is stopped only when
+it does.
+.It Cm a , b , c
+run the
+.Cm ondemand
+entries for that letter.
+These are not runlevels: the current runlevel does not change, and nothing
+else is started or stopped.
+.El
+.Sh OPTIONS
+.Bl -tag -width "-t seconds"
+.It Fl t Ar seconds
+How long a process gets between the
+.Dv SIGTERM
+that asks it to leave the runlevel and the
+.Dv SIGKILL
+that makes it.
+This is passed to
+.Xr init 8
+with the request and applies to that shutdown only.
+.El
+.Sh FILES
+.Bl -tag -width "/run/initctl" -compact
+.It Pa /run/initctl
+the FIFO the request is written to.
+.El
+.Sh EXIT STATUS
+.Ex -std
+A request that cannot be delivered - no
+.Pa /run/initctl ,
+or nothing reading it - is a failure.
+.Sh EXAMPLES
+Stop the services and keep the console:
+.Pp
+.Dl telinit 1
+.Pp
+Go back to the default runlevel:
+.Pp
+.Dl telinit 3
+.Pp
+Apply an edited inittab:
+.Pp
+.Dl telinit q
+.Sh SEE ALSO
+.Xr inittab 5 ,
+.Xr init 8 ,
+.Xr runlevel 8 ,
+.Xr shutdown 8
+.Sh CAVEATS
+Only root can change the runlevel.
+.Pp
+.Ic init Ar runlevel
+run by anyone but process 1 does the same thing: it forwards the request and
+exits, exactly as System V's did.

@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+
+OLLAMA_VERSION="0.32.15"
+OLLAMA_TARBALL="ollama-linux-amd64.tar.zst"
+OLLAMA_URL="https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/${OLLAMA_TARBALL}"
+OLLAMA_SHA256="50539c5fe9bf85887733355098dcdb266b433cb8c73fa180713417e9ed6e42bb"
+
+if [ -f "/tmp/${OLLAMA_TARBALL}" ]; then
+	echo "File already downloaded: /tmp/${OLLAMA_TARBALL}"
+	printf "Remove existing file and download again? [y/N] "
+	read -r answer
+	case "${answer}" in
+		y|Y|yes|YES)
+			rm -f "/tmp/${OLLAMA_TARBALL}"
+			curl -fL -o "/tmp/${OLLAMA_TARBALL}" "${OLLAMA_URL}"
+			;;
+		*)
+			echo "Keeping existing file."
+			;;
+	esac
+else
+	curl -fL -o "/tmp/${OLLAMA_TARBALL}" "${OLLAMA_URL}"
+fi
+
+echo "${OLLAMA_SHA256}  /tmp/${OLLAMA_TARBALL}" | sha256sum -c -
+
+rm -rf /opt/ollama
+
+mkdir -p /opt/ollama
+tar --zstd -C /opt/ollama -xf "/tmp/${OLLAMA_TARBALL}"
+rm -f "/tmp/${OLLAMA_TARBALL}"
+
+ln -sf /opt/ollama/bin/ollama /usr/bin/ollama

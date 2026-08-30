@@ -1,0 +1,157 @@
+.Dd August 27, 2026
+.Dt LANDLOCK-SANDBOXER 1
+.Os Sowa
+.Sh NAME
+.Nm landlock-sandboxer
+.Nd run a command under a Landlock filesystem and TCP sandbox
+.Sh SYNOPSIS
+.Ev LL_FS_RO Ns = Ns Ar paths
+.Ev LL_FS_RW Ns = Ns Ar paths
+.Op Ev LL_TCP_BIND Ns = Ns Ar ports
+.Op Ev LL_TCP_CONNECT Ns = Ns Ar ports
+.Op Ev LL_SCOPED Ns = Ns Ar scopes
+.Nm
+.Ar command Op Ar argument ...
+.Sh DESCRIPTION
+.Nm
+builds a Landlock ruleset out of its environment, applies it to itself, and then
+executes
+.Ar command .
+The ruleset is inherited by everything
+.Ar command
+goes on to execute and can never be widened again, so what is granted on the
+command line is the most that any part of the resulting process tree can do.
+.Pp
+Landlock is unprivileged.
+Nothing here needs root, a capability, a device or a namespace: a task asks the
+kernel to restrict itself, and the kernel agrees.
+That is what makes it different from every other sandbox on this system - a
+user with no way to become root can still confine what they run.
+.Pp
+Two settings are mandatory, because a forgotten one would silently be a sandbox
+that allows everything:
+.Ev LL_FS_RO
+and
+.Ev LL_FS_RW .
+Each is a colon-separated list of paths, and each path is granted along with
+everything beneath it.
+A path that does not exist is an error rather than an empty grant.
+.Pp
+The two port settings work the other way round, and the difference matters.
+When one is not set at all the access it covers is left unhandled, and
+unhandled means always allowed; set to the empty string it is handled with no
+port in it, and nothing is permitted.
+.Ev LL_SCOPED
+has no such distinction - unset and empty both mean no scoping.
+.Pp
+The kernel's answer to the ruleset is all-or-nothing per operation and is not
+logged by default.
+A denied program sees
+.Er EACCES ,
+.Er EPERM
+or
+.Er ENOENT
+from an ordinary system call and usually reports it as the file being missing,
+so the first run of anything under
+.Nm
+is best done with
+.Xr strace 1
+beside it.
+.Sh ENVIRONMENT
+.Bl -tag -width "LL_TCP_CONNECT"
+.It Ev LL_FS_RO
+Colon-separated paths that may be read, listed and executed.
+Required.
+.It Ev LL_FS_RW
+Colon-separated paths that may additionally be written, created, removed,
+renamed and truncated.
+Required.
+.It Ev LL_TCP_BIND
+Colon-separated TCP ports the sandboxed process may bind.
+Unset means every port; empty means none.
+.It Ev LL_TCP_CONNECT
+Colon-separated TCP ports the sandboxed process may connect to.
+Unset means every port; empty means none.
+.It Ev LL_SCOPED
+Colon-separated letters naming what the sandbox may not reach outside itself:
+.Ql a
+for abstract Unix sockets, and
+.Ql s
+for signals.
+.It Ev LL_FORCE_LOG
+Set to
+.Ql 1
+to have the kernel audit denied requests.
+A real sandboxer should not: it is one log record per denial, from a program
+that is expected to be denied.
+It is here to see that the policy is doing what it was asked to.
+.El
+.Pp
+Each of these is removed from the environment before
+.Ar command
+runs, so a sandboxed program cannot read the policy it is under.
+.Sh EXIT STATUS
+.Nm
+exits 1 without executing anything when the ruleset cannot be built - a missing
+mandatory setting, a path that does not exist, or a kernel with no Landlock.
+Otherwise it is replaced by
+.Ar command
+and the exit status is that command's.
+.Sh EXAMPLES
+Read-only everything the shell needs, one writable directory, no network at
+all:
+.Bd -literal -offset indent
+LL_FS_RO="/usr:/etc:/lib64:/dev/urandom" \e
+LL_FS_RW="/tmp/work:/dev/null" \e
+LL_TCP_BIND="" LL_TCP_CONNECT="" \e
+landlock-sandboxer /usr/bin/bash
+.Ed
+.Pp
+A build that may write only its own tree:
+.Bd -literal -offset indent
+LL_FS_RO="/usr:/etc:/lib64" LL_FS_RW="${PWD}:/tmp" \e
+landlock-sandboxer make
+.Ed
+.Pp
+A client that may reach HTTPS and nothing else:
+.Bd -literal -offset indent
+LL_FS_RO="/usr:/etc:/lib64:/dev/urandom" \e
+LL_FS_RW="/dev/null:/tmp" \e
+LL_TCP_BIND="" LL_TCP_CONNECT="443" \e
+landlock-sandboxer curl -sS https://example.com/
+.Ed
+.Pp
+Check that the kernel has Landlock at all - this prints the usage and the ABI
+version, or the hint that says the kernel was built without it:
+.Bd -literal -offset indent
+landlock-sandboxer
+.Ed
+.Sh SEE ALSO
+.Xr capsh 1 ,
+.Xr strace 1 ,
+.Xr prctl 2
+.Pp
+.Pa /root/sowa-howto/sandboxing.txt
+.Sh STANDARDS
+Landlock is a Linux security module.
+This kernel provides ABI version 7, which is what
+.Nm
+was compiled against, so every access type it knows about is one the kernel can
+enforce.
+.Sh AUTHORS
+The program is
+.Pa samples/landlock/sandboxer.c
+from the Linux kernel source this system's kernel is built from, by
+.An Micka\(:el Sala\(:un
+and ANSSI, under the BSD-3-Clause licence.
+This page is Sowa's.
+.Sh CAVEATS
+Landlock covers the filesystem, TCP bind and connect, and a small set of
+scopes.
+It does not cover UDP, raw sockets, ptrace beyond the scope options, or the
+loading of a kernel module, and it is not a substitute for
+.Xr seccomp 2
+where the concern is which system calls are reachable at all.
+.Pp
+A ruleset applies to paths, not to files: a hard link created outside a granted
+hierarchy is outside it, and a bind mount into one is inside it.

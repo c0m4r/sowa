@@ -1,0 +1,42 @@
+# /etc/profile - the environment a login shell starts with, for every user.
+
+# /usr/local comes first so that something built and installed on this machine
+# takes precedence over the packaged program of the same name - which is the
+# whole point of having it, and is what the image's own compiler makes
+# possible. The directories ship empty; sowa-pkg never writes into them and no
+# package owns anything under /usr/local, so it stays the one place on the
+# system an upgrade cannot touch.
+#
+# Within each half, bin comes before sbin, which is this image's order rather
+# than the more common sbin-first: there is no separate root PATH here, so the
+# ordering that matters is the one a person typing a command expects.
+export PATH=/usr/local/bin:/usr/local/sbin:/bin:/sbin:/usr/bin:/usr/sbin
+umask 022
+
+# login(1) and su(1) set these from the account database before the shell runs,
+# and this file must not overwrite what they decided: a user whose HOME is
+# forced to /root has no home directory they can write to, and every tool that
+# asks the environment who is logged in gets the wrong answer.
+#
+# They are still worth a default, because one shell in this image starts with no
+# environment at all - "su:S:respawn:/bin/sh -l" in /etc/inittab, the single-user
+# root shell, which init execs directly with no login in front of it. These
+# assignments are what that shell gets; a shell that arrived through login keeps
+# what login gave it.
+: "${HOME:=/root}"
+: "${USER:=root}"
+: "${LOGNAME:=root}"
+export HOME USER LOGNAME
+
+# A login shell never reads /etc/bash.bashrc: Bash consults SYS_BASHRC only for
+# an interactive shell that is not a login shell. Without this the prompt and
+# the aliases would apply to half the sessions on the system and the other half
+# would be bare. Reading it here is what makes the two look alike.
+if [[ -r /etc/bash.bashrc ]]; then
+    . /etc/bash.bashrc
+fi
+
+for profile_script in /etc/profile.d/*.sh; do
+    [[ -r "${profile_script}" ]] && . "${profile_script}"
+done
+unset profile_script

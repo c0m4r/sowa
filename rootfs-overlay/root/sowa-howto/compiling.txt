@@ -1,0 +1,25 @@
+Compiling
+=========
+
+The compiler is here, so this system can build programs for itself:
+
+    cc hello.c -o hello           # cc is gcc; g++ and c++ are the C++ driver
+    cc -O2 -Wall -c thing.c       # and as, ld, ar, nm, objdump, strip, readelf
+    make                          # its built-in rules already know about cc
+    ./configure && make && make install     # the usual three lines
+
+It is GCC 16 for C and C++, GNU binutils 2.47 behind it, the glibc headers in
+/usr/include and the C++ ones in /usr/include/c++. Static linking works too:
+"cc -static" uses the .a libraries next to the shared ones in /usr/lib64.
+
+m4, autoconf and pkg-config (pkgconf) are here as well, which is what a
+released tarball with a configure script in it needs. What is not here is
+automake, libtool, bison or flex, so a package that has to regenerate its build
+system cannot be built until you build those - which this compiler can do.
+
+    gcc -v                        # what it was configured with
+    cc -print-search-dirs         # where it looks for its own pieces
+
+Anything you build belongs in /usr/local, which comes first on PATH and which
+no package owns - so an upgrade cannot touch it. That is the default prefix of
+almost every configure script for exactly this reason.

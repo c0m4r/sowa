@@ -1,0 +1,28 @@
+# HAProxy.
+#
+# Nothing here enables or starts it, for the same reason as nginx: the package
+# carries an init script so that a load balancer can survive a reboot, but
+# whether this machine is a load balancer is not something an install can know.
+# "chkconfig haproxy on" is where that is decided, and neither an install nor an
+# upgrade moves it.
+#
+# The restart drops whatever connections are established for as long as HAProxy
+# takes to come back, and it is here anyway: upgrading a TLS-terminating proxy
+# and leaving the old process running is upgrading nothing, and the old one is
+# usually precisely what should stop answering. A machine that cannot afford the
+# interruption declines with "sowa-pkg upgrade --no-hooks haproxy" and restarts
+# when it suits.
+#
+# A reload would not do instead. SIGUSR2 has the master re-exec itself, which
+# re-runs the program that is on the disk - so it would in fact pick the new
+# binary up - but only for the workers; there is no equivalent for the
+# libraries the master already mapped, and the restart is the honest form of
+# what the upgrade is for.
+post-upgrade|service-restart|haproxy
+# Removing the package does not stop the master or its workers: an unlinked
+# binary keeps running, and this one holds whatever front ends the
+# configuration bound. Without these, "sowa-pkg remove haproxy" leaves a proxy
+# answering from a program that is no longer on the disk, and rc links naming
+# an init script the same removal takes away.
+pre-remove|service-stop|haproxy
+pre-remove|service-disable|haproxy

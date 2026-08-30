@@ -1,0 +1,102 @@
+Locales
+=======
+
+The image speaks UTF-8 and no particular language. Two locales are compiled
+into it - C.UTF-8, which everything defaults to, and en_US.UTF-8 - and the
+other five hundred glibc supports are one command away, with nothing to
+download.
+
+    locale               what this shell resolved to
+    locale -a            which locales are compiled on this machine
+    locale charmap       the character set in use; it should say UTF-8
+
+Adding one
+----------
+
+Names are in /etc/locale.gen, which lists every locale glibc supports with the
+ones this machine is not using commented out. Search it, then generate:
+
+    grep -i portuguese /etc/locale.gen
+    grep '^#pt_' /etc/locale.gen
+
+    locale-gen pt_BR.UTF-8
+
+That enables the line and compiles it into /usr/lib/locale/locale-archive,
+which is the file every program reads through setlocale(3). Nothing has to be
+installed for it: the locale definitions, the character maps and localedef are
+all in the image already.
+
+Editing /etc/locale.gen by hand and running "locale-gen" with no arguments does
+the same thing, and is the way to enable several at once. The archive is
+rebuilt from the file each time, so commenting a line out and running it again
+takes that locale away.
+
+Making it the system's
+----------------------
+
+Compiling a locale does not select it. That is /etc/locale.conf:
+
+    locale-gen de_DE.UTF-8
+    printf 'LANG=de_DE.UTF-8\n' > /etc/locale.conf
+
+It applies at the next login. For the shell that is already running:
+
+    export LANG=de_DE.UTF-8
+
+LANG is the default for every category, and a category can be set on its own -
+a Polish system that writes ISO dates and sorts Polish:
+
+    LANG=pl_PL.UTF-8
+    LC_TIME=en_DK.UTF-8
+
+/etc/profile.d/locale.sh is what puts them in the environment, and it leaves
+alone anything that is already there. sshd is configured with "AcceptEnv LANG
+LC_*", so logging in from a machine that speaks your language keeps your own
+locale rather than being handed this one's.
+
+When it goes wrong
+------------------
+
+    setlocale: LC_ALL: cannot change locale (fr_FR.UTF-8)
+
+means the locale was named but never compiled. Every program prints it on
+startup and then carries on in the C locale, so text quietly stops being UTF-8.
+"locale -a" says what is really there; "locale-gen fr_FR.UTF-8" fixes it. This
+is nearly always a LANG in /etc/locale.conf or in a shell profile that no
+locale-gen run has caught up with, and locale-gen warns about the first case.
+
+If characters come out as question marks or boxes, the locale is probably fine
+and the terminal is not: check that it is set to UTF-8 at the other end.
+
+Installing
+----------
+
+sowa-setup copies the live system as it stands, so setting the locale here
+before installing is enough - the installed system boots with it, and there is
+no question about it during the install.
+
+Services started at boot run in the C locale whatever /etc/locale.conf says:
+nothing exports it before init runs its scripts, and a daemon's timestamps
+should not move because the machine changed language. A service that wants one
+sets it in its own init script.
+
+The one thing that is not here
+------------------------------
+
+The console keyboard is US, and nothing in the image changes it - loadkeys and
+the keymaps come from kbd, which is not built. Over SSH this does not arise:
+the layout is the client's. On the local console, a non-US layout needs kbd
+built and installed.
+
+Size
+----
+
+Locales are cheap after the first one, which carries the character tables the
+rest share: C.UTF-8 alone is 392 KB, with en_US.UTF-8 beside it 2.9 MB, and all
+328 UTF-8 locales about 200 MB. Everything, on a machine with the room:
+
+    sed -i 's/^#\([a-z].*UTF-8\)$/\1/' /etc/locale.gen
+    locale-gen
+
+See also: man locale-gen, man locale.conf, man locale.gen, and time.txt for the
+time zone, which is a separate setting.

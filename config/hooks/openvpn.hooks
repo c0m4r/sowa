@@ -1,0 +1,14 @@
+# OpenVPN.
+#
+# The restart drops whatever tunnels are up for as long as they take to
+# renegotiate, and it is here anyway: upgrading OpenVPN and leaving the old
+# daemon running is upgrading nothing, and the reason to upgrade a TLS daemon is
+# usually that the old one should not still be answering. A machine that cannot
+# afford the interruption declines it with "sowa-pkg upgrade --no-hooks openvpn"
+# and restarts the tunnels when it suits.
+#
+# Note that a tunnel carrying the session that is running the upgrade goes down
+# with it. Nothing here can help with that, and neither could doing it by hand.
+post-upgrade|service-restart|openvpn
+pre-remove|service-stop|openvpn
+pre-remove|service-disable|openvpn

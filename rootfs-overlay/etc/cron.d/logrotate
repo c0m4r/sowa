@@ -1,0 +1,12 @@
+# Rotate the logs once a day.
+#
+# 03:15 rather than midnight: the hour everything else in the world also picked
+# is the hour a machine has least to spare, and nothing here needs the rotation
+# to happen at a particular time - only that it happens before the disk fills.
+#
+# Unlike a user's crontab, each line here names the user to run as:
+# minute hour day-of-month month day-of-week user command
+SHELL=/bin/bash
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+15 3 * * * root /usr/sbin/logrotate /etc/logrotate.conf >> /var/log/logrotate.log 2>&1

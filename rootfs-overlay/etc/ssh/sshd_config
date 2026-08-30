@@ -1,0 +1,37 @@
+# Sowa sshd configuration. Every option not named here keeps the built-in
+# default documented in sshd_config(5); "man sshd_config" is not available on
+# the image, but the page ships at /usr/share/man/man5/sshd_config.5.
+#
+# This sshd is built without PAM, Kerberos and GSSAPI, so the corresponding
+# keywords are deliberately absent: sshd warns about them on startup.
+
+Port 22
+AddressFamily any
+
+# Host keys are generated on the running system by sowa-sshd-keygen rather
+# than shipped in the image, so every machine gets its own identity. Only an
+# Ed25519 key is created; add HostKey lines here if a client needs RSA and
+# generate the key with "ssh-keygen -A".
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+# root is the only login account on a stock image and it ships with an empty
+# password, so the network path is public keys only: put a key in
+# /root/.ssh/authorized_keys. Note that setting a root password with "passwd"
+# is not on its own enough to allow a root login over SSH - that also needs
+# "PermitRootLogin yes" here.
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+PasswordAuthentication yes
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+
+LoginGraceTime 30
+MaxAuthTries 4
+StrictModes yes
+
+PrintMotd no
+X11Forwarding no
+AcceptEnv LANG LC_*
+
+Subsystem sftp /usr/lib/openssh/sftp-server

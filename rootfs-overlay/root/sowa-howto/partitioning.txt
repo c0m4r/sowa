@@ -1,0 +1,76 @@
+Partitioning disks, and building RAID and LVM on them
+====================================================
+
+sowa-partitioner is the program that gets a disk into a state something can be
+installed onto. sowa-setup does its own partitioning of one whole disk in one
+fixed shape; this does the general case - several disks, an existing table to
+read and keep, partitions placed by hand, and md or LVM stacked on top.
+
+Run it with no arguments for the full-screen program:
+
+    sowa-partitioner
+
+It opens on the list of disks. Enter looks inside one, s lays a disk out the
+way Sowa installs, and l writes an empty table on it.
+
+Inside a disk: n makes a partition in the free space, d removes one, t changes
+its type, z resizes it, w wipes, u re-reads the disk and forgets the plan, and
+a applies. R builds an md array from partitions that already exist and V
+manages volume groups and the volumes inside them; both are on the disk list as
+well. f says how this machine booted and which table format suits it, and q
+goes back - asking first if the plan has changes that were never applied.
+
+Nothing reaches the disk until it is applied. Everything before that edits a
+plan held in memory, drawn beside the table that is really there, and applying
+lists what is about to happen and asks before doing it.
+
+Reading needs no privilege; writing does. So looking at the layout of a machine
+is something any account can do:
+
+    sowa-partitioner list                    every disk, with what is on it
+    sowa-partitioner show /dev/sda           one disk, including its free space
+    sowa-partitioner firmware                how this machine booted
+
+The same operations are subcommands, for a script or for one step on its own:
+
+    sowa-partitioner label /dev/sdb gpt      write an empty table
+    sowa-partitioner scheme /dev/sdb gpt     lay it out the way Sowa installs
+    sowa-partitioner create /dev/sdb xfs 100%
+    sowa-partitioner delete /dev/sdb 3
+    sowa-partitioner wipe /dev/sdb           zero its signatures
+    sowa-partitioner raid --level=1 --name=/dev/md0 /dev/sdb1 /dev/sdc1
+    sowa-partitioner lvm --vg=data --lv=files --size=20G --fs=xfs /dev/md0
+
+--dry-run prints every command that would run and writes nothing, which is the
+way to read what a subcommand is about to do before letting it. --yes skips the
+confirmations, for unattended use. --no-format writes the table and leaves the
+filesystems to be made later.
+
+Sizes are read the way sfdisk reads them: 10G and 10GiB are the same 1024-based
+number and 10GB is the smaller 1000-based one. A percentage is of whatever is
+being filled, so 100% is always "the rest of it". A number with no unit at all
+is refused rather than guessed at.
+
+Partitions keep the numbers they already have, and rewriting a table does not
+change the identity of anything that was on it: GPT partition UUIDs are carried
+across and an MBR disk keeps its four-byte signature, so an /etc/fstab or a
+grub.cfg naming a PARTUUID stays correct.
+
+It refuses to write over anything that is in use - a mounted partition, an
+assembled array member, an active physical volume - and says which. Unmount it,
+stop the array, or deactivate the volume group first.
+
+A raw image file works everywhere a disk does, which is the way to try any of
+this without a spare disk:
+
+    fallocate -l 1G fake_disk
+    sowa-partitioner raw fake_disk
+
+Making filesystems inside an image needs root, because it is done by attaching
+it to a loop device; without that the table is still written and the mkfs step
+is left to a "losetup -P" of your own.
+
+Putting a system on the result is installing.txt. The filesystems, mdadm and
+LVM underneath it are storage.txt. The full reference is "man sowa-partitioner".
+
+See also: installing.txt, storage.txt.

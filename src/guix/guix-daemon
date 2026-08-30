@@ -1,0 +1,99 @@
+#!/bin/bash
+#
+# chkconfig: - 70 30
+# description: GNU Guix build daemon
+#
+# Off by default, and after the network in every runlevel it is turned on for:
+# installing the guix package and running its daemon are two decisions, and the
+# second one belongs to the machine. "chkconfig guix-daemon on" answers it.
+#
+# guix-daemon stays in the foreground of its own accord, which is what the
+# daemon helper wants, and its output is appended to /var/log/guix-daemon.log:
+# a build daemon's output is build logs, and those are its own to keep rather
+# than something to put through syslog.
+#
+# Builds run as the guixbuild accounts sowa-guix-setup creates, in a chroot
+# and in namespaces of their own. Without --build-users-group the daemon would
+# build as root, which is exactly what the store's guarantees are not worth.
+
+. /etc/rc.d/init.d/functions
+
+name=guix-daemon
+profile=/var/guix/profiles/per-user/root/current-guix
+pidfile=/run/guix-daemon.pid
+logfile=/var/log/guix-daemon.log
+build_group=guixbuild
+substitute_urls='https://bordeaux.guix.gnu.org https://ci.guix.gnu.org'
+
+# Every path in a Guix profile is a symbolic link into the store, so a daemon
+# started through the profile is running /gnu/store/...-guix-1.5.0/bin/guix-daemon
+# as far as /proc/PID/exe is concerned - and that is what the helpers here
+# compare against to find a running service. Resolving the link once, up front,
+# is what makes start, stop and status agree on the program's name. It also
+# means "guix pull" is followed by a restart: the daemon that is running is the
+# one from the generation it was started from.
+program="$(readlink -f "${profile}/bin/guix-daemon" 2> /dev/null)" || program=""
+
+# Guix speaks UTF-8 to the terminal, and its own libc has no locales until a
+# profile provides them: "guix install glibc-locales" is what fills this in.
+locale_dir=/var/guix/profiles/per-user/root/guix-profile/lib/locale
+if [[ -d "${locale_dir}" ]]; then
+    export GUIX_LOCPATH="${locale_dir}"
+    export LC_ALL=en_US.utf8
+fi
+
+start() {
+    begin "Starting ${name}"
+    if [[ -z "${program}" || ! -x "${program}" ]]; then
+        failed
+        printf '%s: no daemon at %s; run sowa-guix-setup first\n' \
+            "${name}" "${profile}/bin/guix-daemon" >&2
+        return 1
+    fi
+    # --discover=no keeps the daemon off the local network: substitutes come
+    # from the servers named above, whose keys sowa-guix-setup authorized, and
+    # discovering peers on a LAN is a decision for whoever owns the LAN.
+    daemon --pidfile "${pidfile}" --log "${logfile}" -- \
+        "${program}" \
+        --build-users-group="${build_group}" \
+        --discover=no \
+        --substitute-urls="${substitute_urls}"
+    result $?
+}
+
+stop() {
+    begin "Stopping ${name}"
+    # Nothing resolved means nothing was ever started through this script, and
+    # the subsystem lock is cleared either way so the runlevel change completes.
+    if [[ -z "${program}" ]]; then
+        subsys_clear "${name}"
+        skipped
+        return 0
+    fi
+    killproc --name "${name}" --pidfile "${pidfile}" "${program}"
+    result $?
+}
+
+case "${1:-}" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    status)
+        if [[ -z "${program}" ]]; then
+            printf '%s is not set up; run sowa-guix-setup\n' "${name}"
+            exit 3
+        fi
+        status --pidfile "${pidfile}" "${program}"
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|status}\n' "$0" >&2
+        exit 2
+        ;;
+esac

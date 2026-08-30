@@ -1,0 +1,55 @@
+Filesystems, software RAID, and LVM
+==================================
+
+Sowa carries the kernel drivers and userspace tools for ext4, XFS and Btrfs.
+sowa-setup offers all three as the root filesystem:
+
+    SOWA_SETUP_ROOT_FILESYSTEM=xfs sowa-setup
+    SOWA_SETUP_ROOT_FILESYSTEM=btrfs sowa-setup
+
+"brfs" is accepted there as an alias for the commonly mistyped name; the real
+filesystem and command names are Btrfs, mkfs.btrfs and btrfs. For filesystems
+you create yourself, the entry points are:
+
+    mkfs.ext4 /dev/sdb1       fsck.ext4 /dev/sdb1
+    mkfs.xfs /dev/sdb1        xfs_repair /dev/sdb1
+    mkfs.btrfs /dev/sdb1      btrfs check /dev/sdb1
+
+sowa-partitioner does all of the below through one screen, including making
+the filesystems and building the array or volume group; partitioning.txt is the
+topic for it. The commands underneath it are these, and they are what to reach
+for in a script or when only one step is wanted.
+
+Linux software RAID is built into the kernel and administered with mdadm. For
+example, after checking the device names and accepting that both are erased:
+
+    mdadm --create /dev/md0 --level=1 --raid-devices=2 /dev/sdb1 /dev/sdc1
+    mdadm --detail /dev/md0
+    mdadm --detail --scan >> /etc/mdadm.conf
+
+/etc/mdadm.conf starts with metadata discovery enabled. rc.sysinit runs
+"mdadm --assemble --scan" before it mounts /etc/fstab, so an array containing
+a data filesystem is ready in time for its entry.
+
+LVM2 supplies pvcreate, vgcreate, lvcreate, the pvs/vgs/lvs reporting commands,
+and dmsetup. A minimal data volume looks like:
+
+    pvcreate /dev/md0
+    vgcreate data /dev/md0
+    lvcreate -L 20G -n files data
+    mkfs.xfs /dev/data/files
+
+Add /dev/data/files to /etc/fstab after mounting and checking it. At boot,
+rc.sysinit assembles md arrays first, runs "vgchange --activate y --sysinit",
+and only then runs "mount -a", so the LVM-on-md order is handled.
+
+sowa-setup deliberately creates a plain partition root and boots it directly
+with root=PARTUUID, without an initramfs. mdadm and LVM work automatically for
+non-root fstab entries. Putting the root itself on an md array or logical volume
+requires a custom initramfs and boot menu; use sowa-bootstrap after preparing
+that layout.
+
+All creation commands above destroy or repurpose their named devices. Use
+"lsblk -f", "mdadm --examine" and "pvs" first, and keep a current backup.
+
+See also: partitioning.txt, installing.txt.

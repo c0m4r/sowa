@@ -1,0 +1,29 @@
+# GNU Guix - the steps that were the README's job until sowa-pkg learned to
+# take them. Installing the package puts /gnu/store on the machine and nothing
+# else, because everything Guix writes is state and a package must not own
+# state; until that state exists /usr/bin/guix is a dangling link and a
+# completely successful install answers "guix: command not found".
+#
+# sowa-guix-setup is what creates it - the guixbuild accounts, /var/guix, root's
+# profile link, and the substitute keys - and it is written to be run again, so
+# an upgrade runs it too and it repairs what the new store moved rather than
+# undoing what the machine has done with Guix.
+#
+# Enabling and starting the daemon is a decision, and the guix-daemon script
+# still defaults to off for anyone who wants to make it themselves. It is made
+# here on the first install only: a store without the daemon that builds into it
+# is a package that does not work, and there is nothing for guix-daemon to do on
+# a machine where nobody uses Guix. On an upgrade it is only restarted, and only
+# if it was running - the daemon that is up is the one from the generation it
+# was started from, and an administrator who turned it off is not overruled.
+post-install|setup|/usr/sbin/sowa-guix-setup
+post-install|service-enable|guix-daemon
+post-install|service-start|guix-daemon
+post-upgrade|setup|/usr/sbin/sowa-guix-setup
+post-upgrade|service-restart|guix-daemon
+# The daemon runs out of the store this package owns. Removing the store under a
+# running daemon would leave a process whose program is gone holding build users
+# and a socket, and the rc links would name an init script that the same removal
+# takes away - a service the next boot tries and fails to start.
+pre-remove|service-stop|guix-daemon
+pre-remove|service-disable|guix-daemon

@@ -1,0 +1,23 @@
+#!/bin/sh
+# A name Sowa answers but does not implement.
+#
+# Sowa has no program called lsof, and does not want one: util-linux's lsfd is
+# the replacement and it is already in the image -
+# it reads the same /proc/*/fd information, it is maintained alongside the
+# kernel interfaces it reads, and it is about a tenth of the size. This file
+# exists so that typing the name people know produces the answer rather than
+# "command not found", which teaches nobody anything.
+#
+# It exits 127, the same status a missing command produces, so a script testing
+# for lsof still fails rather than believing it succeeded.
+
+printf '%s\n' \
+    "lsof is not part of Sowa. Use lsfd(1), util-linux's replacement:" \
+    "" \
+    "    lsfd                every open file on the system" \
+    "    lsfd -p PID         the files one process has open" \
+    "    lsfd -i             the network sockets, like lsof -i" \
+    "    lsfd -Q EXPRESSION  filter, e.g. -Q 'NAME =~ \"/var.*\"'" \
+    "" \
+    "See lsfd(1) for the column names, which are its own rather than lsof's." >&2
+exit 127

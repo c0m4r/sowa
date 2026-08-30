@@ -1,0 +1,71 @@
+Sandboxing a command with Landlock
+==================================
+
+Landlock is a kernel security module that lets a program take away its own
+access to the filesystem and to TCP ports. It needs no root, no capability, no
+namespace and no configuration file: the program asks the kernel to restrict it,
+the kernel agrees, and the restriction is inherited by everything that program
+goes on to execute and can never be widened again.
+
+landlock-sandboxer is the command that does it for something you did not write.
+It reads a policy out of its environment, applies it to itself, and then execs
+what you asked for:
+
+    LL_FS_RO="/usr:/etc:/lib64" LL_FS_RW="/tmp/work:/dev/null" \
+        landlock-sandboxer bash
+
+That shell can read the system, write /tmp/work and /dev/null, and touch nothing
+else - not your home directory, not /etc/shadow, not the disk it booted from.
+
+The two lists are colon-separated, each entry grants everything beneath it, and
+both are mandatory. That is deliberate: forgetting one would otherwise be a
+sandbox that quietly allows everything. A path that does not exist is an error
+rather than an empty grant, so a typo fails loudly.
+
+Anything dynamically linked needs the loader and the libraries it names, or it
+cannot start at all:
+
+    ldd /usr/bin/curl       # what has to be readable for curl to run
+
+/usr and /lib64 in LL_FS_RO cover every program in the image. Add /dev/urandom
+for anything doing TLS, and /dev/null and /dev/zero for almost anything else.
+
+The network half is two more variables, and they work the other way round: not
+set at all means the port check is not enforced, and set to the empty string
+means no port is allowed.
+
+    LL_FS_RO="/usr:/etc:/lib64:/dev/urandom" LL_FS_RW="/dev/null:/tmp" \
+        LL_TCP_BIND="" LL_TCP_CONNECT="443" \
+        landlock-sandboxer curl -sS https://example.com/
+
+That curl can connect to 443 and to nothing else, and can bind nothing at all.
+
+LL_SCOPED takes "a" to cut the sandbox off from abstract Unix sockets outside
+it and "s" to stop it signalling processes outside it; unset and empty both mean
+no scoping. All five variables are removed from the environment before your
+command runs, so what is sandboxed cannot read the policy it is under.
+
+A denied program is told the ordinary thing - "Permission denied", sometimes
+"No such file or directory" - so the first run of anything new under
+landlock-sandboxer is worth doing with strace beside it:
+
+    LL_FS_RO=... LL_FS_RW=... landlock-sandboxer strace -f -e trace=file cmd
+
+Nothing is logged by default. LL_FORCE_LOG=1 asks the kernel to audit denials,
+which is for finding out what a policy is doing rather than for running under.
+
+To check that this kernel has Landlock at all, run the command with no
+arguments: it prints its usage and the ABI version it can use, or the hint that
+says the kernel was built without CONFIG_SECURITY_LANDLOCK. Sowa's kernel is
+built with it, and the sandboxer comes out of the same kernel source, so the two
+always agree about what can be asked for.
+
+Landlock is not the only thing here. Capabilities are what a privileged process
+holds - see capsh, getpcaps and setcap - and seccomp is what filters system
+calls, which is how sshd's network-facing children are confined. Landlock is the
+one of the three that answers "which files and ports", and the only one an
+unprivileged user can apply to a command they just typed.
+
+See also: man landlock-sandboxer, utilities.txt for the base commands, and
+firewall.txt for the packet filter, which is the machine's network policy rather
+than one process's.

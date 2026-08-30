@@ -1,0 +1,243 @@
+#!/bin/bash
+#
+# chkconfig - decide which services a runlevel starts.
+#
+# The rc<N>.d directories are the real configuration: a service is started in a
+# runlevel because there is an S link for it there, and stopped because there is
+# a K link. This command is how those links are made without counting digits by
+# hand, and it takes the defaults from the script's own header:
+#
+#     # chkconfig: 2345 50 40
+#     # description: what the service is
+#
+# The three fields are the runlevels the service belongs in - "-" for none -
+# and the two-digit start and stop priorities. Every runlevel ends up with a
+# link either way: S where the service runs, K where it must be stopped if it
+# is running.
+
+set -u
+
+initd=/etc/rc.d/init.d
+rcdir=/etc/rc.d
+all_levels="0123456"
+default_on_levels="2345"
+
+die() {
+    printf 'chkconfig: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: chkconfig --list [NAME]
+       chkconfig --add NAME
+       chkconfig --del NAME
+       chkconfig [--level LEVELS] NAME <on|off|reset>
+       chkconfig NAME
+
+The last form asks whether the service is started in the current runlevel and
+answers with its exit status.
+USAGE
+    exit 2
+}
+
+# The characters of a runlevel string, one per line, without leaving the shell.
+each_level() {
+    local text="$1"
+    local index
+
+    for ((index = 0; index < ${#text}; index++)); do
+        printf '%s\n' "${text:index:1}"
+    done
+}
+
+script_path() {
+    local script="${initd}/$1"
+
+    [[ -f "${script}" ]] || die "$1: no such service"
+    printf '%s\n' "${script}"
+}
+
+# Reads the "# chkconfig:" header into header_levels, header_start and
+# header_stop.
+read_header() {
+    local script="$1"
+    local line
+    local fields
+
+    line="$(sed -n 's/^#[[:space:]]*chkconfig:[[:space:]]*//p' "${script}" \
+        | sed -n '1p')"
+    [[ -n "${line}" ]] || die "${script##*/} has no \"# chkconfig:\" line"
+
+    read -r -a fields <<< "${line}"
+    [[ "${#fields[@]}" -eq 3 ]] || die "${script##*/} has a malformed chkconfig line"
+    header_levels="${fields[0]}"
+    header_start="${fields[1]}"
+    header_stop="${fields[2]}"
+    [[ "${header_start}" =~ ^[0-9]{2}$ && "${header_stop}" =~ ^[0-9]{2}$ ]] \
+        || die "${script##*/} has non-numeric start or stop priorities"
+    [[ "${header_levels}" == - ]] && header_levels=""
+    return 0
+}
+
+link_for() {
+    local level="$1"
+    local prefix="$2"
+    local priority="$3"
+    local name="$4"
+
+    printf '%s/rc%s.d/%s%s%s\n' "${rcdir}" "${level}" "${prefix}" \
+        "${priority}" "${name}"
+}
+
+remove_links() {
+    local name="$1"
+    local level
+
+    for level in $(each_level "${all_levels}"); do
+        rm -f "${rcdir}/rc${level}.d/"[SK][0-9][0-9]"${name}"
+    done
+}
+
+# Places one link for one runlevel, replacing whatever was there for the
+# service before.
+set_level() {
+    local name="$1"
+    local level="$2"
+    local started="$3"
+
+    rm -f "${rcdir}/rc${level}.d/"[SK][0-9][0-9]"${name}"
+    install -d -m 0755 "${rcdir}/rc${level}.d"
+    if [[ "${started}" == yes ]]; then
+        ln -sf "../init.d/${name}" "$(link_for "${level}" S "${header_start}" "${name}")"
+    else
+        ln -sf "../init.d/${name}" "$(link_for "${level}" K "${header_stop}" "${name}")"
+    fi
+}
+
+apply_defaults() {
+    local name="$1"
+    local level
+
+    for level in $(each_level "${all_levels}"); do
+        if [[ "${header_levels}" == *"${level}"* ]]; then
+            set_level "${name}" "${level}" yes
+        else
+            set_level "${name}" "${level}" no
+        fi
+    done
+}
+
+is_on() {
+    local name="$1"
+    local level="$2"
+
+    compgen -G "${rcdir}/rc${level}.d/S[0-9][0-9]${name}" > /dev/null
+}
+
+list_one() {
+    local name="$1"
+    local level
+    local state
+
+    printf '%-20s' "${name}"
+    for level in $(each_level "${all_levels}"); do
+        if is_on "${name}" "${level}"; then
+            state=on
+        else
+            state=off
+        fi
+        printf '%s:%-4s' "${level}" "${state}"
+    done
+    printf '\n'
+}
+
+list_services() {
+    local script
+
+    if [[ $# -gt 0 ]]; then
+        script_path "$1" > /dev/null
+        list_one "$1"
+        return 0
+    fi
+    for script in "${initd}"/*; do
+        [[ -f "${script}" && -x "${script}" ]] || continue
+        [[ "${script##*/}" == functions ]] && continue
+        list_one "${script##*/}"
+    done
+}
+
+levels=""
+case "${1:-}" in
+    --list)
+        shift
+        list_services "$@"
+        exit 0
+        ;;
+    --add)
+        [[ $# -eq 2 ]] || usage
+        script="$(script_path "$2")"
+        read_header "${script}"
+        apply_defaults "$2"
+        exit 0
+        ;;
+    --del)
+        [[ $# -eq 2 ]] || usage
+        script_path "$2" > /dev/null
+        remove_links "$2"
+        exit 0
+        ;;
+    --level)
+        [[ $# -eq 4 ]] || usage
+        levels="$2"
+        shift 2
+        ;;
+    "" | -*)
+        usage
+        ;;
+esac
+
+name="${1:-}"
+action="${2:-}"
+[[ -n "${name}" ]] || usage
+script="$(script_path "${name}")"
+
+# "chkconfig NAME" with no action asks about the current runlevel.
+if [[ -z "${action}" ]]; then
+    current="$(runlevel | sed -n 's/^.* //p')"
+    [[ -n "${current}" ]] || die "cannot tell what runlevel this is"
+    is_on "${name}" "${current}"
+    exit $?
+fi
+
+read_header "${script}"
+case "${action}" in
+    on | off)
+        if [[ -z "${levels}" ]]; then
+            if [[ "${action}" == on ]]; then
+                levels="${header_levels:-${default_on_levels}}"
+                # Runlevels the service does not belong in still need a K link.
+                for level in $(each_level "${all_levels}"); do
+                    [[ "${levels}" == *"${level}"* ]] && continue
+                    set_level "${name}" "${level}" no
+                done
+            else
+                levels="${all_levels}"
+            fi
+        fi
+        for level in $(each_level "${levels}"); do
+            [[ "${all_levels}" == *"${level}"* ]] || die "${level} is not a runlevel"
+            if [[ "${action}" == on ]]; then
+                set_level "${name}" "${level}" yes
+            else
+                set_level "${name}" "${level}" no
+            fi
+        done
+        ;;
+    reset)
+        apply_defaults "${name}"
+        ;;
+    *)
+        usage
+        ;;
+esac

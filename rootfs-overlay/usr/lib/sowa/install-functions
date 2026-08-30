@@ -1,0 +1,509 @@
+#!/bin/bash
+#
+# /usr/lib/sowa/install-functions - what sowa-setup, sowa-bootstrap and
+# sowa-chroot all source.
+#
+# Laying the live root down onto a mounted filesystem is the same job whether
+# the caller partitioned the disk first (sowa-setup) or the user did it by hand
+# (sowa-bootstrap), so it is written once, here. The three programs differ in
+# what they do around it, not in the copy itself - which matters because the
+# copy is the part that cannot be checked by reading it, and one implementation
+# is one thing to prove.
+#
+# Every function that writes takes the destination as its first argument. None
+# of them reads a SOWA_* variable: each program owns its own names for those
+# and passes the values in.
+
+# shellcheck shell=bash
+
+log()  { printf '==> %s\n' "$*"; }
+warn() { printf '==> warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+require_root() {
+    [[ "$(id -u)" -eq 0 ]] || die "${0##*/} must run as root"
+}
+
+# The kernel these programs need under them, which is not the same as the kernel
+# the installed system will boot. glibc was configured --enable-kernel=6.1.0, so
+# every binary in the image carries "Linux 6.1.0" in its .note.ABI-tag and is
+# entitled to assume every syscall that kernel had.
+#
+# This matters because installing from a hosting provider's rescue environment
+# runs Sowa's own tar, grub-install and grub-mkconfig on *that* system's kernel,
+# and rescue images may carry a kernel below the supported floor.
+#
+# The failure it produces is not a clean one, which is the reason for checking
+# rather than letting it happen: the loader runs the binaries anyway, and then
+# statx(2) - added in Linux 4.11, and what coreutils 9 calls directly for ls,
+# stat and du - returns ENOSYS. ls prints "Function not implemented" and a row
+# of question marks where the permissions go, and anything that reads a file
+# listing quietly gets nothing. Sowa cannot fix that from userspace; the only
+# honest answer is to say so and stop.
+readonly SOWA_MIN_KERNEL_MAJOR=6
+readonly SOWA_MIN_KERNEL_MINOR=1
+
+require_supported_host_kernel() {
+    local release major minor
+    release="$(uname -r)"
+    major="${release%%.*}"
+    minor="${release#*.}"
+    minor="${minor%%.*}"
+
+    # A release string that does not begin with two numbers is not something to
+    # guess about. Let it through rather than refuse an install over a version
+    # scheme this does not recognise.
+    [[ "${major}" =~ ^[0-9]+$ && "${minor}" =~ ^[0-9]+$ ]] || return 0
+
+    if (( major > SOWA_MIN_KERNEL_MAJOR )) \
+        || { (( major == SOWA_MIN_KERNEL_MAJOR )) && (( minor >= SOWA_MIN_KERNEL_MINOR )); }; then
+        return 0
+    fi
+
+    if [[ "${SOWA_INSTALL_IGNORE_KERNEL:-}" == 1 ]]; then
+        warn "this kernel is ${release}; Sowa's programs need ${SOWA_MIN_KERNEL_MAJOR}.${SOWA_MIN_KERNEL_MINOR} or newer"
+        warn "continuing because SOWA_INSTALL_IGNORE_KERNEL=1 - expect coreutils to fail with ENOSYS"
+        return 0
+    fi
+
+    printf 'error: this system is running Linux %s, and Sowa'"'"'s programs need %s.%s or newer.\n\n' \
+        "${release}" "${SOWA_MIN_KERNEL_MAJOR}" "${SOWA_MIN_KERNEL_MINOR}" >&2
+    printf 'Every binary in the Sowa image was built against glibc configured for\n' >&2
+    printf 'Linux %s.%s. Running them here does not fail cleanly - it fails quietly:\n' \
+        "${SOWA_MIN_KERNEL_MAJOR}" "${SOWA_MIN_KERNEL_MINOR}" >&2
+    printf 'statx(2) arrived in Linux 4.11 and coreutils 9 calls it directly, so\n' >&2
+    printf '"ls -l" answers "Function not implemented" and prints question marks\n' >&2
+    printf 'where the permissions belong, and grub-mkconfig writes a config with no\n' >&2
+    printf 'menu entries in it.\n\n' >&2
+    printf 'This is the kernel you are installing *from*. The installed system boots\n' >&2
+    printf 'its own kernel and is unaffected - so the fix is to install from a newer\n' >&2
+    printf 'environment, not to change anything about Sowa:\n\n' >&2
+    printf '  - if this is a hosting rescue system, pick a newer rescue image\n' >&2
+    printf '  - or boot the Sowa ISO and use sowa-setup or sowa-bootstrap from it\n\n' >&2
+    printf 'SOWA_INSTALL_IGNORE_KERNEL=1 proceeds anyway, and is not recommended.\n' >&2
+    exit 1
+}
+
+# Reports the tools in "$@" that are not on PATH, one per line. The caller
+# decides what to do about them, because each program needs a different set and
+# some of those are conditional.
+missing_tools() {
+    local tool
+    for tool in "$@"; do
+        command -v "${tool}" >/dev/null 2>&1 || printf '%s\n' "${tool}"
+    done
+}
+
+live_root_mib() {
+    # How much the copy is going to write, in MiB. It is measured by walking the
+    # tree rather than by asking df, because neither filesystem the live root is
+    # made of can answer the question:
+    #
+    #   /                is an overlay, and df reports an overlay from its
+    #                    upper layer - the tmpfs holding this boot's handful of
+    #                    writes - so it answers with tens of megabytes for a
+    #                    system close to a gigabyte.
+    #   /run/sowa/sfs    is the squashfs underneath, and df reports a squashfs
+    #                    by the size of the *compressed* image, which is a
+    #                    third of what lands on the disk.
+    #
+    # Either answer would pass a disk that the copy then fills part way
+    # through. "du -sx /" is slower - it is a walk of a hundred thousand files
+    # - and it is the size of the thing being copied, which is the number this
+    # check needs. -x keeps it on the root filesystem, so /proc, /sys, /dev and
+    # /run are skipped much as copy_system skips them. It is equally correct on
+    # an installed system, where / is an ordinary disk.
+    local used
+    used="$(du -sxk / 2>/dev/null | awk 'NR == 1 { print $1 }')"
+    # A conservative fallback keeps the size check useful if du cannot report it.
+    [[ "${used}" =~ ^[0-9]+$ ]] || used=$(( 1024 * 1024 ))
+    printf '%s\n' "$(( used / 1024 ))"
+}
+
+# The same figure live_root_mib measures for the running system, measured for a
+# rootfs tarball instead: the sum of the regular-file sizes it will write, in
+# MiB. It is listed from the archive rather than estimated from its compressed
+# size, which says nothing reliable about how much filesystem space it needs.
+tarball_root_mib() {
+    local tarball="${1:?tarball_root_mib needs a tarball}"
+    local bytes
+    bytes="$(tar -tvf "${tarball}" 2>/dev/null \
+        | awk '$1 ~ /^-/ { s += $3 } END { printf "%d\n", s }')"
+    [[ "${bytes}" =~ ^[0-9]+$ ]] || bytes=$(( 1024 * 1024 ))
+    printf '%s\n' "$(( bytes / 1048576 ))"
+}
+
+# One absolute path with no trailing slash, no "..", and no symbolic link left
+# in it. Everything below needs the destination in this form: the tar exclude
+# has to match the name tar itself will walk, and a message naming the path the
+# user typed rather than the one being written to would be a lie.
+normalize_path() {
+    ( cd "$1" 2>/dev/null && pwd -P )
+}
+
+# The live root, copied onto the directory named by $1, which the caller has
+# already mounted and passed through normalize_path.
+copy_system() {
+    local destination="${1:?copy_system needs a destination}"
+
+    # Every exclude below is relative to the root being archived, so a
+    # destination of "/" would exclude the whole tree and produce an empty
+    # copy. No caller should get here with one; this is the backstop.
+    [[ "${destination}" == /* && "${destination}" != / ]] \
+        || die "refusing to copy the live root onto '${destination}'"
+
+    # What this copies is whatever is running, which is only the right thing to
+    # copy when what is running is Sowa. On any other host, "copy the live root"
+    # would place the wrong system in the destination and could write gigabytes
+    # before anything looked wrong. --from-tarball is the supported path there,
+    # so name it.
+    is_sowa_root / \
+        || die "this is not a Sowa system, so there is no live Sowa root to copy; install from a rootfs tarball instead (--from-tarball)"
+
+    # A Sowa root with no kernel in it is a real thing to be running inside: the
+    # container image is the whole system minus /boot, because a container never
+    # boots one. Copying it onto a disk is still a reasonable thing to want - a
+    # chroot tree needs no kernel either - but a copy meant to boot and made
+    # from here would come up to a GRUB that has nothing to load, and that is
+    # worth saying before the copy rather than after the reboot.
+    [[ -f /boot/vmlinuz ]] \
+        || warn "this system has no /boot/vmlinuz, so the copy will not be bootable; --from-tarball installs a kernel with the tree"
+
+    # One tar pass, skipping the kernel's virtual filesystems, the transient
+    # ones, and the destination itself. Each exclude carries the "./" that tar
+    # puts in front of every member name, so it names one top-level directory
+    # and cannot also match a "tmp" or a "proc" further down the tree.
+    #
+    # Excluding the destination is what keeps the copy from feeding itself: it
+    # is a path under the very tree being archived, so without this tar would
+    # write into what it is still reading. A separate filesystem is no defence,
+    # because tar descends into one.
+    #
+    # --sparse so a file that is mostly holes - /var/log/lastlog is the one
+    # every system has - is written to the target as holes rather than at its
+    # full apparent size, which is also how live_root_mib measured it.
+    #
+    # --numeric-owner on both ends because the two sides are the same system:
+    # turning each uid into a name only to look the name back up is work that
+    # can disagree with itself and has nothing to gain.
+    #
+    # --format=posix so a file written since boot keeps its sub-second mtime,
+    # which the default header rounds away. It costs almost nothing here: the
+    # extended header that carries the fraction is written only for a file that
+    # has one, and everything from the medium came out of a squashfs, whose
+    # timestamps are whole seconds already. atime and ctime are deleted from
+    # that header because pax records both for every file otherwise - an extra
+    # header each, for two fields extraction does not restore.
+    local excludes=(
+        --exclude=./proc --exclude=./sys --exclude=./dev --exclude=./run
+        --exclude=./tmp --exclude=./mnt --exclude=./lost+found
+        "--exclude=.${destination}"
+    )
+    tar -C / -cf - --sparse --numeric-owner \
+        --format=posix --pax-option=delete=atime,delete=ctime \
+        "${excludes[@]}" . \
+        | tar -C "${destination}" -xpf - --numeric-owner
+}
+
+# The rootfs tarball form of copy_system: the same single-tar copy, but the
+# source is a file the build system produced (make rootfs-tarball) rather than
+# the running root, so a Sowa live system can install a pristine image instead
+# of the state it happens to be in. The destination is the caller's already
+# mounted directory, as with copy_system.
+extract_rootfs_tarball() {
+    local tarball="${1:?extract_rootfs_tarball needs a tarball}"
+    local destination="${2:?extract_rootfs_tarball needs a destination}"
+
+    [[ -f "${tarball}" ]] || die "no such file: ${tarball}"
+    [[ "${destination}" == /* && "${destination}" != / ]] \
+        || die "refusing to extract onto '${destination}'"
+
+    # Refuse an archive whose members would land outside the destination, the
+    # way the build system refuses a source archive before unpacking it.
+    # Compression auto-detection accepts the current .tar.xz output as well as
+    # a legacy .tar.gz copied from an older build.
+    tar -tf "${tarball}" 2>/dev/null \
+        | awk '/^\// || /(^|\/)\.\.(\/|$)/ { bad=1 } END { exit bad }' \
+        || die "archive contains an unsafe path: ${tarball}"
+
+    # --numeric-owner preserves the root ownership the tarball was written with,
+    # so the result is root-owned however it was produced. -p preserves the
+    # modes - the setuid ping, the 0600 shadow - that copy_system preserves too.
+    tar -xpf "${tarball}" -C "${destination}" --numeric-owner
+}
+
+reset_host_keys() {
+    local destination="${1:?reset_host_keys needs a destination}"
+    # A host key identifies one machine. The live environment generated its own
+    # at boot and copy_system just copied it across, so drop it again and let
+    # sowa-sshd-keygen create a fresh key on the installed system's first boot.
+    rm -f "${destination}"/etc/ssh/ssh_host_*
+}
+
+create_mount_points() {
+    local destination="${1:?create_mount_points needs a destination}"
+    # The directories copy_system skips still have to exist on the target: at
+    # boot /etc/rc.d/rc.sysinit mounts proc, sysfs, and devtmpfs over them, and
+    # mount fails on a missing mount point. sowa-chroot needs the same ones for
+    # the same reason.
+    local directory
+    for directory in proc sys dev run tmp mnt; do
+        mkdir -p "${destination}/${directory}"
+    done
+    chmod 1777 "${destination}/tmp"
+    # The kernel opens /dev/console for init before init has mounted devtmpfs,
+    # so the on-disk /dev must carry the two nodes early boot depends on.
+    [[ -e "${destination}/dev/console" ]] \
+        || mknod -m 0600 "${destination}/dev/console" c 5 1
+    [[ -e "${destination}/dev/null" ]] \
+        || mknod -m 0666 "${destination}/dev/null" c 1 3
+}
+
+set_target_hostname() {
+    local destination="${1:?set_target_hostname needs a destination}" name="$2"
+    printf '%s\n' "${name}" > "${destination}/etc/hostname"
+}
+
+# The column widths the generated fstab is written in. One format string for
+# the header, the entries and the commented-out swap alike, so the columns line
+# up whatever went in them.
+readonly SOWA_FSTAB_FORMAT='%-44s %-14s %-8s %-16s %-6s %s\n'
+
+# /etc/fstab for the system in $1, written from what is mounted underneath it.
+#
+# This is the one part of a layout an installer does not have to guess at. The
+# boot loader's disk is a guess - which is why sowa-bootstrap prints the
+# grub-install line rather than running it - but everything that belongs in an
+# fstab is already mounted below the destination, so findmnt here is reading
+# back the layout the operator built rather than choosing one for them.
+#
+# Two things it cannot read back, and both are handled by saying so rather than
+# by inventing an answer:
+#
+#   swap        is not a mount, so nothing under the destination points at it.
+#               Swap signatures found on the machine are written commented out:
+#               one of them may well belong to another system sharing the disk.
+#   the options  each filesystem was mounted with here belong to this
+#               environment - a rescue system's own noatime, a "ro" left over
+#               from a check - and not to the installed one, so every entry
+#               gets "defaults" and the operator adds what they meant.
+generate_fstab() {
+    local destination="${1:?generate_fstab needs a destination}"
+    local fstab="${destination}/etc/fstab"
+
+    # Without a mount point there is no layout to read: findmnt --target would
+    # answer for whichever filesystem merely contains the directory, which is
+    # the installing system's own root. A tree destined to be a chroot needs no
+    # fstab anyway.
+    is_mount_point "${destination}" \
+        || die "generate_fstab: ${destination} is not a mount point"
+    [[ -d "${destination}/etc" ]] \
+        || die "generate_fstab: ${destination}/etc does not exist"
+
+    local entries="" root_found=0
+    local line rest target source fstype uuid partuuid
+    local mountpoint identifier options pass
+    while IFS= read -r line; do
+        # TARGET="/mnt" SOURCE="/dev/sda2" FSTYPE="ext4" UUID="..." PARTUUID="..."
+        #
+        # findmnt --pairs hex-escapes every character that would otherwise need
+        # quoting, so no value can contain a quote of its own and each field
+        # ends at the next one. That is what makes this parseable by cutting the
+        # string rather than by eval, which would hand a mount point somebody
+        # else created to the shell to expand.
+        [[ "${line}" == TARGET=\"* ]] || continue
+        rest="${line#TARGET=\"}";   target="${rest%%\"*}";   rest="${rest#*\" }"
+        [[ "${rest}" == SOURCE=\"* ]] || continue
+        rest="${rest#SOURCE=\"}";   source="${rest%%\"*}";   rest="${rest#*\" }"
+        [[ "${rest}" == FSTYPE=\"* ]] || continue
+        rest="${rest#FSTYPE=\"}";   fstype="${rest%%\"*}";   rest="${rest#*\" }"
+        [[ "${rest}" == UUID=\"* ]] || continue
+        rest="${rest#UUID=\"}";     uuid="${rest%%\"*}";     rest="${rest#*\" }"
+        [[ "${rest}" == PARTUUID=\"* ]] || continue
+        rest="${rest#PARTUUID=\"}"; partuuid="${rest%%\"*}"
+
+        # What is not a filesystem on a block device is not a line in this file.
+        # The kernel's own proc, sys and dev are mounted by rc.sysinit and not
+        # from here; a tmpfs and an overlay have no device to name; and a bind
+        # mount's source is not a device either, because findmnt writes it as
+        # the device with the subtree in brackets ("/dev/sda2[/srv]") and the
+        # test below fails on the whole string.
+        [[ -b "${source}" ]] || continue
+        # Both are real filesystems on real devices and neither is one an
+        # installed system remounts: the squashfs is the live medium this may
+        # be running from, and the iso9660 is what carries it.
+        case "${fstype}" in squashfs|iso9660) continue ;; esac
+
+        # An fstab field is whitespace-separated, so a mount point holding a
+        # space has to be written with it as \040 - and findmnt handed it over
+        # as \x20. Rather than translate between two escapes, leave the mount
+        # out and name it, so that what is missing is missing out loud.
+        if [[ "${target}" == *\\* ]]; then
+            warn "leaving ${target} out of the fstab: writing that mount point needs an escape this does not translate"
+            continue
+        fi
+
+        # The path the installed system will see, which is the path here with
+        # the destination taken off the front. The destination itself becomes /.
+        mountpoint="${target#"${destination}"}"
+        mountpoint="${mountpoint:-/}"
+
+        # UUID= first because it is the one name that fits every layout this
+        # program exists for: a logical volume, an md array and a plain
+        # partition all have one, and only the last has a PARTUUID. The kernel
+        # command line is the other way round - it is resolved with no
+        # initramfs and no udev, so GRUB's root=PARTUUID= stays as it is.
+        if [[ -n "${uuid}" ]]; then
+            identifier="UUID=${uuid}"
+        elif [[ -n "${partuuid}" ]]; then
+            identifier="PARTUUID=${partuuid}"
+        else
+            identifier="${source}"
+            warn "${source} has no UUID, so the fstab names it by device path; that name can change between boots"
+        fi
+
+        # vfat here is the EFI System Partition in every layout this is likely
+        # to meet, and noauto for the reason sowa-setup writes it noauto: a
+        # machine whose ESP has been removed or reformatted still has to reach a
+        # login prompt, and nothing after boot reads it.
+        options=defaults
+        [[ "${fstype}" == vfat ]] && options=defaults,noauto
+        pass=0
+        case "${fstype}" in
+            ext2|ext3|ext4)
+                [[ "${mountpoint}" == / ]] && pass=1 || pass=2
+                ;;
+            vfat)
+                pass=2
+                ;;
+        esac
+        [[ "${mountpoint}" == / ]] && root_found=1
+
+        # Accumulated rather than written as it goes, so that a run that dies
+        # part way through leaves the old file alone instead of half of a new
+        # one. shellcheck disable=SC2059: the format is this file's own
+        # constant, not something that came in from outside.
+        # shellcheck disable=SC2059
+        printf -v entries "%s${SOWA_FSTAB_FORMAT}" "${entries}" \
+            "${identifier}" "${mountpoint}" "${fstype}" "${options}" 0 "${pass}"
+    done < <(findmnt -R -n -P -o TARGET,SOURCE,FSTYPE,UUID,PARTUUID \
+        --target "${destination}" 2>/dev/null)
+
+    # The root entry is the one that must be there. It can go missing for a
+    # layout this cannot describe - a btrfs subvolume, whose source carries the
+    # subvolume in brackets and so fails the block-device test above - and a
+    # boot that mounts no root is not something to find out about at the reboot.
+    (( root_found == 1 )) \
+        || warn "the filesystem mounted at ${destination} is not one this can name in an fstab; the file it wrote has no root entry"
+
+    local swap="" device swap_uuid
+    if command -v blkid >/dev/null 2>&1; then
+        while IFS= read -r device; do
+            [[ -b "${device}" ]] || continue
+            # The image's own compressed swap, made at every boot by
+            # /etc/rc.d/init.d/zram, which no fstab names and nothing here
+            # should offer to.
+            [[ "${device}" == /dev/zram* ]] && continue
+            swap_uuid="$(blkid -s UUID -o value "${device}" 2>/dev/null || true)"
+            [[ -n "${swap_uuid}" ]] && device="UUID=${swap_uuid}"
+            # The same columns as SOWA_FSTAB_FORMAT, one narrower, so that the
+            # "#" sits in front of them rather than pushing them along.
+            printf -v swap "%s#%-43s %-14s %-8s %-16s %-6s %s\n" "${swap}" \
+                "${device}" none swap sw 0 0
+        done < <(blkid -t TYPE=swap -o device 2>/dev/null || true)
+    fi
+
+    {
+        printf '# /etc/fstab - written by %s from the filesystems that\n' "${0##*/}"
+        printf '# were mounted under %s at the time. Check it before\n' "${destination}"
+        printf '# the first boot: whatever was not mounted then is not below.\n#\n'
+        # shellcheck disable=SC2059 # the format is this file's own
+        printf "${SOWA_FSTAB_FORMAT}" \
+            '# <file system>' '<mount point>' '<type>' '<options>' '<dump>' '<pass>'
+        printf '%s' "${entries}"
+        if [[ -n "${swap}" ]]; then
+            printf '\n# Swap is not a mount, so it could not be read off this layout the way\n'
+            printf '# the entries above were. These are the swap areas on the machine, left\n'
+            printf '# commented out because one of them may belong to another system on the\n'
+            printf '# same disk. rc.sysinit runs "swapon -a" after mount -a.\n'
+            printf '%s' "${swap}"
+        fi
+    } > "${fstab}"
+    chmod 0644 "${fstab}"
+}
+
+# Ask for the installed system's root password on the terminal and print it on
+# standard output, so a caller can take it through a command substitution:
+#
+#     password="$(prompt_root_password)"
+#
+# The questions go to standard error - which is where read -p writes a prompt,
+# and why nothing here writes one itself - so they appear while the answer stays
+# on stdout and out of the terminal.
+#
+# It is asked because the image ships root with an empty password. That is right
+# for a live system, which is thrown away at reboot and whose sshd refuses an
+# empty password outright, and wrong for one being installed: an empty answer
+# here leaves a machine anyone at the console can log into as root. So an empty
+# answer is allowed - a machine that will only ever be reached by key wants
+# exactly that - but the caller says so out loud rather than defaulting to it
+# silently.
+#
+# Assign it in a statement of its own. "local password=$(prompt_root_password)"
+# would swallow the exit status below, because that is local's status and not
+# the substitution's, and a mistyped password would carry on as an empty one.
+prompt_root_password() {
+    local attempt password confirmation
+    for (( attempt = 0; attempt < 3; attempt++ )); do
+        # IFS= so a password with a leading or trailing space is read as typed;
+        # read strips both otherwise. -s so it is not echoed.
+        IFS= read -r -s -p 'Root password for the installed system (empty for none): ' password
+        printf '\n' >&2
+        IFS= read -r -s -p 'Repeat it: ' confirmation
+        printf '\n' >&2
+        if [[ "${password}" == "${confirmation}" ]]; then
+            printf '%s' "${password}"
+            return 0
+        fi
+        printf 'The two do not match. Try again.\n' >&2
+    done
+    die "the password was mistyped three times"
+}
+
+set_target_root_password() {
+    local destination="${1:?set_target_root_password needs a destination}" password="$2"
+    local hash
+    hash="$(printf '%s' "${password}" | openssl passwd -6 -stdin)"
+    # The base system keeps password hashes in the root-only shadow database.
+    [[ -f "${destination}/etc/shadow" ]] \
+        || die "${destination}/etc/shadow is missing; there is no root account to set a password on"
+    sed -i "s|^root:[^:]*:|root:${hash}:|" "${destination}/etc/shadow"
+    # sed says nothing when it matches nothing, and a password that was asked
+    # for, typed twice and then quietly not set is the one outcome here that
+    # must not pass for success.
+    grep -q "^root:${hash}:" "${destination}/etc/shadow" \
+        || die "could not set the root password in ${destination}/etc/shadow"
+}
+
+# A Sowa root filesystem, as far as anything here can tell from the outside:
+# the release file names it, and the two programs a chroot is useless without
+# are present. sowa-chroot refuses a directory that fails this, because the
+# alternative is bind-mounting /dev over whatever the user actually typed.
+is_sowa_root() {
+    local destination="${1:?is_sowa_root needs a destination}"
+    [[ -r "${destination}/etc/os-release" ]] || return 1
+    grep -q '^ID=sowa$' "${destination}/etc/os-release" || return 1
+    [[ -x "${destination}/bin/bash" && -x "${destination}/sbin/init" ]]
+}
+
+# The partition holding $1, or nothing if it is not a mount point. Used to turn
+# a destination directory back into the device name the boot loader needs.
+mount_source() {
+    findmnt -n -o SOURCE --target "$1" 2>/dev/null
+}
+
+is_mount_point() {
+    # --mountpoint matches only when the path is itself a mount point, where
+    # --target would answer with whichever filesystem merely contains it.
+    findmnt -n --mountpoint "$1" >/dev/null 2>&1
+}

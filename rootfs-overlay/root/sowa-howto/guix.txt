@@ -1,0 +1,40 @@
+GNU Guix
+========
+
+Also in the repository, and much the largest thing in it: about 870 MiB of
+store, so this is for an installed disk rather than for the live system, which
+runs from RAM.
+
+    sowa-pkg install guix
+    guix install hello
+
+The package is upstream's binary tarball - Guix is the one component Sowa does
+not build - and carries /gnu/store and nothing that changes. sowa-guix-setup
+creates the state Guix writes to; the package declares it as an install step,
+so sowa-pkg runs it, turns the daemon on and starts it, and prints each one as
+it goes. "sowa-pkg hooks guix" lists them, "sowa-pkg install --no-hooks guix"
+declines them and leaves you to run:
+
+    sowa-guix-setup            # build users, /var/guix, root's profile, keys
+    chkconfig guix-daemon on
+    service guix-daemon start
+
+An upgrade of the package runs sowa-guix-setup again and restarts the daemon; a
+removal stops it first. sowa-guix-setup leaves anything already there alone, so
+running it by hand is never wrong. After "guix pull", restart the daemon. Its
+log is /var/log/guix-daemon.log.
+
+Log out and back in once the package is installed, or "source
+/etc/profile.d/guix.sh": that file arrives with the package and a shell reads it
+at login, so the one you installed from does not have it. /usr/bin/guix works
+either way; what the file adds is the profile.
+
+"guix install" ends by asking you to set some environment variables, because the
+profile it just made did not exist when your shell started. It is already done:
+/etc/profile.d/guix.sh applies the profile at login and defines guix as a shell
+function that applies it again afterwards, which is something only the shell
+itself can do. A shell script that runs guix does not get the function and
+should follow the hint.
+
+See also: packages.txt for what an install step is and why a package cannot
+ship a script.

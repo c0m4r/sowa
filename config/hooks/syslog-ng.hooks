@@ -1,0 +1,33 @@
+# syslog-ng.
+#
+# A machine upgraded from the release before syslog-ng gains the package and
+# its rc links through the sowa-release dependency. Hooks run after the whole
+# transaction, when that init script is present, so enable and start it then.
+post-install|service-enable|syslog-ng
+post-install|service-start|syslog-ng
+#
+# An upgrade replaces /usr/sbin/syslog-ng and the modules under
+# /usr/lib64/syslog-ng by renaming the new ones over them. The running daemon
+# keeps the inode it started with and the modules it has already dlopened, so
+# it goes on being the old program - and, worse than for most daemons, the new
+# modules on disk no longer match the core library it has mapped. A reload
+# would not help: SIGHUP rereads the configuration into the process that is
+# already running.
+#
+# The restart costs the few messages sent in the second it takes to come back.
+# That is the smaller loss: a logger running from a program that is no longer
+# on the disk is the one process on the machine whose failure nothing else can
+# report.
+post-upgrade|service-restart|syslog-ng
+# Removing the package does not stop the daemon - an unlinked binary keeps
+# running - and this one holds /dev/log. Without these, "sowa-pkg remove
+# syslog-ng" leaves a logger writing from a program that is gone, and rc links
+# naming an init script the same removal takes away: a service the next boot
+# tries and fails to start.
+#
+# Everything that logs keeps working afterwards. syslog(3) to a socket nothing
+# is listening on is discarded, which is exactly where this system was before
+# the package existed, and each service's own output still reaches its
+# /var/log/<name>.log through the rc framework.
+pre-remove|service-stop|syslog-ng
+pre-remove|service-disable|syslog-ng

@@ -1,0 +1,16 @@
+# v6
+
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -m conntrack --ctstate INVALID -j DROP
+# NDP, RA, and PMTU discovery. IPv6 does not work without ICMPv6.
+-A INPUT -p ipv6-icmp -j ACCEPT
+# DHCPv6 replies. nic's DHCPv6 client listens on a UDP socket, so unlike
+# DHCPv4 (a packet socket) these are filtered by this chain.
+-A INPUT -s fe80::/10 -p udp -m udp --dport 546 -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT
+COMMIT

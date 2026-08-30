@@ -1,0 +1,227 @@
+.Dd August 27, 2026
+.Dt SOWA-SETUP 8
+.Os Sowa
+.Sh NAME
+.Nm sowa-setup
+.Nd install Sowa from the live environment onto a disk
+.Sh SYNOPSIS
+.Nm
+.Sh DESCRIPTION
+.Nm
+takes a whole disk and does everything: partitions it, makes the filesystems,
+copies the running system across and installs GRUB for both legacy BIOS and
+UEFI firmware.
+An interactive run asks for the partition-table format, root filesystem, NIC
+configuration and root password.
+Environment variables provide the same choices to an unattended run.
+.Pp
+Booted from the ISO, Sowa's root filesystem is a read-only squashfs on the
+medium with a tmpfs overlaid on it.
+What is copied is the merged view, so anything changed since boot - a password
+set, a package installed - is copied as it is now.
+.Pp
+The default is an MBR partition table with a FAT EFI System Partition and an
+ext4 root, preserving the layout used by earlier releases.
+GPT can be selected instead; it adds a 1 MiB BIOS Boot Partition ahead of the
+ESP.
+With MBR, GRUB's BIOS core is embedded in the reserved post-MBR gap.
+The UEFI image is installed to the ESP in removable mode
+.Pq Pa EFI/BOOT/BOOTX64.EFI ,
+so no firmware NVRAM entry is needed and no
+.Xr efibootmgr 8
+with it.
+The installed system boots the on-disk kernel directly with
+.Ar root=PARTUUID=... ,
+with no initramfs between them.
+.Pp
+The root may be ext4, XFS or Btrfs.
+All three drivers are built into the Sowa kernel, so each can be mounted as the
+direct root without an initramfs.
+An ext4 root is made with
+.Cm orphan_file
+and
+.Cm metadata_csum_seed
+switched off.
+e2fsprogs 1.47 turns both on by default and GRUB 2.12's ext2 driver cannot read
+either, so a filesystem made without this lands at a rescue prompt instead of a
+boot menu.
+.Pp
+Before it writes anything,
+.Nm
+checks that the target is a whole disk rather than a partition, that none of its
+partitions is mounted, that the live system has a kernel to copy, that the
+selected filesystem tool is installed, and that what is left after the ESP is
+large enough for the system and filesystem metadata.
+Then it says what it is about to destroy and waits to be told to go ahead.
+.Pp
+Once the erase is confirmed and before anything is written,
+.Nm
+asks for the root password the installed system will have, twice, without
+echoing it.
+It is asked here rather than at the end because the copy that follows takes
+minutes and there is nobody waiting at the end of them.
+The image ships root with an empty password, which is right for a live system
+that is thrown away at reboot and wrong for one being installed, so an empty
+answer is accepted - a machine reached only by SSH key wants exactly that - and
+said out loud rather than taken silently.
+The question is skipped, and the account left as the image ships it, when
+.Ev SOWA_SETUP_ROOT_PASSWORD
+already answers it, when
+.Ev SOWA_SETUP_ASSUME_YES
+says the run is unattended, when standard input is not a terminal, or when
+there is no
+.Xr openssl 1
+to hash the answer with.
+.Pp
+Host keys are not copied: a shipped or copied host key would give every
+installation the same identity.
+The installed system generates its own at first boot.
+.Pp
+NIC mode
+.Cm keep
+copies the running system's
+.Pa /etc/nic.conf
+unchanged.
+The guided DHCP, static and firewall-only modes generate a replacement while
+retaining Sowa's default IPv4 and IPv6 firewall rules.
+A complete configuration file can be supplied instead when the guided fields
+are not enough.
+.Sh ENVIRONMENT
+.Nm
+is interactive by default.
+For an unattended install, set these:
+.Bl -tag -width SOWA_SETUP_ROOT_FILESYSTEM
+.It Ev SOWA_SETUP_DISK
+The target device, for example
+.Pa /dev/sda .
+Set, and the menu is skipped.
+.It Ev SOWA_SETUP_ASSUME_YES
+Set to 1 to skip the confirmation before the disk is erased and the root
+password prompt with it.
+.It Ev SOWA_SETUP_ROOT_PASSWORD
+The root password for the installed system, given instead of being asked for.
+Unset, an interactive run asks; an unattended one installs the account as the
+image ships it, with no password at all.
+.It Ev SOWA_SETUP_ESP_SIZE_MB
+The size of the EFI System Partition in MiB.
+The default is 512 and the minimum is 34, below which
+.Xr mkfs.fat 8
+cannot make the 65525 clusters FAT32 requires.
+.It Ev SOWA_SETUP_HOSTNAME
+The hostname for the installed system.
+.It Ev SOWA_SETUP_PARTITION_TABLE
+.Cm mbr
+or
+.Cm gpt .
+The unattended default is
+.Cm mbr .
+The spelling
+.Cm dos
+is accepted as an alias for
+.Cm mbr .
+.It Ev SOWA_SETUP_ROOT_FILESYSTEM
+.Cm ext4 ,
+.Cm xfs
+or
+.Cm btrfs .
+The unattended default is
+.Cm ext4 .
+The misspelling
+.Cm brfs
+is accepted as an alias for
+.Cm btrfs .
+.It Ev SOWA_SETUP_NIC_CONFIG_FILE
+A complete
+.Cm nic
+configuration to install as
+.Pa /etc/nic.conf .
+It is validated before the disk is written and cannot be combined with
+.Ev SOWA_SETUP_NIC_MODE .
+.It Ev SOWA_SETUP_NIC_MODE
+One of
+.Cm keep ,
+.Cm dhcp ,
+.Cm static
+or
+.Cm firewall-only .
+The unattended default is
+.Cm keep .
+The last mode configures no non-loopback interface, but still lets the network
+service restore the default firewall.
+.It Ev SOWA_SETUP_NIC_INTERFACE
+The interface used by
+.Cm dhcp
+or
+.Cm static .
+The current default-route interface, the first non-loopback interface, or
+.Cm eth0
+is selected when this is unset.
+.It Ev SOWA_SETUP_NIC_ADDRESS
+The address, normally in CIDR notation, required by static mode.
+.It Ev SOWA_SETUP_NIC_GATEWAY
+An optional default gateway for static mode.
+.It Ev SOWA_SETUP_NIC_DNS
+Optional DNS server addresses separated by spaces or commas for static mode.
+.El
+.Sh FILES
+.Bl -tag -width "/usr/lib/sowa/install-functions" -compact
+.It Pa /usr/lib/sowa/install-functions
+the copy, the host-key reset and the mount points, shared with
+.Xr sowa-bootstrap 8
+and
+.Xr sowa-chroot 8 .
+.It Pa /mnt
+where the target root is mounted while the copy runs.
+.It Pa /boot/vmlinuz
+the kernel that must be there to copy.
+.El
+.Sh EXIT STATUS
+.Ex -std
+Every check that fails does so before anything has been written.
+.Sh EXAMPLES
+The whole interactive install:
+.Pp
+.Dl sowa-setup
+.Pp
+Unattended, onto a virtual disk, with a password and a name:
+.Bd -literal -offset indent
+SOWA_SETUP_DISK=/dev/vda \e
+SOWA_SETUP_ASSUME_YES=1 \e
+SOWA_SETUP_ROOT_PASSWORD=hunter2 \e
+SOWA_SETUP_HOSTNAME=web01 \e
+    sowa-setup
+.Ed
+.Pp
+GPT, XFS and a static interface:
+.Bd -literal -offset indent
+SOWA_SETUP_DISK=/dev/nvme0n1 \e
+SOWA_SETUP_ASSUME_YES=1 \e
+SOWA_SETUP_PARTITION_TABLE=gpt \e
+SOWA_SETUP_ROOT_FILESYSTEM=xfs \e
+SOWA_SETUP_NIC_MODE=static \e
+SOWA_SETUP_NIC_INTERFACE=enp1s0 \e
+SOWA_SETUP_NIC_ADDRESS=192.0.2.10/24 \e
+SOWA_SETUP_NIC_GATEWAY=192.0.2.1 \e
+SOWA_SETUP_NIC_DNS="1.1.1.1 2606:4700:4700::1111" \e
+    sowa-setup
+.Ed
+.Sh SEE ALSO
+.Xr sowa-bootstrap 8 ,
+.Xr sowa-chroot 8 ,
+.Xr sowa-pkg 8
+.Sh CAVEATS
+.Nm
+erases the disk it is given.
+It does not create an LVM or mdadm root, an encrypted root, or a disk shared
+with another operating system; those layouts are what
+.Xr sowa-bootstrap 8
+is for.
+Sowa includes mdadm and LVM2 and activates arrays and volume groups before
+mounting fstab entries, but a root placed on either needs a boot arrangement
+with an initramfs rather than the direct-root menu this command writes.
+.Pp
+It must run as root, and on Linux 6.1 or newer.
+Every binary in the image was built against glibc configured for that kernel,
+and an older one does not fail cleanly - see
+.Xr sowa-bootstrap 8 ,
+which explains the check the two of them share.

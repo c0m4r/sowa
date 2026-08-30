@@ -1,0 +1,11 @@
+Guix is set up and its daemon is running, now and at every boot.
+
+Log out and back in before you use it: /etc/profile.d/guix.sh is read at login,
+and it is what puts the programs guix installs on your PATH. In this shell,
+"source /etc/profile.d/guix.sh" does the same. Then, as root:
+
+    guix install hello
+
+Guix installs into /gnu/store and into per-user profiles, so nothing else on
+this system is affected by anything you do with it. See
+/root/sowa-howto/guix.txt.

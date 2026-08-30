@@ -1,0 +1,25 @@
+# ISC BIND.
+#
+# Nothing enables named here. It is in the image because dig is, and the
+# decision to run a name server on a particular machine is that machine's -
+# which is also why the init script carries no default runlevels. The hooks
+# below only keep a named that somebody did start honest about which program it
+# is running.
+#
+# An upgrade replaces /usr/sbin/named and the five libraries under it. A
+# running named goes on serving from the inodes it started with, so it keeps
+# answering from the old program - including from the old libdns, which is
+# where a DNS security fix almost always lands. Restarting is the point of
+# having upgraded. It is a restart rather than a reload because reload rereads
+# zones and configuration and does not replace the program.
+#
+# Cache is lost with the restart and refills from the queries that follow.
+# A resolver that cannot afford that declines with
+# "sowa-pkg upgrade --no-hooks bind" and restarts when it suits.
+post-upgrade|service-restart|named
+# Removing the package does not stop the daemon: an unlinked binary keeps
+# running, and this one holds port 53 and the control channel. Without these,
+# "sowa-pkg remove bind" leaves a name server answering from a program that is
+# no longer on the disk, and rc links that make the next boot try to start it.
+pre-remove|service-stop|named
+pre-remove|service-disable|named

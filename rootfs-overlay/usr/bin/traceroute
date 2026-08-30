@@ -1,0 +1,23 @@
+#!/bin/sh
+# A name Sowa answers but does not implement.
+#
+# Sowa ships mtr instead of building a package to keep the traceroute name.
+# mtr walks the path exactly as traceroute does and
+# then keeps probing every hop it found, so it reports loss and latency per hop
+# over time rather than one snapshot - which is the question anyone running
+# traceroute actually has. "mtr -r" prints a single report and exits, if the
+# one-shot behaviour is what was wanted.
+#
+# It exits 127, the same status a missing command produces, so a script testing
+# for traceroute still fails rather than believing it succeeded.
+
+printf '%s\n' \
+    "traceroute is not part of Sowa. Use mtr(8), which does the same walk:" \
+    "" \
+    "    mtr HOST                  live, one line per hop, updating" \
+    "    mtr -r -c 10 HOST         one report of 10 probes, then exit" \
+    "    mtr -T -P 443 HOST        TCP probes to a port, not ICMP" \
+    "    mtr -n HOST               skip the reverse DNS lookups" \
+    "" \
+    "See mtr(8). It is in /usr/sbin, which is on the default PATH." >&2
+exit 127

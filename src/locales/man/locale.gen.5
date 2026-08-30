@@ -1,0 +1,91 @@
+.Dd August 18, 2026
+.Dt LOCALE.GEN 5
+.Os Sowa
+.Sh NAME
+.Nm locale.gen
+.Nd which locales this machine compiles, and the catalogue of every one it could
+.Sh SYNOPSIS
+.Pa /etc/locale.gen
+.Sh DESCRIPTION
+.Pa /etc/locale.gen
+is read by
+.Xr locale-gen 8 ,
+which compiles each locale the file enables into
+.Pa /usr/lib/locale/locale-archive .
+Each line is
+.Pp
+.Dl locale charset
+.Pp
+where
+.Ar locale
+is a name such as
+.Ql de_DE.UTF-8
+and
+.Ar charset
+is the character map to compile it against, such as
+.Ql UTF-8 .
+Blank lines and lines beginning with
+.Ql #
+are ignored.
+.Pp
+The file ships holding every locale the C library it was built against
+supports - a little over five hundred of them, generated from glibc's own
+.Pa localedata/SUPPORTED -
+with all but the image's own set commented out.
+So it is a catalogue as much as a configuration: the way to find a name is to
+search this file.
+.Bd -literal -offset indent
+grep -i portuguese /etc/locale.gen
+grep '^#pt_' /etc/locale.gen
+.Ed
+.Pp
+A locale is enabled by uncommenting its line, or by naming it to
+.Xr locale-gen 8 ,
+which uncomments it and then compiles.
+Neither the file nor the archive is consulted by any program at run time except
+.Xr locale-gen 8 :
+what a program sees is the compiled archive, so an edit here does nothing until
+.Xr locale-gen 8
+has run.
+.Pp
+The image is built with the set in
+.Pa config/locales.conf
+in the Sowa source tree, which is the same two lines this file arrives with
+uncommented.
+.Sh THE COST OF A LOCALE
+Compiled locales share their character tables and pay separately for collation
+and formats, so the first one is expensive and the rest are not.
+.Ql C.UTF-8
+alone is 392 KB;
+with
+.Ql en_US.UTF-8
+beside it, 2.9 MB;
+sixteen locales covering most of the world's speakers, 17 MB;
+all 328 UTF-8 locales, about 200 MB.
+An installed system that wants them all can have them:
+.Bd -literal -offset indent
+sed -i 's/^#\e([a-z].*UTF-8\e)$/\e1/' /etc/locale.gen
+locale-gen
+.Ed
+.Sh FILES
+.Bl -tag -width "/usr/lib/locale/locale-archive"
+.It Pa /etc/locale.gen
+This file.
+.It Pa /usr/lib/locale/locale-archive
+What
+.Xr locale-gen 8
+writes from it.
+.It Pa /usr/share/i18n/locales
+The locale definitions, one file per locale, in the source form
+.Xr localedef 1
+reads.
+.It Pa /usr/share/i18n/charmaps
+The character maps.
+.El
+.Sh SEE ALSO
+.Xr locale 1 ,
+.Xr localedef 1 ,
+.Xr locale.conf 5 ,
+.Xr locale-gen 8
+.Pp
+.Pa /root/sowa-howto/locale.txt

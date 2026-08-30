@@ -1,0 +1,60 @@
+.Dd August 17, 2026
+.Dt SOWA-SSHD-KEYGEN 8
+.Os Sowa
+.Sh NAME
+.Nm sowa-sshd-keygen
+.Nd create the sshd host key on the running system
+.Sh SYNOPSIS
+.Nm
+.Sh DESCRIPTION
+A host key identifies a machine, so shipping one in the image would give every
+Sowa installation the same identity: anything that trusted one would trust all
+of them, and the first machine to be installed would be able to impersonate
+every machine installed after it.
+The image therefore carries no host key at all, and the build refuses to make
+one that does.
+.Pp
+.Nm
+is what creates it instead.
+.Pa /etc/rc.d/init.d/sshd
+runs it before starting the daemon, so a fresh installation generates its own
+key at the first boot that starts SSH.
+.Pp
+It creates the Ed25519 key that
+.Pa /etc/ssh/sshd_config
+names, and nothing else.
+.Ic ssh-keygen -A
+adds the remaining types if a client that cannot speak Ed25519 ever needs one.
+The key is commented
+.Ar root@ Ns Ar hostname ,
+read from
+.Pa /etc/hostname .
+.Pp
+It takes no options and is a no-op once the key exists, so running it by hand is
+never wrong and never regenerates anything.
+Deleting the key and running it again is how a machine is given a new identity -
+after cloning a disk image, for instance, where every copy would otherwise
+answer with the same fingerprint.
+.Sh FILES
+.Bl -tag -width "/etc/ssh/ssh_host_ed25519_key.pub" -compact
+.It Pa /etc/ssh/ssh_host_ed25519_key
+the private key, mode 0600.
+.It Pa /etc/ssh/ssh_host_ed25519_key.pub
+the public half, mode 0644.
+.It Pa /etc/rc.d/init.d/sshd
+what runs this.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh EXAMPLES
+Give a cloned machine an identity of its own:
+.Bd -literal -offset indent
+rm -f /etc/ssh/ssh_host_*
+sowa-sshd-keygen
+service sshd restart
+.Ed
+.Sh SEE ALSO
+.Xr ssh-keygen 1 ,
+.Xr sshd_config 5 ,
+.Xr service 8 ,
+.Xr sshd 8

@@ -1,0 +1,47 @@
+#!/bin/bash
+#
+# chkconfig: 2345 60 40
+# description: Cronie, the cron daemon
+#
+# -n keeps crond in the foreground so its output can be kept; -m off disables
+# mail, because the base image has neither a mail transfer agent nor a syslog
+# daemon and a scheduled command should redirect its own output.
+
+. /etc/rc.d/init.d/functions
+
+name=crond
+program=/usr/sbin/crond
+pidfile=/run/crond.pid
+logfile=/var/log/crond.log
+
+case "${1:-}" in
+    start)
+        begin "Starting ${name}"
+        daemon --pidfile "${pidfile}" --log "${logfile}" -- \
+            "${program}" -n -m off
+        result $?
+        ;;
+    stop)
+        begin "Stopping ${name}"
+        killproc --pidfile "${pidfile}" "${program}"
+        result $?
+        ;;
+    restart)
+        "$0" stop
+        "$0" start
+        ;;
+    reload)
+        # Cronie rereads the spool on its own, through inotify; SIGHUP is here
+        # for the cases where a table was replaced behind its back.
+        begin "Reloading ${name}"
+        killproc --pidfile "${pidfile}" --signal HUP "${program}"
+        result $?
+        ;;
+    status)
+        status --pidfile "${pidfile}" "${program}"
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|reload|status}\n' "$0" >&2
+        exit 2
+        ;;
+esac

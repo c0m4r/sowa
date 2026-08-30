@@ -1,0 +1,7 @@
+root:x:0:
+tty:x:5:
+disk:x:6:
+wheel:x:10:root
+named:x:25:
+sshd:x:74:
+nobody:x:65534:

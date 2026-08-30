@@ -1,0 +1,6 @@
+# chrony. Restarting chronyd costs the clock its accumulated drift estimate and
+# a few minutes of re-convergence, which is a smaller price than a time daemon
+# running from a program that has been replaced under it.
+post-upgrade|service-restart|chronyd
+pre-remove|service-stop|chronyd
+pre-remove|service-disable|chronyd

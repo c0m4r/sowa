@@ -1,0 +1,4186 @@
+#!/bin/bash
+#
+# sowa-partitioner - look at the disks, lay out partitions, build RAID and LVM.
+#
+# This is the program that gets a disk into a state something can be installed
+# onto. sowa-setup does its own partitioning of one whole disk in one fixed
+# shape; this does the general case: several disks, an existing table to read
+# and keep, partitions placed by hand, and md/LVM stacked on top afterwards.
+#
+# Nothing is written to a disk until it is applied. Everything up to that point
+# edits an in-memory plan - a list of partitions with a start, a length and a
+# kind - which is drawn beside the table that is really on the disk. "Apply"
+# turns that plan into one sfdisk script and one call, and the pending changes
+# are listed and confirmed before it runs.
+#
+# Rewriting a table renumbers what is on it, and on GPT it would ordinarily
+# hand every partition a fresh UUID. Both would break an /etc/fstab that names
+# partitions by PARTUUID, for partitions whose contents were never touched. So
+# the identity of everything that was already there is carried through the
+# rewrite: the GPT partition UUIDs are read out of the old table and written
+# back into the new one, and an MBR disk's four-byte signature - the first half
+# of every PARTUUID on it - is preserved the same way. Only genuinely new
+# partitions get new identities.
+#
+# The partition kinds are the ones a Sowa system is built out of:
+#
+#   ext4, xfs, btrfs   a filesystem, made when the plan is applied
+#   efi                a FAT32 EFI System Partition
+#   biosboot           the 1 MiB BIOS Boot Partition GRUB embeds into on GPT
+#   raid               a Linux RAID member, left empty for mdadm
+#   lvm                an LVM2 physical volume, left empty for pvcreate
+#
+# The ext4 filesystems it makes have orphan_file and metadata_csum_seed
+# switched off, for the same reason sowa-setup does it: e2fsprogs 1.47 turns
+# both on by default and GRUB 2.12's ext2 driver can read neither, so a /boot
+# made without this lands at a rescue prompt.
+#
+# Wiping is a separate operation from partitioning, and its default is the
+# narrow one: the regions that hold a partition table and the head and tail of
+# every partition that is on the disk now. That is where filesystem, RAID and
+# LVM signatures live, so it is what makes a disk stop being recognised as
+# whatever it used to be - without writing over a terabyte to do it. Wiping the
+# whole disk, or a stated size or percentage of it, is offered as well.
+#
+# It runs as a full-screen program by default and as a set of subcommands when
+# given one, so the same tool serves an install being done by hand and a script
+# preparing a machine. --dry-run prints what would be run and writes nothing;
+# every destructive step in this program goes through one place, so that flag
+# covers all of them.
+
+set -Eeuo pipefail
+
+readonly PROGRAM=sowa-partitioner
+
+# 1 MiB, expressed in sectors once the disk's sector size is known. Every start
+# and length in a plan is a multiple of this: it is what every partitioning
+# tool has aligned to since 4Kn and SSD erase blocks made the old
+# cylinder-boundary answer wrong, and it is also the size of the gap GRUB's
+# i386-pc core is embedded into on an MBR disk.
+readonly ALIGN_BYTES=$((1024 * 1024))
+
+# What a wipe clears at each end of a disk and of each partition. A partition
+# table lives in the first of these and, for GPT, is mirrored in the last. A
+# filesystem superblock is inside the first; an mdadm 0.90 or 1.0 superblock is
+# inside the last. One MiB covers all of them with room to spare and is a whole
+# number of alignment units.
+readonly SIGNATURE_BYTES=$((1024 * 1024))
+
+# The smallest each kind of partition may be made. These are not taste: below
+# them the thing that makes the filesystem fails, and it fails after the
+# partition table has already been written.
+#
+# The ESP figure is mkfs.fat's: a FAT32 filesystem needs 65525 clusters, which
+# is not reachable below 34 MiB. XFS refuses under 300 MB. Btrfs needs room for
+# its system chunk. ext4 will go far smaller than 8 MiB, but nothing useful is
+# below it.
+readonly MIN_BYTES_EXT4=$((8 * 1024 * 1024))
+readonly MIN_BYTES_XFS=$((320 * 1024 * 1024))
+readonly MIN_BYTES_BTRFS=$((128 * 1024 * 1024))
+readonly MIN_BYTES_EFI=$((34 * 1024 * 1024))
+readonly MIN_BYTES_BIOSBOOT=$((1024 * 1024))
+readonly MIN_BYTES_RAID=$((1024 * 1024))
+readonly MIN_BYTES_LVM=$((1024 * 1024))
+
+# The root filesystem has to be built with -O, so this has to be e2fsprogs'
+# mkfs.ext4 and nothing else. Named by path rather than resolved through PATH,
+# where a running system may since have grown something else; the PATH lookup
+# is the fallback for running this from a rescue environment that keeps its
+# filesystem tools somewhere else.
+MKFS_EXT4=/usr/sbin/mkfs.ext4
+[[ -x "${MKFS_EXT4}" ]] || MKFS_EXT4=mkfs.ext4
+
+# The tools every path that writes a partition table goes through: sfdisk writes
+# it, od makes the random MBR signature that gives such a disk usable PARTUUIDs,
+# and blockdev reports the size the plan is measured against. partx is not here
+# because it is only the fallback for telling a busy kernel about the result,
+# and reread_table already checks for it before reaching for it.
+readonly TABLE_TOOLS=(sfdisk od blockdev)
+
+DRY_RUN=0
+ASSUME_YES=0
+DO_FORMAT=1
+# Loop devices are not disks and are left out of the listing, which is what
+# stops a live system's own squashfs mount from appearing as a target. They are
+# also the only way to exercise this program without a spare disk, so there is
+# a way to ask for them.
+ALLOW_LOOP=0
+[[ "${SOWA_PARTITIONER_ALLOW_LOOP:-0}" == 1 ]] && ALLOW_LOOP=1
+# The sector size a raw image is treated as having. A file has no opinion about
+# this the way a disk does, and 512 is what every tool assumes of one unless it
+# is told otherwise.
+IMAGE_SECTOR=512
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+log()  { printf '==> %s\n' "$*"; }
+warn() { printf '==> warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# Every command that changes a disk goes through here, which is what makes
+# --dry-run a property of the program rather than of the places that remembered
+# to check for it.
+run() {
+    if ((DRY_RUN)); then
+        printf '+ %s\n' "$*"
+        return 0
+    fi
+    "$@"
+}
+
+require_root() {
+    [[ "$(id -u)" -eq 0 ]] || die "${PROGRAM} must run as root"
+}
+
+# Writing to a disk needs root and writing to a file does not, and which of the
+# two is happening is a property of what was named rather than of which
+# subcommand was asked for. So the target decides, and partitioning an image
+# works as whoever owns the image.
+require_privilege() {
+    local target="${1:-}"
+    ((DRY_RUN)) && return 0
+    [[ -n "${target}" ]] && [[ -f "${target}" ]] && return 0
+    require_root
+}
+
+missing_tools() {
+    local tool
+    for tool in "$@"; do
+        command -v "${tool}" > /dev/null 2>&1 || printf '%s\n' "${tool}"
+    done
+}
+
+require_tools() {
+    local missing=()
+    mapfile -t missing < <(missing_tools "$@")
+    ((${#missing[@]} == 0)) || die "missing required tools: ${missing[*]}"
+}
+
+# ---------------------------------------------------------------------------
+# Sizes
+#
+# Sizes are read the way sfdisk reads them, because sfdisk is what eventually
+# receives them and a program that disagreed with its own back end about what
+# "10G" means would be worse than one that picked either convention: a bare
+# unit letter is a power of 1024, a two-letter "B" spelling is a power of 1000,
+# and the explicit "iB" spellings are powers of 1024. So 10G and 10GiB are the
+# same number and 10GB is a smaller one.
+#
+# A percentage is of whatever the caller is filling - the free region a new
+# partition is being placed in, the disk a wipe is being sized against - so
+# that "100%" always means "the rest of it". Each place that accepts one says
+# what it is a percentage of.
+#
+# A number with no unit at all is refused. It is the one input whose intent
+# cannot be read off the text: somebody who types "10" into a box that has just
+# offered "10G" as an example means gigabytes, and the answer bytes would give
+# them is a partition of the minimum size, created without complaint.
+# ---------------------------------------------------------------------------
+
+# The disk's logical sector size, and the alignment and unit that follow from
+# it. Set by disk_select; the defaults are what a size parsed before any disk
+# is chosen is measured against.
+SECTOR=512
+ALIGN=$((ALIGN_BYTES / 512))
+
+parse_size() {
+    local text="${1//[[:space:]]/}" base="${2:-0}"
+    local whole frac unit mult letter radix
+
+    [[ -n "${text}" ]] || { printf 'a size is required\n' >&2; return 1; }
+
+    if [[ ! "${text}" =~ ^([0-9]+)(\.([0-9]+))?([A-Za-z%]*)$ ]]; then
+        printf 'not a size: %s\n' "$1" >&2
+        return 1
+    fi
+    whole="${BASH_REMATCH[1]}"
+    frac="${BASH_REMATCH[3]}"
+    unit="${BASH_REMATCH[4]^^}"
+
+    if [[ "${unit}" == '%' ]]; then
+        ((base > 0)) || { printf 'a percentage means nothing here\n' >&2; return 1; }
+        # Carried to three decimal places and rounded rather than truncated, so
+        # that three partitions of 33.4% do not silently leave a sliver behind.
+        local scaled=$(( whole * 1000 ))
+        if [[ -n "${frac}" ]]; then
+            local padded="${frac}000"
+            scaled=$(( scaled + 10#${padded:0:3} ))
+        fi
+        ((scaled <= 100000)) || { printf 'a percentage above 100%% means nothing\n' >&2; return 1; }
+        printf '%d' $(( (base * scaled + 50000) / 100000 ))
+        return 0
+    fi
+
+    case "${unit}" in
+        '')
+            printf 'a size needs a unit: 10G, 512MiB, 2048s or 50%%\n' >&2
+            return 1
+            ;;
+        B) mult=1 ;;
+        S) mult="${SECTOR}" ;;
+        *)
+            if [[ "${unit}" =~ ^([KMGTPE])IB$ ]]; then
+                letter="${BASH_REMATCH[1]}"
+                radix=1024
+            elif [[ "${unit}" =~ ^([KMGTPE])B$ ]]; then
+                letter="${BASH_REMATCH[1]}"
+                radix=1000
+            elif [[ "${unit}" =~ ^([KMGTPE])$ ]]; then
+                letter="${BASH_REMATCH[1]}"
+                radix=1024
+            else
+                printf 'unknown unit: %s\n' "${unit}" >&2
+                return 1
+            fi
+            mult=1
+            local step
+            for step in K M G T P E; do
+                mult=$(( mult * radix ))
+                [[ "${step}" == "${letter}" ]] && break
+            done
+            ;;
+    esac
+
+    local total=$(( whole * mult ))
+    if [[ -n "${frac}" ]]; then
+        local padded="${frac}000000"
+        local millionths=$(( 10#${padded:0:6} ))
+        # The multiplier is split rather than divided: (mult / 1000000) *
+        # millionths on its own throws away everything below the multiplier's
+        # millionth part, which is 370 KiB of a 1.5G. Multiplying first would
+        # be exact but overflows a signed 64-bit intermediate above a
+        # terabyte, so each half is scaled in the order that cannot.
+        total=$(( total + (mult / 1000000) * millionths \
+            + ((mult % 1000000) * millionths) / 1000000 ))
+    fi
+    printf '%d' "${total}"
+}
+
+format_size() {
+    local bytes="$1"
+    local names=(B KiB MiB GiB TiB PiB)
+    local index=0 div=1
+
+    ((bytes >= 0)) || { printf '-'; return; }
+    while ((index < 5)) && ((bytes / 1024 >= div)) && ((bytes >= div * 1024)); do
+        div=$(( div * 1024 ))
+        index=$(( index + 1 ))
+    done
+    if ((index == 0)); then
+        printf '%d B' "${bytes}"
+        return
+    fi
+
+    local scaled=$(( (bytes * 100 + div / 2) / div ))
+    local whole=$(( scaled / 100 )) frac=$(( scaled % 100 ))
+    # Rounding up can carry a value that was just short of the next unit over
+    # it - 1073741823 bytes is not 1 GiB but rounds to 1024.00 KiB - and
+    # "1024 KiB" is not a unit anybody uses.
+    if ((whole >= 1024 && index < 5)); then
+        whole=1
+        frac=0
+        index=$(( index + 1 ))
+    fi
+    if ((frac == 0)); then
+        printf '%d %s' "${whole}" "${names[index]}"
+    elif ((frac % 10 == 0)); then
+        printf '%d.%d %s' "${whole}" $(( frac / 10 )) "${names[index]}"
+    else
+        printf '%d.%02d %s' "${whole}" "${frac}" "${names[index]}"
+    fi
+}
+
+# Sectors in, human-readable out. Every length in a plan is in sectors and
+# every length shown to somebody is not.
+format_sectors() { format_size $(( $1 * SECTOR )); }
+
+align_down() { printf '%d' $(( ($1 / ALIGN) * ALIGN )); }
+align_up()   { printf '%d' $(( (($1 + ALIGN - 1) / ALIGN) * ALIGN )); }
+
+# ---------------------------------------------------------------------------
+# Partition kinds
+#
+# One name per kind on this side, and the code the table format wants on the
+# other. GPT type GUIDs and MBR type bytes are not translations of each other -
+# GPT has no BIOS Boot equivalent in MBR, and MBR's 0x83 covers every Linux
+# filesystem - so the mapping is written out per format rather than derived.
+# ---------------------------------------------------------------------------
+
+readonly KINDS=(ext4 xfs btrfs efi biosboot raid lvm)
+
+kind_label() {
+    case "$1" in
+        ext4)     printf 'ext4' ;;
+        xfs)      printf 'XFS' ;;
+        btrfs)    printf 'Btrfs' ;;
+        efi)      printf 'EFI System' ;;
+        biosboot) printf 'BIOS boot' ;;
+        raid)     printf 'RAID member' ;;
+        lvm)      printf 'LVM2 member' ;;
+        linux)      printf 'Linux' ;;
+        swap)       printf 'swap' ;;
+        root)       printf 'Linux root' ;;
+        home)       printf 'Linux /home' ;;
+        var)        printf 'Linux /var' ;;
+        srv)        printf 'Linux /srv' ;;
+        xbootldr)   printf 'Linux boot' ;;
+        luks)       printf 'LUKS' ;;
+        windows)    printf 'Windows data' ;;
+        recovery)   printf 'Win recovery' ;;
+        msreserved) printf 'MS reserved' ;;
+        extended)   printf 'extended' ;;
+        protective) printf 'protective' ;;
+        other)      printf 'other' ;;
+        *)        printf '%s' "$1" ;;
+    esac
+}
+
+kind_description() {
+    case "$1" in
+        ext4)     printf 'ext4 filesystem, made GRUB-readable' ;;
+        xfs)      printf 'XFS filesystem' ;;
+        btrfs)    printf 'Btrfs filesystem' ;;
+        efi)      printf 'FAT32 EFI System Partition, for UEFI boot' ;;
+        biosboot) printf '1 MiB, for GRUB on GPT; left empty' ;;
+        raid)     printf 'Linux RAID member for mdadm; left empty' ;;
+        lvm)      printf 'LVM2 physical volume for pvcreate; left empty' ;;
+    esac
+}
+
+partition_type_label() {
+    local index="$1"
+    if [[ "${P_KIND[index]}" == other && -n "${P_TYPE[index]}" ]]; then
+        printf '%s' "${P_TYPE[index]:0:12}"
+    else
+        kind_label "${P_KIND[index]}"
+    fi
+}
+
+# The program that makes each kind of filesystem, or nothing for the kinds that
+# are handed on empty. One table, so that the places which make a filesystem and
+# the places which check one can be made cannot drift apart.
+mkfs_for_kind() {
+    case "$1" in
+        ext4)  printf '%s' "${MKFS_EXT4}" ;;
+        xfs)   printf 'mkfs.xfs' ;;
+        btrfs) printf 'mkfs.btrfs' ;;
+        efi)   printf 'mkfs.fat' ;;
+        *)     return 1 ;;
+    esac
+}
+
+kind_min_bytes() {
+    case "$1" in
+        ext4)     printf '%d' "${MIN_BYTES_EXT4}" ;;
+        xfs)      printf '%d' "${MIN_BYTES_XFS}" ;;
+        btrfs)    printf '%d' "${MIN_BYTES_BTRFS}" ;;
+        efi)      printf '%d' "${MIN_BYTES_EFI}" ;;
+        biosboot) printf '%d' "${MIN_BYTES_BIOSBOOT}" ;;
+        raid)     printf '%d' "${MIN_BYTES_RAID}" ;;
+        lvm)      printf '%d' "${MIN_BYTES_LVM}" ;;
+        *)        printf '%d' "${ALIGN_BYTES}" ;;
+    esac
+}
+
+kind_gpt_type() {
+    case "$1" in
+        ext4|xfs|btrfs) printf '0FC63DAF-8483-4772-8E79-3D69D8477DE4' ;;
+        efi)            printf 'C12A7328-F81F-11D2-BA4B-00A0C93EC93B' ;;
+        biosboot)       printf '21686148-6449-6E6F-744E-656564454649' ;;
+        raid)           printf 'A19D880F-05FC-4D3B-A006-743F0F84911E' ;;
+        lvm)            printf 'E6D6D379-F507-44C2-A23C-238F2A3DF928' ;;
+        *)              return 1 ;;
+    esac
+}
+
+kind_dos_type() {
+    case "$1" in
+        ext4|xfs|btrfs) printf '83' ;;
+        efi)            printf 'ef' ;;
+        raid)           printf 'fd' ;;
+        lvm)            printf '8e' ;;
+        # An MBR table has nowhere to put one. GRUB's i386-pc core goes in the
+        # gap after the MBR on such a disk, which is why it does not need one.
+        biosboot)       return 1 ;;
+        *)              return 1 ;;
+    esac
+}
+
+# "gpt" and "dos" are what sfdisk calls the two formats; GPT and MBR are what
+# everybody else calls them. Messages use the plural throughout, because "a
+# MBR table" and "an GPT table" are each wrong one way round and neither is
+# worth a table of articles.
+label_name() {
+    case "${1:-${LABEL}}" in
+        gpt) printf 'GPT' ;;
+        dos) printf 'MBR' ;;
+        *)   printf 'unpartitioned' ;;
+    esac
+}
+
+kind_supported() {
+    local kind="$1" label="$2"
+    if [[ "${label}" == dos ]]; then
+        kind_dos_type "${kind}" > /dev/null 2>&1
+    else
+        kind_gpt_type "${kind}" > /dev/null 2>&1
+    fi
+}
+
+# The other direction, for a table that is already on the disk: what a type
+# code found there should be called. Only the kinds this program creates get
+# their own name; anything else keeps its code, which is honest about the fact
+# that this did not put it there and does not know what it is.
+# The discoverable-partitions GUIDs are in here as well as the generic Linux
+# one, because a modern image uses them: a Debian or Ubuntu cloud image's root
+# is "Linux root (x86-64)", not "Linux filesystem", and reporting that as
+# "other" tells the person looking at it nothing. None of these is a kind this
+# program creates - it writes the generic type for a filesystem it makes - but
+# all of them are kinds it has to be able to name.
+type_to_kind() {
+    local type="${1^^}"
+    case "${type}" in
+        0FC63DAF-8483-4772-8E79-3D69D8477DE4|83) printf 'linux' ;;
+        C12A7328-F81F-11D2-BA4B-00A0C93EC93B|EF) printf 'efi' ;;
+        21686148-6449-6E6F-744E-656564454649)    printf 'biosboot' ;;
+        A19D880F-05FC-4D3B-A006-743F0F84911E|FD) printf 'raid' ;;
+        E6D6D379-F507-44C2-A23C-238F2A3DF928|8E) printf 'lvm' ;;
+        0657FD6D-A4AB-43C4-84E5-0933C84B4F4F|82) printf 'swap' ;;
+        4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709)    printf 'root' ;;
+        933AC7E1-2EB4-4F13-B844-0E14E2AEF915)    printf 'home' ;;
+        4D21B016-B534-45C2-A9FB-5C16E091FD2D)    printf 'var' ;;
+        3B8F8425-20E0-4F3B-907F-1A25A76F98E8)    printf 'srv' ;;
+        BC13C2FF-59E6-4262-A352-B275FD6F7172)    printf 'xbootldr' ;;
+        CA7D7CCB-63ED-4C53-861C-1742536059CC)    printf 'luks' ;;
+        EBD0A0A2-B9E5-4433-87C0-68B6B72699C7|7)  printf 'windows' ;;
+        DE94BBA4-06D1-4D40-A16A-BFD50179D6AC|27) printf 'recovery' ;;
+        E3C9E316-0B5C-4DB8-817D-F92DF00215AE|C)  printf 'msreserved' ;;
+        5|F)                                     printf 'extended' ;;
+        EE)                                      printf 'protective' ;;
+        *)                                       printf 'other' ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Reading what is on the machine
+# ---------------------------------------------------------------------------
+
+# lsblk --pairs output, read a key at a time. Not eval'd: a filesystem label is
+# attacker-controlled input on a disk that was handed to this machine, and the
+# whole point of this program is that it is pointed at disks nobody trusts yet.
+kv() {
+    local line="$1" key="$2"
+    if [[ "${line}" =~ (^|[[:space:]])"${key}"=\"([^\"]*)\" ]]; then
+        printf '%s' "${BASH_REMATCH[2]}"
+    fi
+}
+
+# Everything on this machine that can hold a partition table, in the order
+# somebody would look for it: the disks, then the md arrays built out of them,
+# then the logical volumes built out of those. All three are block devices with
+# room for a table in them, so all three open into the same screen - which is
+# what "partition inside a RAID array" and "partition inside a volume" mean.
+#
+# Emitted as "kind<TAB>path" lines.
+# When one target was named - "raw <file>" - it is the only one there is. The
+# list is still the way in rather than being skipped, because writing a table
+# and laying a disk out live there, and a raw image needs both of those at
+# least as much as a real disk does.
+TARGET_ONLY=''
+
+list_targets() {
+    local output line kname type path
+
+    if [[ -n "${TARGET_ONLY}" ]]; then
+        if is_image "${TARGET_ONLY}"; then
+            printf 'image\t%s\n' "${TARGET_ONLY}"
+        else
+            printf 'disk\t%s\n' "${TARGET_ONLY}"
+        fi
+        return 0
+    fi
+
+    output="$(lsblk -n -P -o KNAME,PATH,TYPE 2> /dev/null)" \
+        || output="$(lsblk -n -P -o KNAME,TYPE 2> /dev/null)" \
+        || return 0
+
+    while IFS= read -r line; do
+        kname="$(kv "${line}" KNAME)"
+        [[ -n "${kname}" ]] || continue
+        [[ "${kname}" == zram* ]] && continue
+        type="$(kv "${line}" TYPE)"
+        path="$(kv "${line}" PATH)"
+        [[ -n "${path}" ]] || path="/dev/${kname}"
+        case "${type}" in
+            disk)  printf 'disk\t%s\n' "${path}" ;;
+            raid*) printf 'array\t%s\n' "${path}" ;;
+            lvm)   printf 'volume\t%s\n' "${path}" ;;
+            loop)  [[ "${ALLOW_LOOP}" == 1 ]] && printf 'loop\t%s\n' "${path}" ;;
+        esac
+    done <<< "${output}"
+    return 0
+}
+
+# Whole disks, in the order the kernel names them. An optical drive, a
+# device-mapper target and a loop device are all at the top level of lsblk's
+# tree without being something to partition; zram reports TYPE=disk but is RAM
+# backed and is already the live system's swap.
+list_disk_names() {
+    local line name type
+    while IFS= read -r line; do
+        name="$(kv "${line}" NAME)"
+        type="$(kv "${line}" TYPE)"
+        [[ -n "${name}" ]] || continue
+        [[ "${name}" == zram* ]] && continue
+        if [[ "${type}" == disk ]] \
+            || { [[ "${type}" == loop && "${ALLOW_LOOP}" == 1 ]]; }; then
+            printf '/dev/%s\n' "${name}"
+        fi
+    done < <(lsblk -d -n -P -o NAME,TYPE 2> /dev/null)
+}
+
+# A raw image: a regular file being partitioned as though it were a disk.
+# Everything below works on one, because everything a partition table needs is
+# in the bytes of the file and none of it is in the fact that a disk is a disk.
+# What a file cannot have is partition device nodes, which is the one place
+# this has to be handled separately - see plan_apply_format.
+is_image() { [[ -f "$1" ]]; }
+
+# The name a device has in /sys, which is not always the name it has in /dev:
+# /dev/mapper/data-files and /dev/data/files are both symlinks to /dev/dm-0,
+# and dm-0 is the only one of the three sysfs has heard of.
+device_kernel_name() {
+    local resolved
+    resolved="$(readlink -f "$1" 2> /dev/null || true)"
+    [[ -n "${resolved}" ]] || resolved="$1"
+    printf '%s' "${resolved##*/}"
+}
+
+device_bytes() {
+    local bytes=''
+    if is_image "$1"; then
+        stat -c %s "$1" 2> /dev/null || printf '0'
+        return 0
+    fi
+    bytes="$(blockdev --getsize64 "$1" 2> /dev/null || true)"
+    # blockdev opens the device, which needs privilege this program does not
+    # require for "list" and "show". sysfs reports the same number to anybody,
+    # in 512-byte units whatever the disk's own sector size is.
+    if [[ ! "${bytes}" =~ ^[0-9]+$ ]]; then
+        bytes="$(cat "/sys/class/block/$(device_kernel_name "$1")/size" 2> /dev/null || true)"
+        [[ "${bytes}" =~ ^[0-9]+$ ]] && bytes=$(( bytes * 512 ))
+    fi
+    printf '%s' "${bytes:-0}"
+}
+
+device_sector() {
+    local size=''
+    if is_image "$1"; then
+        printf '%s' "${IMAGE_SECTOR}"
+        return 0
+    fi
+    size="$(blockdev --getss "$1" 2> /dev/null || true)"
+    if [[ ! "${size}" =~ ^[0-9]+$ ]]; then
+        size="$(cat "/sys/class/block/$(device_kernel_name "$1")/queue/logical_block_size" 2> /dev/null || true)"
+    fi
+    [[ "${size}" =~ ^[0-9]+$ ]] || size=512
+    printf '%s' "${size}"
+}
+
+# What kind of table is on a disk, as one word. lsblk answers from libblkid,
+# which is the same probe sfdisk uses, and says nothing at all for a disk with
+# no table - which is a fourth answer, not an error.
+device_table() {
+    local table
+    if is_image "$1"; then
+        table="$(sfdisk --dump "$1" 2> /dev/null | sed -n 's/^label:[[:space:]]*//p' | head -1)"
+        printf '%s' "${table:-none}"
+        return 0
+    fi
+    table="$(lsblk -d -n -o PTTYPE "$1" 2> /dev/null | awk 'NF {print $1; exit}')"
+    [[ -n "${table}" ]] || table="$(blkid -p -o value -s PTTYPE "$1" 2> /dev/null || true)"
+    printf '%s' "${table:-none}"
+}
+
+device_model() {
+    local model
+    if is_image "$1"; then
+        printf 'raw image'
+        return 0
+    fi
+    model="$(lsblk -d -n -o MODEL "$1" 2> /dev/null | sed -e 's/[[:space:]]\+$//' -e 's/^[[:space:]]\+//')"
+    printf '%s' "${model}"
+}
+
+# What is inside a target, as "name<TAB>bytes<TAB>kind<TAB>filesystem<TAB>mountpoint"
+# lines. lsblk answers for a block device and knows nothing about a file, so an
+# image is read out of its own partition table instead - which is why the disk
+# list used to say a freshly laid-out image contained nothing.
+target_children() {
+    local target="$1" line rest device size type
+
+    if is_image "${target}"; then
+        while IFS= read -r line; do
+            [[ "${line}" == *' : '* ]] || continue
+            device="${line%% : *}"
+            [[ "${device}" == "${target}"* ]] || continue
+            rest="${line#* : }"
+            [[ "${rest}" =~ size=[[:space:]]*([0-9]+) ]] || continue
+            size=$(( BASH_REMATCH[1] * IMAGE_SECTOR ))
+            type=""
+            [[ "${rest}" =~ type=([^,[:space:]]+) ]] && type="${BASH_REMATCH[1]}"
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+                "${device}" "${size}" part "$(kind_label "$(type_to_kind "${type}")")" ""
+        done < <(sfdisk --dump "${target}" 2> /dev/null)
+        return 0
+    fi
+
+    local kname
+    while IFS= read -r line; do
+        kname="$(kv "${line}" KNAME)"
+        [[ -n "${kname}" ]] || continue
+        [[ "/dev/${kname}" == "${target}" ]] && continue
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+            "/dev/${kname}" "$(kv "${line}" SIZE)" "$(kv "${line}" TYPE)" \
+            "$(kv "${line}" FSTYPE)" "$(kv "${line}" MOUNTPOINT)"
+    done < <(lsblk -b -n -P -o KNAME,TYPE,FSTYPE,MOUNTPOINT,SIZE "${target}" 2> /dev/null)
+    return 0
+}
+
+# How many partitions are on a target. Counted the same two ways, for the same
+# reason: the PARTS column read 0 for every image.
+target_partition_count() {
+    local target="$1"
+    if is_image "${target}"; then
+        sfdisk --dump "${target}" 2> /dev/null \
+            | awk -v prefix="${target}" 'index($0, prefix) == 1 && index($0, " : ") { n++ } END { print n + 0 }'
+        return 0
+    fi
+    lsblk -n -o TYPE "${target}" 2> /dev/null | grep -c '^part$' || true
+}
+
+# Everything that has this disk open right now, one readable line each.
+#
+# A disk with a mounted partition, an assembled array member or an active
+# physical volume on it cannot be repartitioned: the kernel refuses to re-read
+# the table while anything on it is open. Finding that out from the refusal is
+# the wrong time, because by then the table has already been written and what
+# is on the disk no longer matches what the kernel believes.
+#
+# A second argument narrows the answer to one partition, which is what wiping
+# a single partition asks: the rest of the disk being busy is not a reason to
+# refuse to write over one slice of it that is not.
+device_holders() {
+    local disk="$1" only="${2:-}" line mount kname
+
+    # A file is not open in the sense this asks about: the kernel is not holding
+    # a partition table on it, so there is nothing to be in the way of writing
+    # one.
+    is_image "${disk}" && return 0
+
+    while IFS= read -r line; do
+        kname="$(kv "${line}" KNAME)"
+        [[ -z "${only}" || "/dev/${kname}" == "${only}" ]] || continue
+        mount="$(kv "${line}" MOUNTPOINT)"
+        [[ -n "${mount}" ]] && printf '/dev/%s is mounted on %s\n' "${kname}" "${mount}"
+    done < <(lsblk -n -P -o KNAME,MOUNTPOINT "${disk}" 2> /dev/null)
+
+    # Anything below /sys/block/<part>/holders is a device-mapper target or an
+    # md array that has this partition open. The name there is a kernel name,
+    # which is enough to say which one.
+    local part holder
+    local kernel_name
+    kernel_name="$(device_kernel_name "${disk}")"
+    for part in /sys/block/"${kernel_name}"/"${kernel_name}"*; do
+        [[ -d "${part}/holders" ]] || continue
+        [[ -z "${only}" || "/dev/${part##*/}" == "${only}" ]] || continue
+        for holder in "${part}/holders"/*; do
+            [[ -e "${holder}" ]] || continue
+            printf '/dev/%s is held open by %s\n' "${part##*/}" "${holder##*/}"
+        done
+    done
+    return 0
+}
+
+# A whole disk, and not a partition of one. Every subcommand that names a
+# device names a disk, and repartitioning what was meant to be one partition of
+# it is not a mistake that can be undone afterwards.
+require_whole_disk() {
+    local disk="$1" type
+
+    [[ -n "${disk}" ]] || die "name a disk"
+
+    if is_image "${disk}"; then
+        local bytes
+        bytes="$(device_bytes "${disk}")"
+        # A partition table addresses sectors, and a trailing fraction of one
+        # is not addressable - so an image that is not a whole number of them
+        # has a tail no partition can ever reach.
+        ((bytes % IMAGE_SECTOR == 0)) \
+            || die "${disk} is not a whole number of ${IMAGE_SECTOR}-byte sectors"
+        ((bytes >= 2 * ALIGN_BYTES)) \
+            || die "${disk} is too small to partition; it needs at least $(format_size $(( 2 * ALIGN_BYTES )))"
+        return 0
+    fi
+
+    [[ -b "${disk}" ]] || die "not a block device: ${disk}"
+    [[ "${disk}" =~ ^/dev/zram[0-9]*$ ]] \
+        && die "${disk} is zram, which is RAM and holds no partitions"
+
+    type="$(lsblk -d -n -o TYPE "${disk}" 2> /dev/null | awk 'NF {print $1; exit}')"
+    case "${type}" in
+        # An md array and a logical volume are each a block device with room
+        # for a partition table in them, and partitioning one is a thing people
+        # do. A partition is not: repartitioning what was meant to be one slice
+        # of a disk is not a mistake that can be undone afterwards.
+        disk|raid*|lvm) ;;
+        loop)
+            [[ "${ALLOW_LOOP}" == 1 ]] \
+                || die "${disk} is a loop device; pass --allow-loop to treat it as a disk"
+            ;;
+        part) die "${disk} is a partition; name the disk it is on" ;;
+        *)    die "${disk} is a ${type:-device of unknown kind}, not something with partitions" ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Firmware
+#
+# Which partition table to use is not a matter of taste: it is decided by how
+# the machine's firmware finds a bootloader, and that is knowable from the
+# running system rather than something the person at the keyboard should have
+# to remember.
+#
+# /sys/firmware/efi exists if and only if the kernel was entered through EFI
+# boot services. That is the question that matters and not "does this machine
+# have UEFI firmware": a UEFI machine booted through its compatibility support
+# module is a BIOS machine as far as the disk it is about to install onto is
+# concerned, and it will still be one on the next boot. So the answer is always
+# about this boot, and every message here says so.
+#
+# Secure Boot is an EFI variable, readable through efivarfs. Whether it is on
+# has nothing to do with the partition table and everything to do with whether
+# the result will boot: Sowa's GRUB image is not signed and no Sowa key is in
+# anybody's firmware, so a machine with Secure Boot enabled will refuse to load
+# it however the disk is laid out. That is worth saying before the disk is
+# erased rather than after.
+# ---------------------------------------------------------------------------
+
+# The vendor GUID every variable in this section lives under - the EFI global
+# namespace, which is where the specification puts SecureBoot and SetupMode.
+readonly EFI_GLOBAL_GUID=8be4df61-93ca-11d2-aa0d-00e098032b8c
+
+FIRMWARE_MODE=''      # uefi or bios
+FIRMWARE_BITS=''      # 64, 32, or empty when the firmware did not say
+SECURE_BOOT=''        # on, off, setup, unknown, or none
+SECURE_BOOT_NOTE=''
+
+# One byte out of one EFI global variable, as a number, or nothing.
+efi_variable_byte() {
+    local name="$1" path
+
+    # efivarfs puts the variable's four attribute bytes in front of its data,
+    # so the byte wanted is the fifth.
+    path="/sys/firmware/efi/efivars/${name}-${EFI_GLOBAL_GUID}"
+    if [[ -r "${path}" ]]; then
+        od -An -t u1 -j 4 -N 1 "${path}" 2> /dev/null | tr -d '[:space:]'
+        return 0
+    fi
+    # The older sysfs interface, which splits the same variable into files and
+    # does not prefix the attributes.
+    path="/sys/firmware/efi/vars/${name}-${EFI_GLOBAL_GUID}/data"
+    if [[ -r "${path}" ]]; then
+        od -An -t u1 -N 1 "${path}" 2> /dev/null | tr -d '[:space:]'
+        return 0
+    fi
+    return 1
+}
+
+firmware_probe() {
+    [[ -n "${FIRMWARE_MODE}" ]] && return 0
+
+    if [[ -d /sys/firmware/efi ]]; then
+        FIRMWARE_MODE=uefi
+    else
+        FIRMWARE_MODE=bios
+    fi
+
+    FIRMWARE_BITS=''
+    if [[ -r /sys/firmware/efi/fw_platform_size ]]; then
+        FIRMWARE_BITS="$(tr -d '[:space:]' < /sys/firmware/efi/fw_platform_size)"
+    fi
+
+    if [[ "${FIRMWARE_MODE}" != uefi ]]; then
+        SECURE_BOOT=none
+        SECURE_BOOT_NOTE='there is no Secure Boot outside UEFI'
+        return 0
+    fi
+
+    local value=''
+    if value="$(efi_variable_byte SecureBoot)" && [[ -n "${value}" ]]; then
+        if ((value == 1)); then
+            SECURE_BOOT=on
+            SECURE_BOOT_NOTE=''
+            local setup=''
+            # Setup mode means the platform key has been cleared, so the
+            # firmware is not enforcing anything yet and will accept keys.
+            if setup="$(efi_variable_byte SetupMode)" && [[ "${setup}" == 1 ]]; then
+                SECURE_BOOT=setup
+                SECURE_BOOT_NOTE='the firmware is in setup mode, so it is not enforcing this yet'
+            fi
+        else
+            SECURE_BOOT=off
+            SECURE_BOOT_NOTE=''
+        fi
+        return 0
+    fi
+
+    SECURE_BOOT=unknown
+    if [[ ! -d /sys/firmware/efi/efivars ]]; then
+        # CONFIG_EFIVAR_FS is what puts that directory there. Without it the
+        # variables cannot be read at all, which is a fact about this kernel
+        # and not about the machine.
+        SECURE_BOOT_NOTE='this kernel has no efivarfs, so the variable cannot be read'
+    elif ! grep -q ' efivarfs ' /proc/mounts 2> /dev/null; then
+        SECURE_BOOT_NOTE='efivarfs is not mounted - mount -t efivarfs efivarfs /sys/firmware/efi/efivars'
+    else
+        SECURE_BOOT_NOTE='the firmware does not publish a SecureBoot variable'
+    fi
+}
+
+# gpt or dos. GPT is the answer on a machine that booted through UEFI, because
+# UEFI firmware looks for its bootloader on an EFI System Partition and finding
+# one on an MBR disk is not something any of it is required to do.
+#
+# It is also the answer on a machine that booted through BIOS, for a different
+# reason: the layout this program writes puts a BIOS Boot Partition on GPT, so
+# GRUB's i386-pc core has somewhere to live and the disk boots either way. MBR
+# is still offered, and is still what sowa-setup does by default, but it is the
+# narrower of the two and nothing here has a reason to prefer it.
+firmware_recommended_label() {
+    firmware_probe
+    printf 'gpt'
+}
+
+firmware_summary() {
+    firmware_probe
+    local mode='legacy BIOS'
+    if [[ "${FIRMWARE_MODE}" == uefi ]]; then
+        mode='UEFI'
+        [[ -n "${FIRMWARE_BITS}" ]] && mode="UEFI ${FIRMWARE_BITS}-bit"
+    fi
+    local secure
+    case "${SECURE_BOOT}" in
+        on)      secure='Secure Boot on' ;;
+        setup)   secure='Secure Boot on, setup mode' ;;
+        off)     secure='Secure Boot off' ;;
+        none)    secure='no Secure Boot' ;;
+        *)       secure='Secure Boot unknown' ;;
+    esac
+    printf 'booted through %s, %s' "${mode}" "${secure}"
+}
+
+# The advice, one line per line, for wherever there is room to print it.
+firmware_advice() {
+    firmware_probe
+    local recommended
+    recommended="$(firmware_recommended_label)"
+
+    if [[ "${FIRMWARE_MODE}" == uefi ]]; then
+        printf 'This system booted through UEFI, so the firmware loads its bootloader from a\n'
+        printf 'FAT EFI System Partition. Use GPT: UEFI firmware is not required to look for\n'
+        printf 'an ESP on an MBR disk, and plenty of it does not.\n'
+        if [[ "${FIRMWARE_BITS}" == 32 ]]; then
+            printf '\n'
+            printf 'The firmware is 32-bit EFI. Sowa builds only the x86_64-efi GRUB image, which\n'
+            printf 'such firmware cannot load. This machine has to be booted through its legacy\n'
+            printf 'or CSM mode instead, and laid out for that.\n'
+        fi
+    else
+        printf 'This system booted through legacy BIOS, so the firmware reads the first sector\n'
+        printf 'of the disk and nothing else. Either table works. GPT is still the better one:\n'
+        printf 'the layout written here gives it a BIOS Boot Partition for GRUB and an ESP as\n'
+        printf 'well, so the same disk also boots on UEFI firmware later. Choose MBR when\n'
+        printf 'something other than this machine has to read the disk and cannot handle GPT.\n'
+        printf '\n'
+        printf 'This says how the machine booted, not what it is capable of. A UEFI machine\n'
+        printf 'started through its compatibility support module looks exactly like this, and\n'
+        printf 'will still be in that mode on the next boot unless the firmware setup is\n'
+        printf 'changed.\n'
+    fi
+
+    case "${SECURE_BOOT}" in
+        on)
+            printf '\n'
+            printf 'Secure Boot is enabled. Sowa'"'"'s GRUB image is not signed and no Sowa key is in\n'
+            printf 'this firmware, so it will be refused however the disk is laid out. Turn Secure\n'
+            printf 'Boot off in the firmware setup, or enroll your own keys and sign the image.\n'
+            printf 'This is not a partitioning problem and no layout works around it.\n'
+            ;;
+        setup)
+            printf '\n'
+            printf 'Secure Boot is enabled but the firmware is in setup mode, so nothing is being\n'
+            printf 'enforced and keys can still be enrolled. Sowa ships no signed image, so leave\n'
+            printf 'it in setup mode or turn Secure Boot off before installing.\n'
+            ;;
+        unknown)
+            printf '\n'
+            printf 'Secure Boot could not be read: %s.\n' "${SECURE_BOOT_NOTE}"
+            printf 'If it turns out to be enabled, Sowa'"'"'s unsigned GRUB will not be loaded.\n'
+            ;;
+    esac
+
+    printf '\n'
+    printf 'Recommended layout here: %s\n' "${recommended}"
+}
+
+cmd_firmware() {
+    firmware_probe
+    local mode='legacy BIOS'
+    [[ "${FIRMWARE_MODE}" == uefi ]] && mode='UEFI'
+    printf '%-16s %s\n' 'boot mode:' "${mode}"
+    [[ -n "${FIRMWARE_BITS}" ]] && printf '%-16s %s-bit\n' 'firmware:' "${FIRMWARE_BITS}"
+    local secure="${SECURE_BOOT}"
+    case "${SECURE_BOOT}" in
+        on)      secure='enabled' ;;
+        setup)   secure='enabled, setup mode' ;;
+        off)     secure='disabled' ;;
+        none)    secure='not applicable' ;;
+        unknown) secure='unknown' ;;
+    esac
+    [[ -n "${SECURE_BOOT_NOTE}" ]] && secure="${secure} (${SECURE_BOOT_NOTE})"
+    printf '%-16s %s\n' 'secure boot:' "${secure}"
+    printf '%-16s %s\n' 'recommended:' "$(firmware_recommended_label)"
+    printf '\n'
+    firmware_advice
+}
+
+# ---------------------------------------------------------------------------
+# The plan
+#
+# One disk at a time. P_* are parallel arrays, sorted by start, describing what
+# the table should say after "apply". Entries copied from the disk carry
+# P_EXISTING=1 and the identity they already have; entries added here carry 0
+# and are the only ones a filesystem is ever made on.
+# ---------------------------------------------------------------------------
+
+DISK=""
+DISK_BYTES=0
+DISK_SECTORS=0
+LABEL=none          # gpt, dos or none
+LABEL_ID=""         # GPT disk GUID or MBR four-byte signature, preserved
+PLAN_DIRTY=0
+
+P_COUNT=0
+declare -a P_START=() P_SIZE=() P_KIND=() P_NAME=() P_UUID=() P_EXISTING=()
+declare -a P_FSTYPE=() P_MOUNT=() P_TYPE=() P_FORMAT=() P_ACTION=() P_NUMBER=()
+
+# P_EXISTING and P_FORMAT answer two different questions and used to be one
+# array, which was wrong in both directions. "Was this read off the disk?"
+# decides whether its type code and its UUID are carried through the rewrite;
+# "should a filesystem be made on it?" decides whether mkfs runs. Resizing a
+# partition is the case that separates them: it is still the partition that was
+# on the disk, keeping its type and its identity, and reformatting it is
+# exactly what must not happen. P_ACTION is what the summary calls it.
+plan_reset() {
+    P_COUNT=0
+    P_START=(); P_SIZE=(); P_KIND=(); P_NAME=(); P_UUID=(); P_EXISTING=()
+    P_FSTYPE=(); P_MOUNT=(); P_TYPE=(); P_FORMAT=(); P_ACTION=(); P_NUMBER=()
+    PLAN_DIRTY=0
+}
+
+# GPT keeps its backup header and partition array at the very end of the disk.
+# A whole alignment unit is reserved for it rather than the 33 sectors it needs,
+# so that the last partition still ends on a boundary. MBR keeps nothing there.
+plan_first_usable() { printf '%d' "${ALIGN}"; }
+plan_last_usable() {
+    if [[ "${LABEL}" == gpt ]]; then
+        printf '%d' $(( DISK_SECTORS - ALIGN - 1 ))
+    else
+        printf '%d' $(( DISK_SECTORS - 1 ))
+    fi
+}
+
+# MBR has four slots and this program uses them as four primaries. Extended and
+# logical partitions are not offered: they exist to get past this limit on
+# disks that predate GPT, and the answer on any disk that can hold a modern
+# system is to use GPT instead.
+plan_max_partitions() {
+    if [[ "${LABEL}" == dos ]]; then printf '4'; else printf '128'; fi
+}
+
+plan_sort() {
+    local i j tmp
+    for ((i = 1; i < P_COUNT; i++)); do
+        for ((j = i; j > 0 && P_START[j] < P_START[j - 1]; j--)); do
+            tmp="${P_START[j]}"; P_START[j]="${P_START[j - 1]}"; P_START[j - 1]="${tmp}"
+            tmp="${P_SIZE[j]}"; P_SIZE[j]="${P_SIZE[j - 1]}"; P_SIZE[j - 1]="${tmp}"
+            tmp="${P_KIND[j]}"; P_KIND[j]="${P_KIND[j - 1]}"; P_KIND[j - 1]="${tmp}"
+            tmp="${P_NAME[j]}"; P_NAME[j]="${P_NAME[j - 1]}"; P_NAME[j - 1]="${tmp}"
+            tmp="${P_UUID[j]}"; P_UUID[j]="${P_UUID[j - 1]}"; P_UUID[j - 1]="${tmp}"
+            tmp="${P_EXISTING[j]}"; P_EXISTING[j]="${P_EXISTING[j - 1]}"; P_EXISTING[j - 1]="${tmp}"
+            tmp="${P_FSTYPE[j]}"; P_FSTYPE[j]="${P_FSTYPE[j - 1]}"; P_FSTYPE[j - 1]="${tmp}"
+            tmp="${P_MOUNT[j]}"; P_MOUNT[j]="${P_MOUNT[j - 1]}"; P_MOUNT[j - 1]="${tmp}"
+            tmp="${P_TYPE[j]}"; P_TYPE[j]="${P_TYPE[j - 1]}"; P_TYPE[j - 1]="${tmp}"
+            tmp="${P_FORMAT[j]}"; P_FORMAT[j]="${P_FORMAT[j - 1]}"; P_FORMAT[j - 1]="${tmp}"
+            tmp="${P_ACTION[j]}"; P_ACTION[j]="${P_ACTION[j - 1]}"; P_ACTION[j - 1]="${tmp}"
+            tmp="${P_NUMBER[j]}"; P_NUMBER[j]="${P_NUMBER[j - 1]}"; P_NUMBER[j - 1]="${tmp}"
+        done
+    done
+}
+
+plan_add() {
+    local start="$1" size="$2" kind="$3" name="${4:-}"
+    local index="${P_COUNT}"
+    P_START[index]="${start}"
+    P_SIZE[index]="${size}"
+    P_KIND[index]="${kind}"
+    P_NAME[index]="${name}"
+    P_UUID[index]=""
+    P_EXISTING[index]=0
+    P_FSTYPE[index]=""
+    P_MOUNT[index]=""
+    P_TYPE[index]=""
+    P_FORMAT[index]=1
+    P_ACTION[index]=create
+    P_NUMBER[index]="$(plan_free_number)"
+    P_COUNT=$(( P_COUNT + 1 ))
+    plan_sort
+    PLAN_DIRTY=1
+}
+
+# The lowest partition number nothing is using. New partitions take one of
+# these rather than being numbered by where they sit, because the numbers on a
+# disk are not in any particular relation to the order of the partitions and
+# renumbering the ones already there is exactly what must not happen.
+plan_free_number() {
+    local candidate i taken maximum
+    maximum="$(plan_max_partitions)"
+    for ((candidate = 1; candidate <= maximum; candidate++)); do
+        taken=0
+        for ((i = 0; i < P_COUNT; i++)); do
+            [[ "${P_NUMBER[i]}" == "${candidate}" ]] && { taken=1; break; }
+        done
+        ((taken)) || { printf '%d' "${candidate}"; return 0; }
+    done
+    printf '0'
+}
+
+plan_delete() {
+    local target="$1" i
+    local -a s=() z=() k=() n=() u=() e=() f=() m=() t=() r=() a=() b=()
+    for ((i = 0; i < P_COUNT; i++)); do
+        ((i == target)) && continue
+        s+=("${P_START[i]}"); z+=("${P_SIZE[i]}"); k+=("${P_KIND[i]}")
+        n+=("${P_NAME[i]}"); u+=("${P_UUID[i]}"); e+=("${P_EXISTING[i]}")
+        f+=("${P_FSTYPE[i]}"); m+=("${P_MOUNT[i]}"); t+=("${P_TYPE[i]}")
+        r+=("${P_FORMAT[i]}"); a+=("${P_ACTION[i]}"); b+=("${P_NUMBER[i]}")
+    done
+    P_START=("${s[@]}"); P_SIZE=("${z[@]}"); P_KIND=("${k[@]}")
+    P_NAME=("${n[@]}"); P_UUID=("${u[@]}"); P_EXISTING=("${e[@]}")
+    P_FSTYPE=("${f[@]}"); P_MOUNT=("${m[@]}"); P_TYPE=("${t[@]}")
+    P_FORMAT=("${r[@]}"); P_ACTION=("${a[@]}"); P_NUMBER=("${b[@]}")
+    P_COUNT=$(( P_COUNT - 1 ))
+    PLAN_DIRTY=1
+}
+
+# Read the table that is on the disk into the plan. sfdisk's own dump is the
+# source for the geometry, because it is the only one that reports starts and
+# lengths in the units the table uses; lsblk fills in what a table does not
+# know - what filesystem is in each partition and whether it is mounted.
+plan_load() {
+    local disk="$1"
+    plan_reset
+    DISK="${disk}"
+    SECTOR="$(device_sector "${disk}")"
+    ((SECTOR > 0)) || SECTOR=512
+    ALIGN=$(( ALIGN_BYTES / SECTOR ))
+    ((ALIGN > 0)) || ALIGN=1
+    DISK_BYTES="$(device_bytes "${disk}")"
+    DISK_SECTORS=$(( DISK_BYTES / SECTOR ))
+    LABEL="$(device_table "${disk}")"
+    LABEL_ID=""
+    [[ "${LABEL}" == gpt || "${LABEL}" == dos ]] || LABEL=none
+
+    local dump=""
+    dump="$(sfdisk --dump "${disk}" 2> /dev/null || true)"
+
+    local line rest start size type name uuid device number
+    while IFS= read -r line; do
+        case "${line}" in
+            'label-id:'*)
+                LABEL_ID="${line#label-id:}"
+                LABEL_ID="${LABEL_ID//[[:space:]]/}"
+                continue
+                ;;
+            "${disk}"*' : '*) ;;
+            *) continue ;;
+        esac
+        device="${line%% : *}"
+        device="${device%%[[:space:]]}"
+        # The number a partition already has, taken from the name the table
+        # gave it rather than from its position. A cloud image whose root is
+        # partition 1 and whose ESP is partition 15 is the ordinary case, not a
+        # strange one, and calling them 3 and 2 would be wrong on the screen and
+        # dangerous in a command that names one.
+        number="${device#"${disk}"}"
+        number="${number#p}"
+        [[ "${number}" =~ ^[0-9]+$ ]] || number=0
+
+        rest="${line#* : }"
+        start=""; size=""; type=""; name=""; uuid=""
+        [[ "${rest}" =~ start=[[:space:]]*([0-9]+) ]] && start="${BASH_REMATCH[1]}"
+        [[ "${rest}" =~ size=[[:space:]]*([0-9]+) ]] && size="${BASH_REMATCH[1]}"
+        [[ "${rest}" =~ type=([^,[:space:]]+) ]] && type="${BASH_REMATCH[1]}"
+        [[ "${rest}" =~ uuid=([^,[:space:]]+) ]] && uuid="${BASH_REMATCH[1]}"
+        [[ "${rest}" =~ name=\"([^\"]*)\" ]] && name="${BASH_REMATCH[1]}"
+        [[ -n "${start}" && -n "${size}" ]] || continue
+        ((size > 0)) || continue
+
+        local index="${P_COUNT}"
+        P_START[index]="${start}"
+        P_SIZE[index]="${size}"
+        P_KIND[index]="$(type_to_kind "${type}")"
+        P_NAME[index]="${name}"
+        P_UUID[index]="${uuid}"
+        P_TYPE[index]="${type}"
+        P_EXISTING[index]=1
+        P_FSTYPE[index]=""
+        P_MOUNT[index]=""
+        P_FORMAT[index]=0
+        P_ACTION[index]=keep
+        P_NUMBER[index]="${number}"
+        P_COUNT=$(( P_COUNT + 1 ))
+    done <<< "${dump}"
+
+    if ((P_COUNT == 0)) && [[ "${LABEL}" != none ]] && ! is_image "${disk}"; then
+        plan_load_from_sysfs "${disk}"
+    fi
+
+    plan_sort
+
+    is_image "${disk}" && { PLAN_DIRTY=0; return 0; }
+
+    # What the table cannot say. Matched by start sector rather than by name,
+    # so that a disk whose partition numbers are not in disk order still lines
+    # up with what was just read.
+    local kname fstype mount partdev i
+    while IFS= read -r line; do
+        kname="$(kv "${line}" KNAME)"
+        [[ -n "${kname}" ]] || continue
+        partdev="/dev/${kname}"
+        [[ "${partdev}" == "${disk}" ]] && continue
+        fstype="$(kv "${line}" FSTYPE)"
+        mount="$(kv "${line}" MOUNTPOINT)"
+        local pstart=""
+        pstart="$(cat "/sys/class/block/${kname}/start" 2> /dev/null || true)"
+        [[ -n "${pstart}" ]] || continue
+        # /sys reports starts in 512-byte units whatever the disk's sector size.
+        pstart=$(( pstart * 512 / SECTOR ))
+        for ((i = 0; i < P_COUNT; i++)); do
+            if ((P_START[i] == pstart)); then
+                P_FSTYPE[i]="${fstype}"
+                P_MOUNT[i]="${mount}"
+                break
+            fi
+        done
+    done < <(lsblk -n -P -o KNAME,FSTYPE,MOUNTPOINT "${disk}" 2> /dev/null)
+
+    PLAN_DIRTY=0
+}
+
+# The fallback for a disk sfdisk could not open. Starts and lengths come from
+# sysfs, which reports both in 512-byte units however the disk is formatted;
+# the type code and the partition UUID come from lsblk, which reads them out of
+# the table through libblkid rather than by opening the disk itself.
+plan_load_from_sysfs() {
+    local disk="$1" line kname type uuid start size index number
+
+    while IFS= read -r line; do
+        kname="$(kv "${line}" KNAME)"
+        [[ -n "${kname}" && "/dev/${kname}" != "${disk}" ]] || continue
+        [[ "$(kv "${line}" TYPE)" == part ]] || continue
+        start="$(cat "/sys/class/block/${kname}/start" 2> /dev/null || true)"
+        size="$(cat "/sys/class/block/${kname}/size" 2> /dev/null || true)"
+        [[ "${start}" =~ ^[0-9]+$ && "${size}" =~ ^[0-9]+$ ]] || continue
+        type="$(kv "${line}" PARTTYPE)"
+        # lsblk spells an MBR type code 0x83 and sfdisk spells it 83.
+        type="${type#0x}"
+        uuid="$(kv "${line}" PARTUUID)"
+
+        index="${P_COUNT}"
+        P_START[index]=$(( start * 512 / SECTOR ))
+        P_SIZE[index]=$(( size * 512 / SECTOR ))
+        P_KIND[index]="$(type_to_kind "${type}")"
+        P_NAME[index]="$(kv "${line}" PARTLABEL)"
+        P_TYPE[index]="${type}"
+        P_EXISTING[index]=1
+        P_FSTYPE[index]=""
+        P_MOUNT[index]=""
+        P_FORMAT[index]=0
+        P_ACTION[index]=keep
+        number="${kname##*[!0-9]}"
+        [[ "${number}" =~ ^[0-9]+$ ]] || number=0
+        P_NUMBER[index]="${number}"
+        if [[ "${LABEL}" == gpt ]]; then
+            P_UUID[index]="${uuid}"
+        else
+            P_UUID[index]=""
+            # An MBR PARTUUID is the disk's four-byte signature and the
+            # partition number, so the signature can be read back out of it -
+            # which is what keeps every PARTUUID on the disk stable across a
+            # rewrite that sfdisk was not able to dump.
+            [[ -z "${LABEL_ID}" && "${uuid}" =~ ^([0-9a-fA-F]{8})- ]] \
+                && LABEL_ID="0x${BASH_REMATCH[1]}"
+        fi
+        P_COUNT=$(( P_COUNT + 1 ))
+    done < <(lsblk -n -P -o KNAME,TYPE,PARTTYPE,PARTUUID,PARTLABEL "${disk}" 2> /dev/null)
+}
+
+# Where in the plan the partition with a given number is, if it is there.
+plan_index_of() {
+    local want="$1" i
+    for ((i = 0; i < P_COUNT; i++)); do
+        [[ "${P_NUMBER[i]}" == "${want}" ]] && { printf '%d' "${i}"; return 0; }
+    done
+    return 1
+}
+
+# The name partition N of something has. nvme, mmc and loop devices put a "p"
+# between the name and the number, which is what the trailing-digit test is
+# for; a raw image gets the same treatment, and the name it produces is what
+# sfdisk reads the partition number back out of.
+part_node() {
+    local base="$1" number="$2"
+    if [[ "${base}" =~ [0-9]$ ]]; then
+        printf '%sp%d' "${base}" "${number}"
+    else
+        printf '%s%d' "${base}" "${number}"
+    fi
+}
+
+part_device() { part_node "${DISK}" "$1"; }
+
+# Free regions, as "start:size" lines, in disk order. A region shorter than one
+# alignment unit is not reported: nothing can be placed in it.
+plan_gaps() {
+    local cursor first last i start end
+    first="$(plan_first_usable)"
+    last="$(plan_last_usable)"
+    cursor="${first}"
+    for ((i = 0; i < P_COUNT; i++)); do
+        start="${P_START[i]}"
+        if ((start > cursor)); then
+            local size=$(( start - cursor ))
+            ((size >= ALIGN)) && printf '%d:%d\n' "${cursor}" "${size}"
+        fi
+        end=$(( P_START[i] + P_SIZE[i] ))
+        ((end > cursor)) && cursor="$(align_up "${end}")"
+    done
+    if ((last >= cursor)); then
+        local size
+        size=$(align_down $(( last - cursor + 1 )))
+        ((size >= ALIGN)) && printf '%d:%d\n' "${cursor}" "${size}"
+    fi
+    return 0
+}
+
+# The gap a given sector falls in, as "start:size", or nothing.
+plan_gap_at() {
+    local want="$1" gap start size
+    while IFS=: read -r start size; do
+        ((want >= start && want < start + size)) && { printf '%d:%d\n' "${start}" "${size}"; return 0; }
+    done < <(plan_gaps)
+    return 1
+}
+
+plan_largest_gap() {
+    local best_start=0 best_size=0 start size
+    while IFS=: read -r start size; do
+        ((size > best_size)) && { best_start="${start}"; best_size="${size}"; }
+    done < <(plan_gaps)
+    ((best_size > 0)) || return 1
+    printf '%d:%d\n' "${best_start}" "${best_size}"
+}
+
+# Everything that would make the table unwritable, checked before it is
+# offered rather than after sfdisk has refused it.
+plan_validate() {
+    local problems=() i first last
+    first="$(plan_first_usable)"
+    last="$(plan_last_usable)"
+
+    [[ "${LABEL}" == none ]] && ((P_COUNT > 0)) \
+        && problems+=("there are partitions but no partition table; choose one first")
+
+    ((P_COUNT <= $(plan_max_partitions))) \
+        || problems+=("$(label_name) tables hold $(plan_max_partitions) partitions, and there are ${P_COUNT}")
+
+    local maximum
+    maximum="$(plan_max_partitions)"
+    for ((i = 0; i < P_COUNT; i++)); do
+        local start="${P_START[i]}" size="${P_SIZE[i]}" end number="${P_NUMBER[i]}"
+        end=$(( start + size - 1 ))
+        if ((number < 1 || number > maximum)); then
+            problems+=("partition ${number} is not a number $(label_name) tables can hold (1 to ${maximum})")
+        fi
+        local j
+        for ((j = i + 1; j < P_COUNT; j++)); do
+            ((P_NUMBER[j] == number)) \
+                && problems+=("two partitions are both numbered ${number}")
+        done
+        ((start >= first)) \
+            || problems+=("partition ${number} starts at ${start}, before the first usable sector ${first}")
+        ((end <= last)) \
+            || problems+=("partition ${number} ends at ${end}, past the last usable sector ${last}")
+        if ((i + 1 < P_COUNT)) && ((end >= P_START[i + 1])); then
+            problems+=("partition ${number} overlaps partition ${P_NUMBER[i + 1]}")
+        fi
+        if ! kind_supported "${P_KIND[i]}" "${LABEL}" && [[ -z "${P_TYPE[i]}" ]]; then
+            problems+=("partition ${number} is a $(kind_label "${P_KIND[i]}"), which $(label_name) tables cannot hold")
+        fi
+    done
+
+    ((${#problems[@]} == 0)) && return 0
+    printf '%s\n' "${problems[@]}"
+    return 1
+}
+
+# The sfdisk script the plan turns into. Written in sectors, in disk order, with
+# the identity of everything that was already on the disk carried through: an
+# existing GPT partition keeps its own UUID and an MBR disk keeps its
+# signature, so a rewrite does not invalidate an fstab that names them.
+plan_script() {
+    local i type
+
+    printf 'label: %s\n' "${LABEL}"
+    if [[ -n "${LABEL_ID}" ]]; then
+        printf 'label-id: %s\n' "${LABEL_ID}"
+    elif [[ "${LABEL}" == dos ]]; then
+        # Give every MBR disk this program writes a non-zero identity, because
+        # PARTUUID on such a disk is this signature plus the partition number,
+        # and a table with a zero signature has no usable PARTUUIDs at all.
+        printf 'label-id: 0x%s\n' "$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+    fi
+    printf 'unit: sectors\n\n'
+
+    for ((i = 0; i < P_COUNT; i++)); do
+        # A partition this program did not create keeps the exact type code it
+        # was found with, whatever that is; one it did create gets the code for
+        # its kind in the format being written.
+        if ((P_EXISTING[i])) && [[ -n "${P_TYPE[i]}" ]]; then
+            type="${P_TYPE[i]}"
+        elif [[ "${LABEL}" == dos ]]; then
+            type="$(kind_dos_type "${P_KIND[i]}")" || die "an MBR table cannot hold a $(kind_label "${P_KIND[i]}")"
+        else
+            type="$(kind_gpt_type "${P_KIND[i]}")" || die "no GPT type for $(kind_label "${P_KIND[i]}")"
+        fi
+
+        # Naming the device is what fixes the partition number: sfdisk takes
+        # the number from the name and puts the entry in that slot, so a table
+        # can be rewritten without renumbering anything on it.
+        printf '%s : start=%s, size=%s, type=%s' \
+            "$(part_device "${P_NUMBER[i]}")" "${P_START[i]}" "${P_SIZE[i]}" "${type}"
+        if [[ "${LABEL}" == gpt ]]; then
+            [[ -n "${P_UUID[i]}" ]] && printf ', uuid=%s' "${P_UUID[i]}"
+            local name="${P_NAME[i]}"
+            # A partition that came off the disk keeps whatever name it had,
+            # including none; only one being created here gets given one.
+            ((P_EXISTING[i])) || [[ -n "${name}" ]] || name="$(kind_label "${P_KIND[i]}")"
+            # Quotes and backslashes are the two characters sfdisk's own parser
+            # reads specially inside a name, and a name comes from a disk.
+            name="${name//\\/}"
+            name="${name//\"/}"
+            printf ', name="%s"' "${name}"
+        fi
+        printf '\n'
+    done
+}
+
+# What applying the plan would do, in the order it would happen, one line each.
+plan_changes() {
+    local i number=0 lines=()
+    local existing_before=0
+
+    for ((i = 0; i < P_COUNT; i++)); do
+        ((P_EXISTING[i])) && existing_before=$(( existing_before + 1 ))
+    done
+
+    lines+=("write a new $(label_name) partition table to ${DISK}, ${existing_before} of whose ${P_COUNT} entries are already on it:")
+    for ((i = 0; i < P_COUNT; i++)); do
+        number="${P_NUMBER[i]}"
+        lines+=("  ${P_ACTION[i]} $(part_device "${number}") - $(format_sectors "${P_SIZE[i]}") $(kind_label "${P_KIND[i]}")")
+    done
+    if ((DO_FORMAT)); then
+        for ((i = 0; i < P_COUNT; i++)); do
+            ((P_FORMAT[i])) || continue
+            number="${P_NUMBER[i]}"
+            case "${P_KIND[i]}" in
+                ext4)  lines+=("  make an ext4 filesystem on $(part_device "${number}")") ;;
+                xfs)   lines+=("  make an XFS filesystem on $(part_device "${number}")") ;;
+                btrfs) lines+=("  make a Btrfs filesystem on $(part_device "${number}")") ;;
+                efi)   lines+=("  make a FAT32 filesystem on $(part_device "${number}")") ;;
+                *)     lines+=("  clear any old signatures on $(part_device "${number}")") ;;
+            esac
+        done
+    fi
+    printf '%s\n' "${lines[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# Writing
+# ---------------------------------------------------------------------------
+
+# Without udev there is nothing watching for the kernel to publish a new
+# partition; devtmpfs creates the node when the table is re-read, and that is
+# not instantaneous. sowa-setup waits the same way and for the same reason.
+wait_for_node() {
+    local node="$1"
+    ((DRY_RUN)) && return 0
+    for _ in $(seq 1 10); do
+        [[ -b "${node}" ]] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+reread_table() {
+    local disk="$1"
+    # Nothing in the kernel is holding a table for a file, so there is nothing
+    # to make it read one again.
+    is_image "${disk}" && { run sync; return 0; }
+    run sync
+    if ! run blockdev --rereadpt "${disk}" 2> /dev/null; then
+        # A disk that had something open when the table was written cannot be
+        # re-read, and partx can at least tell the kernel about the new entries.
+        command -v partx > /dev/null 2>&1 && run partx -u "${disk}" 2> /dev/null || true
+    fi
+    run sync
+}
+
+plan_apply() {
+    local problems
+    if ! problems="$(plan_validate)"; then
+        printf '%s\n' "${problems}" >&2
+        die "the plan cannot be written"
+    fi
+
+    local -a holders=()
+    mapfile -t holders < <(device_holders "${DISK}")
+    if ((${#holders[@]} > 0)); then
+        printf '%s\n' "${holders[@]}" >&2
+        if ((DRY_RUN)); then
+            warn "${DISK} is in use; a real run would stop here"
+        else
+            die "${DISK} is in use; unmount it and stop any array or volume group on it first"
+        fi
+    fi
+
+    plan_require_format_tools
+
+    local script
+    script="$(plan_script)"
+
+    if ((DRY_RUN)); then
+        printf '+ sfdisk --force --wipe=always --wipe-partitions=never %s <<EOF\n' "${DISK}"
+        printf '%s\n' "${script}"
+        printf 'EOF\n'
+    else
+        log "writing the $(label_name) partition table to ${DISK}"
+        # --wipe=always clears whatever table or superblock was at the start of
+        # the disk, so libblkid does not go on reporting the old one.
+        # --wipe-partitions=never is the important half: a rewrite makes every
+        # entry "new" as far as sfdisk is concerned, and letting it wipe
+        # signatures would erase the superblock of every partition being kept.
+        printf '%s\n' "${script}" \
+            | sfdisk --force --wipe=always --wipe-partitions=never "${DISK}" > /dev/null \
+            || die "sfdisk could not write the table"
+    fi
+
+    reread_table "${DISK}"
+
+    if ! is_image "${DISK}"; then
+        local i number node
+        for ((i = 0; i < P_COUNT; i++)); do
+            number="${P_NUMBER[i]}"
+            node="$(part_device "${number}")"
+            wait_for_node "${node}" || die "the device node ${node} did not appear"
+        done
+    fi
+
+    ((DO_FORMAT)) && plan_apply_format
+
+    run sync
+    log "${DISK} is written"
+    plan_load "${DISK}"
+}
+
+# The filesystem tools the plan is going to need, checked before the table is
+# written rather than after. A table written and then a missing mkfs leaves the
+# disk in a state nobody asked for, and the message that says so arrives too
+# late to be acted on.
+plan_require_format_tools() {
+    ((DO_FORMAT)) || return 0
+    local i tool
+    local -A wanted=()
+    for ((i = 0; i < P_COUNT; i++)); do
+        ((P_FORMAT[i])) || continue
+        if tool="$(mkfs_for_kind "${P_KIND[i]}")"; then
+            wanted["${tool}"]=1
+        else
+            # The kinds handed on empty still have their old signatures cleared.
+            wanted[wipefs]=1
+        fi
+    done
+    ((${#wanted[@]} > 0)) && require_tools "${!wanted[@]}"
+    return 0
+}
+
+plan_wants_format() {
+    local i
+    for ((i = 0; i < P_COUNT; i++)); do
+        ((P_FORMAT[i])) && return 0
+    done
+    return 1
+}
+
+# losetup -P attaches an image and asks the kernel to read the partition table
+# on it, which produces /dev/loopNp1 and the rest for as long as it stays
+# attached. That is the only way to point mkfs at a partition of a file, and it
+# needs privilege. Without it the table is still written and the filesystems are
+# simply not made - said out loud rather than skipped quietly.
+image_attach() {
+    local file="$1" node
+    command -v losetup > /dev/null 2>&1 || return 1
+    [[ "$(id -u)" -eq 0 ]] || return 1
+    node="$(losetup -P -f --show "${file}" 2> /dev/null)" || return 1
+    [[ -n "${node}" ]] || return 1
+    printf '%s' "${node}"
+}
+
+image_detach() { losetup -d "$1" 2> /dev/null || true; }
+
+# The loop device an image is attached to while its filesystems are being made.
+# plan_format ends the program when an mkfs fails, so releasing the device
+# cannot be the statement after the one that failed: it has to be an exit
+# handler. tui_cleanup calls this too, because the full-screen program installs
+# a handler of its own over the top of it.
+ATTACHED_LOOP=''
+
+exit_cleanup() {
+    local device="${ATTACHED_LOOP}"
+    ATTACHED_LOOP=''
+    [[ -z "${device}" ]] || image_detach "${device}"
+    return 0
+}
+
+plan_apply_format() {
+    local base="${DISK}" attached='' i node
+
+    if is_image "${DISK}"; then
+        plan_wants_format || return 0
+        if ((DRY_RUN)); then
+            printf '+ losetup -P -f --show %s, make the filesystems, losetup -d\n' "${DISK}"
+            return 0
+        fi
+        if ! attached="$(image_attach "${DISK}")"; then
+            warn "no filesystems were made in ${DISK}: a raw image has no partition device nodes, and giving it some needs root and losetup"
+            warn "attach it yourself with 'losetup -P -f --show ${DISK}' and run mkfs on the partitions that appear"
+            return 0
+        fi
+        base="${attached}"
+        ATTACHED_LOOP="${attached}"
+        log "attached ${DISK} to ${base} so its partitions can be made"
+        for ((i = 0; i < P_COUNT; i++)); do
+            ((P_FORMAT[i])) || continue
+            node="$(part_node "${base}" "${P_NUMBER[i]}")"
+            if ! wait_for_node "${node}"; then
+                warn "${node} did not appear; no filesystems were made"
+                exit_cleanup
+                return 0
+            fi
+        done
+    fi
+
+    plan_format "${base}"
+    exit_cleanup
+    return 0
+}
+
+plan_format() {
+    local base="${1:-${DISK}}"
+    local i number node
+    for ((i = 0; i < P_COUNT; i++)); do
+        ((P_FORMAT[i])) || continue
+        number="${P_NUMBER[i]}"
+        node="$(part_node "${base}" "${number}")"
+        case "${P_KIND[i]}" in
+            ext4)
+                log "making an ext4 filesystem on ${node}"
+                run "${MKFS_EXT4}" -F -O '^orphan_file,^metadata_csum_seed' "${node}" > /dev/null \
+                    || die "mkfs.ext4 failed on ${node}"
+                ;;
+            xfs)
+                log "making an XFS filesystem on ${node}"
+                run mkfs.xfs -f "${node}" > /dev/null || die "mkfs.xfs failed on ${node}"
+                ;;
+            btrfs)
+                log "making a Btrfs filesystem on ${node}"
+                run mkfs.btrfs -f "${node}" > /dev/null || die "mkfs.btrfs failed on ${node}"
+                ;;
+            efi)
+                log "making a FAT32 filesystem on ${node}"
+                run mkfs.fat -F32 -n SOWA_ESP "${node}" > /dev/null || die "mkfs.fat failed on ${node}"
+                ;;
+            *)
+                # A RAID member, an LVM physical volume and a BIOS Boot
+                # Partition are all handed on empty. Old signatures are cleared
+                # anyway: mdadm and pvcreate both refuse a device that still
+                # looks like a filesystem, and GRUB writes over the BIOS Boot
+                # Partition regardless of what is in it.
+                log "clearing old signatures on ${node}"
+                run wipefs -a "${node}" > /dev/null 2>&1 || true
+                ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Wiping
+#
+# A region list is built first and written second, so that the same code writes
+# the zeros whichever of the four answers was given, and so that the regions
+# can be merged: the head of the disk and the head of a partition starting at
+# sector 2048 overlap, and writing that MiB twice is work nobody asked for.
+# ---------------------------------------------------------------------------
+
+# Head and tail of the disk, and head and tail of every partition on it. This
+# is where a partition table, a filesystem superblock, an LVM label and every
+# version of an mdadm superblock live.
+wipe_regions_signatures() {
+    local i start length
+
+    printf '%d:%d\n' 0 $(( SIGNATURE_BYTES < DISK_BYTES ? SIGNATURE_BYTES : DISK_BYTES ))
+    if ((DISK_BYTES > SIGNATURE_BYTES)); then
+        printf '%d:%d\n' $(( DISK_BYTES - SIGNATURE_BYTES )) "${SIGNATURE_BYTES}"
+    fi
+
+    for ((i = 0; i < P_COUNT; i++)); do
+        ((P_EXISTING[i])) || continue
+        start=$(( P_START[i] * SECTOR ))
+        length=$(( P_SIZE[i] * SECTOR ))
+        if ((length <= 2 * SIGNATURE_BYTES)); then
+            # Small enough that the two ends meet: write it whole rather than
+            # write the middle twice.
+            printf '%d:%d\n' "${start}" "${length}"
+        else
+            printf '%d:%d\n' "${start}" "${SIGNATURE_BYTES}"
+            printf '%d:%d\n' $(( start + length - SIGNATURE_BYTES )) "${SIGNATURE_BYTES}"
+        fi
+    done
+}
+
+# Sort by start and join anything that touches or overlaps.
+wipe_regions_merge() {
+    local start length cur_start=-1 cur_end=-1
+    while IFS=: read -r start length; do
+        ((length > 0)) || continue
+        if ((cur_start < 0)); then
+            cur_start="${start}"; cur_end=$(( start + length ))
+        elif ((start <= cur_end)); then
+            ((start + length > cur_end)) && cur_end=$(( start + length ))
+        else
+            printf '%d:%d\n' "${cur_start}" $(( cur_end - cur_start ))
+            cur_start="${start}"; cur_end=$(( start + length ))
+        fi
+    done < <(sort -t: -k1,1n)
+    ((cur_start >= 0)) && printf '%d:%d\n' "${cur_start}" $(( cur_end - cur_start ))
+    return 0
+}
+
+# The size of one dd call in the body of a region, chosen so that a wipe of a
+# whole disk reports progress instead of sitting silent for an hour. It is large
+# enough that the cost of the call is noise beside the write it performs.
+readonly WIPE_CHUNK_BYTES=$((64 * 1024 * 1024))
+
+# A run of whole sectors, written at the disk's sector size. Every boundary this
+# program produces is a sector boundary - partition entries are in sectors, and
+# the byte constants are all multiples of both 512 and 4096 - so this is exact.
+wipe_sectors() {
+    local start="$1" length="$2"
+    ((length > 0)) || return 0
+    dd if=/dev/zero of="${DISK}" bs="${SECTOR}" \
+        seek=$(( start / SECTOR )) count=$(( length / SECTOR )) \
+        conv=notrunc status=none 2> /dev/null \
+        || die "could not write to ${DISK} at offset ${start}"
+}
+
+# The mebibyte-aligned middle of a region, written a chunk at a time and
+# reporting how far along it is.
+wipe_body() {
+    local start="$1" length="$2" label="$3"
+    local written=0 chunk percent
+
+    ((length > 0)) || return 0
+    while ((written < length)); do
+        chunk=$(( length - written ))
+        ((chunk > WIPE_CHUNK_BYTES)) && chunk="${WIPE_CHUNK_BYTES}"
+        dd if=/dev/zero of="${DISK}" bs=1M \
+            seek=$(( (start + written) / ALIGN_BYTES )) \
+            count=$(( chunk / ALIGN_BYTES )) \
+            conv=notrunc status=none 2> /dev/null \
+            || die "could not write to ${DISK} at offset $(( start + written ))"
+        written=$(( written + chunk ))
+        if ((length > WIPE_CHUNK_BYTES)); then
+            percent=$(( written * 100 / length ))
+            printf '\r    %s: %d%% (%s of %s)   ' \
+                "${label}" "${percent}" "$(format_size "${written}")" "$(format_size "${length}")"
+        fi
+    done
+    ((length > WIPE_CHUNK_BYTES)) && printf '\n'
+    return 0
+}
+
+# One region, exactly. dd is driven in whole mebibytes where it can be and in
+# sectors where it cannot, rather than in sectors throughout: a full-disk wipe
+# of a terabyte is two million writes at 512 bytes and thirty-two thousand at
+# 64 MiB. The ends of a region are frequently not mebibyte-aligned - a disk
+# whose size is not a whole number of them keeps its GPT backup header in the
+# last partial one - and rounding those away used to drop exactly the region
+# that matters most.
+wipe_region() {
+    local start="$1" length="$2" label="$3"
+    local end=$(( start + length ))
+    local body_start body_end
+
+    ((length > 0)) || return 0
+
+    if ((DRY_RUN)); then
+        printf '+ zero %s bytes of %s at offset %s (%s)\n' "${length}" "${DISK}" "${start}" "${label}"
+        return 0
+    fi
+
+    body_start=$(( ((start + ALIGN_BYTES - 1) / ALIGN_BYTES) * ALIGN_BYTES ))
+    body_end=$(( (end / ALIGN_BYTES) * ALIGN_BYTES ))
+    ((body_start > end)) && body_start="${end}"
+    ((body_end < body_start)) && body_end="${body_start}"
+
+    wipe_sectors "${start}" $(( body_start - start ))
+    wipe_body "${body_start}" $(( body_end - body_start )) "${label}"
+    wipe_sectors "${body_end}" $(( end - body_end ))
+    return 0
+}
+
+wipe_run() {
+    local mode="$1" argument="${2:-}"
+    local -a regions=()
+    local line start length total=0
+    # What the refusal below is asked about: one partition when that is all
+    # that is being written over, and the whole disk otherwise.
+    local target=''
+
+    case "${mode}" in
+        signatures)
+            mapfile -t regions < <(wipe_regions_signatures | wipe_regions_merge)
+            ;;
+        full)
+            regions=("0:${DISK_BYTES}")
+            ;;
+        size)
+            local bytes
+            bytes="$(parse_size "${argument}" "${DISK_BYTES}")" \
+                || die "could not read a size from ${argument}"
+            ((bytes > 0)) || die "nothing to wipe"
+            # A sector is the smallest thing a disk can be written in, so a
+            # size that falls inside one covers the whole of it.
+            bytes=$(( ((bytes + SECTOR - 1) / SECTOR) * SECTOR ))
+            ((bytes <= DISK_BYTES)) || bytes="${DISK_BYTES}"
+            regions=("0:${bytes}")
+            ;;
+        partition)
+            local index="${argument}"
+            ((index >= 0 && index < P_COUNT)) || die "no such partition"
+            target="$(part_device "${P_NUMBER[index]}")"
+            regions=("$(( P_START[index] * SECTOR )):$(( P_SIZE[index] * SECTOR ))")
+            ;;
+        *) die "unknown wipe mode: ${mode}" ;;
+    esac
+
+    # The refusal plan_apply makes, made here too and for a harder reason: a
+    # plan that is written while something is mounted leaves the kernel holding
+    # a stale table, but zeros written under a mounted filesystem destroy it
+    # while it is still being used. Every wipe mode goes through this, so the
+    # full-disk ones cannot be the way round it.
+    local -a holders=()
+    mapfile -t holders < <(device_holders "${DISK}" "${target}")
+    if ((${#holders[@]} > 0)); then
+        printf '%s\n' "${holders[@]}" >&2
+        if ((DRY_RUN)); then
+            warn "${target:-${DISK}} is in use; a real run would stop here"
+        else
+            die "${target:-${DISK}} is in use; unmount it and stop any array or volume group on it first"
+        fi
+    fi
+
+    for line in "${regions[@]}"; do
+        IFS=: read -r start length <<< "${line}"
+        total=$(( total + length ))
+    done
+    ((total > 0)) || die "there is nothing to wipe"
+
+    log "wiping $(format_size "${total}") of ${DISK} in ${#regions[@]} region(s)"
+    local number=0
+    for line in "${regions[@]}"; do
+        IFS=: read -r start length <<< "${line}"
+        number=$(( number + 1 ))
+        wipe_region "${start}" "${length}" \
+            "region ${number}/${#regions[@]} at $(format_size "${start}")"
+    done
+    run sync
+    reread_table "${DISK}"
+    log "wiped"
+    plan_load "${DISK}"
+}
+
+# ---------------------------------------------------------------------------
+# Predefined schemes
+#
+# Two layouts that are known to boot Sowa, so that the common case is one
+# keystroke rather than four sizes typed by hand. Both put the whole of the
+# rest of the disk into an ext4 root, which is what sowa-setup would have made.
+#
+#   dos   1 EFI System, 512 MiB      2 ext4, the rest
+#   gpt   1 BIOS boot, 1 MiB         2 EFI System, 512 MiB   3 ext4, the rest
+#
+# The MBR layout has no BIOS Boot Partition because MBR has no such type: GRUB's
+# i386-pc core goes in the gap between the MBR and the first partition, which
+# the 1 MiB alignment leaves free anyway.
+# ---------------------------------------------------------------------------
+
+readonly SCHEME_ESP_DEFAULT="512MiB"
+
+# Whether the layout fits, and how big its ESP would be in sectors. On success
+# the sector count is printed; on failure the reason is, so that a caller can
+# show it whichever way it shows things. Nothing is changed either way.
+#
+# The first and last usable sectors are worked out from the label being asked
+# about rather than from the one currently on the disk, which is the whole point
+# of asking before writing.
+scheme_check() {
+    local label="$1" esp_size="${2:-${SCHEME_ESP_DEFAULT}}"
+    local esp_bytes esp_sectors first last root_sectors
+
+    if ! esp_bytes="$(parse_size "${esp_size}" "${DISK_BYTES}" 2> /dev/null)"; then
+        printf 'could not read a size from %s\n' "${esp_size}"
+        return 1
+    fi
+    if ((esp_bytes < MIN_BYTES_EFI)); then
+        printf 'an EFI System Partition must be at least %s\n' "$(format_size "${MIN_BYTES_EFI}")"
+        return 1
+    fi
+
+    esp_sectors=$(align_up $(( esp_bytes / SECTOR )))
+    first="${ALIGN}"
+    if [[ "${label}" == gpt ]]; then
+        first=$(( first + ALIGN ))
+        last=$(( DISK_SECTORS - ALIGN - 1 ))
+    else
+        last=$(( DISK_SECTORS - 1 ))
+    fi
+
+    if (( first + esp_sectors - 1 > last )); then
+        printf '%s is too small for a %s ESP\n' "${DISK}" "$(format_size "${esp_bytes}")"
+        return 1
+    fi
+    root_sectors=$(align_down $(( last - (first + esp_sectors) + 1 )))
+    if (( root_sectors * SECTOR < MIN_BYTES_EXT4 )); then
+        printf '%s has nothing left for a root filesystem after a %s ESP\n' \
+            "${DISK}" "$(format_size "${esp_bytes}")"
+        return 1
+    fi
+    printf '%d\n' "${esp_sectors}"
+}
+
+# Build the layout. Takes the ESP size scheme_check worked out, so it has
+# nothing left to refuse and cannot fail part-way through a plan.
+scheme_plan() {
+    local label="$1" esp_sectors="$2"
+    local start last
+
+    plan_reset
+    LABEL="${label}"
+    # A new table gets a new identity; nothing on the disk is being kept.
+    LABEL_ID=""
+
+    start="$(plan_first_usable)"
+    last="$(plan_last_usable)"
+
+    if [[ "${label}" == gpt ]]; then
+        plan_add "${start}" "${ALIGN}" biosboot "BIOS boot"
+        start=$(( start + ALIGN ))
+    fi
+    plan_add "${start}" "${esp_sectors}" efi "EFI System"
+    start=$(( start + esp_sectors ))
+    plan_add "${start}" "$(align_down $(( last - start + 1 )))" ext4 "Sowa root"
+
+    PLAN_DIRTY=1
+}
+
+# ---------------------------------------------------------------------------
+# RAID and LVM
+#
+# Both take partitions that already exist - the plan has to have been applied
+# first, because mdadm and pvcreate are given device nodes, not intentions.
+# ---------------------------------------------------------------------------
+
+raid_min_devices() {
+    case "$1" in
+        0|1) printf '2' ;;
+        5)   printf '3' ;;
+        6|10) printf '4' ;;
+        *)   printf '2' ;;
+    esac
+}
+
+raid_create() {
+    local level="$1" node="$2"
+    shift 2
+    local -a members=("$@")
+    local minimum
+    minimum="$(raid_min_devices "${level}")"
+
+    case "${level}" in
+        0|1|5|6|10) ;;
+        *) die "RAID level must be 0, 1, 5, 6 or 10" ;;
+    esac
+    ((${#members[@]} >= minimum)) \
+        || die "RAID ${level} needs at least ${minimum} members, and ${#members[@]} were given"
+
+    local member
+    for member in "${members[@]}"; do
+        [[ -b "${member}" ]] || ((DRY_RUN)) || die "not a block device: ${member}"
+    done
+
+    log "creating RAID ${level} on ${node} from ${members[*]}"
+    # 1.2 metadata, at 4 KiB from the start of each member, is mdadm's own
+    # default and the only version the kernel can assemble a root from without
+    # help. --run answers the "continue creating array?" question that a member
+    # with anything recognisable on it provokes; this program has already asked
+    # its own version of that question by the time it gets here.
+    if ((DRY_RUN)); then
+        printf '+ mdadm --create %s --level=%s --metadata=1.2 --raid-devices=%d --run %s\n' \
+            "${node}" "${level}" "${#members[@]}" "${members[*]}"
+        return 0
+    fi
+    # stdin is closed rather than fed from "yes": --run already answers the only
+    # question this asks, and a "yes" on the other end of a pipe takes SIGPIPE
+    # the moment mdadm exits - which under pipefail is the status of the whole
+    # pipeline, so a successful create would be reported as a failure.
+    mdadm --create "${node}" --level="${level}" --metadata=1.2 \
+        --raid-devices="${#members[@]}" --run "${members[@]}" < /dev/null \
+        || die "mdadm could not create ${node}"
+    log "${node} is created; it will rebuild in the background"
+    mdadm --detail "${node}" 2> /dev/null | sed -n '1,12p' || true
+}
+
+# rc.sysinit assembles arrays with "mdadm --assemble --scan" before it mounts
+# /etc/fstab, and what that scan finds is decided by /etc/mdadm.conf. An array
+# that is not named there may still be assembled by the metadata discovery the
+# shipped file enables, but under a kernel-chosen name; recording it is what
+# makes the name stable across boots.
+raid_record() {
+    local node="$1" conf="${2:-/etc/mdadm.conf}"
+    ((DRY_RUN)) && { printf '+ mdadm --detail --brief %s >> %s\n' "${node}" "${conf}"; return 0; }
+    local entry
+    entry="$(mdadm --detail --brief "${node}" 2> /dev/null || true)"
+    [[ -n "${entry}" ]] || { warn "mdadm had nothing to record for ${node}"; return 0; }
+    # "mdadm --detail --brief" can wrap onto a continuation line, and grep -F
+    # would read that as two independent patterns, either of which matching on
+    # its own would look like the array is already recorded. The whole entry is
+    # matched against the whole file instead.
+    if [[ -f "${conf}" && "$(< "${conf}")" == *"${entry}"* ]]; then
+        log "${conf} already names ${node}"
+        return 0
+    fi
+    printf '%s\n' "${entry}" >> "${conf}"
+    log "recorded ${node} in ${conf}"
+}
+
+lvm_create_vg() {
+    local vg="$1"
+    shift
+    local -a devices=("$@")
+    [[ "${vg}" =~ ^[A-Za-z0-9_+.-]+$ ]] || die "not a usable volume group name: ${vg}"
+    ((${#devices[@]} > 0)) || die "a volume group needs at least one physical volume"
+
+    local device
+    for device in "${devices[@]}"; do
+        [[ -b "${device}" ]] || ((DRY_RUN)) || die "not a block device: ${device}"
+    done
+
+    log "creating physical volumes on ${devices[*]}"
+    run pvcreate -ff -y "${devices[@]}" > /dev/null || die "pvcreate failed"
+    log "creating the volume group ${vg}"
+    run vgcreate "${vg}" "${devices[@]}" > /dev/null || die "vgcreate failed"
+    log "${vg} is created"
+}
+
+lvm_create_lv() {
+    local vg="$1" name="$2" size="$3" filesystem="${4:-}"
+    [[ "${name}" =~ ^[A-Za-z0-9_+.-]+$ ]] || die "not a usable logical volume name: ${name}"
+
+    # Asked before the volume is made, not after: a volume created and then left
+    # unformatted because the tool was missing is worse than nothing created.
+    case "${filesystem}" in
+        '') ;;
+        ext4|xfs|btrfs) require_tools "$(mkfs_for_kind "${filesystem}")" ;;
+        *) die "unknown filesystem for a logical volume: ${filesystem}" ;;
+    esac
+
+    log "creating the logical volume ${name} in ${vg}"
+    if [[ "${size}" == *% ]]; then
+        # LVM has its own way of saying "all of it", and it is more accurate
+        # than anything computed here would be: it knows how much of the group
+        # its own metadata has taken.
+        local percent="${size%\%}"
+        if [[ "${percent}" == 100 ]]; then
+            run lvcreate -l 100%FREE -n "${name}" "${vg}" > /dev/null || die "lvcreate failed"
+        else
+            run lvcreate -l "${percent}%FREE" -n "${name}" "${vg}" > /dev/null || die "lvcreate failed"
+        fi
+    else
+        local bytes
+        bytes="$(parse_size "${size}" 0)" || die "could not read a size from ${size}"
+        # Rounded up, not truncated: lvcreate is told a whole number of KiB, and
+        # a size that is not one of those should not come out smaller than asked.
+        # LVM rounds up again to its own extent size from here.
+        run lvcreate -L "$(( (bytes + 1023) / 1024 ))K" -n "${name}" "${vg}" > /dev/null \
+            || die "lvcreate failed"
+    fi
+
+    local node="/dev/${vg}/${name}"
+    case "${filesystem}" in
+        ext4)  run "${MKFS_EXT4}" -F -O '^orphan_file,^metadata_csum_seed' "${node}" > /dev/null ;;
+        xfs)   run mkfs.xfs -f "${node}" > /dev/null ;;
+        btrfs) run mkfs.btrfs -f "${node}" > /dev/null ;;
+    esac
+    log "${node} is created"
+}
+
+# ---------------------------------------------------------------------------
+# Terminal
+#
+# A full-screen program written against the terminal directly. There is no
+# dialog or whiptail in the image, and linking one would be a package to build
+# and audit for a program that needs a list, a bar and a text field.
+#
+# Two glyph sets: the Linux console draws box characters only when it has been
+# put in UTF-8 mode, and a serial console draws whatever is on the other end of
+# the line. The locale says which is safe to assume, and ASCII is the answer
+# when it says nothing.
+# ---------------------------------------------------------------------------
+
+TUI_ACTIVE=0
+ROWS=24
+COLS=80
+
+C_RESET=''; C_BOLD=''; C_DIM=''; C_REV=''; C_BLINK=''; C_WHITE=''
+C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_MAGENTA=''; C_CYAN=''; C_GREY=''
+
+G_BAR=''; G_LINE=''; G_NEW=''; G_FREE=''; G_MARK=''
+
+term_setup() {
+    if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
+        C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_DIM=$'\e[2m'; C_REV=$'\e[7m'
+        C_BLINK=$'\e[5m'; C_WHITE=$'\e[97m'
+        C_RED=$'\e[31m'; C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'
+        C_BLUE=$'\e[34m'; C_MAGENTA=$'\e[35m'; C_CYAN=$'\e[36m'; C_GREY=$'\e[90m'
+    fi
+    case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+        *UTF-8*|*utf8*|*UTF8*)
+            G_BAR=$'█'; G_LINE=$'─'; G_NEW=$'▒'; G_FREE=$'░'
+            G_MARK=$'▀'
+            ;;
+        *)
+            G_BAR='#'; G_LINE='-'; G_NEW='+'; G_FREE='.'
+            G_MARK='='
+            ;;
+    esac
+}
+
+term_size() {
+    local size
+    size="$(stty size 2> /dev/null || true)"
+    if [[ "${size}" =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+        ROWS="${BASH_REMATCH[1]}"
+        COLS="${BASH_REMATCH[2]}"
+    else
+        ROWS=24
+        COLS=80
+    fi
+    ((ROWS >= 10)) || ROWS=10
+    ((COLS >= 40)) || COLS=40
+    ((COLS <= 200)) || COLS=200
+}
+
+tui_enter() {
+    ((TUI_ACTIVE)) && return 0
+    printf '\e[?1049h\e[?25l'
+    TUI_ACTIVE=1
+}
+
+tui_leave() {
+    ((TUI_ACTIVE)) || return 0
+    printf '\e[?25h\e[?1049l'
+    TUI_ACTIVE=0
+}
+
+# Destructive operations print real output and are watched, so the screen goes
+# back to the one the user started with while they run.
+#
+# Whether it has to be put back is remembered here rather than returned, because
+# returning it would mean writing it to stdout - which is where tui_leave has
+# just written the escape that leaves the alternate screen, and a caller
+# capturing one would capture the other.
+TUI_SUSPENDED=0
+tui_suspend() { TUI_SUSPENDED="${TUI_ACTIVE}"; tui_leave; }
+tui_resume()  { ((TUI_SUSPENDED)) && tui_enter; TUI_SUSPENDED=0; return 0; }
+
+tui_cleanup() {
+    tui_leave
+    tty_close
+    printf '%s' "${C_RESET}"
+    # This handler replaces the program's own for as long as the screen is up,
+    # so it has to do what that one does as well.
+    exit_cleanup
+}
+
+# The terminal, on a file descriptor of its own.
+#
+# A menu is given its items on stdin, so by the time it wants a keystroke its
+# stdin is a pipe that has just ended. Reading a key from there returns
+# end-of-file, every menu cancels itself the moment it is drawn, and nothing in
+# the program can be chosen. So keys are read from the terminal explicitly,
+# through a descriptor opened once and held for as long as the screen is.
+#
+# Zero means it was never opened - a subcommand run, or a terminal that could
+# not be opened - and stdin is used instead, which is right for both.
+TTY_FD=0
+
+tty_open() {
+    ((TTY_FD == 0)) || return 0
+    exec {TTY_FD}< /dev/tty 2> /dev/null || TTY_FD=0
+}
+
+tty_close() {
+    ((TTY_FD == 0)) && return 0
+    exec {TTY_FD}<&-
+    TTY_FD=0
+}
+
+# The "press Enter to go back" at the end of an operation that printed its own
+# output, reading from the same place every other prompt does.
+tty_pause() {
+    local _discard
+    printf '\nPress Enter to go back.\n'
+    read -r -u "${TTY_FD}" _discard || true
+}
+
+# One name per key, so that the screens can read like a description of what the
+# keys do. An escape that is not followed by anything within a few tens of
+# milliseconds is the Escape key; anything else is a sequence, and the modifier
+# parameters in it are kept because the size slider uses shifted arrows.
+read_key() {
+    local key rest char sequence params final
+
+    IFS= read -rsn1 -u "${TTY_FD}" key || return 1
+    case "${key}" in
+        '')     printf 'ENTER'; return 0 ;;
+        $'\t')  printf 'TAB'; return 0 ;;
+        $'\x7f'|$'\b') printf 'BACKSPACE'; return 0 ;;
+        $'\x03') printf 'CTRL-C'; return 0 ;;
+        ' ')    printf 'SPACE'; return 0 ;;
+        $'\e') ;;
+        *)      printf '%s' "${key}"; return 0 ;;
+    esac
+
+    if ! IFS= read -rsn1 -t 0.05 -u "${TTY_FD}" rest; then
+        printf 'ESC'
+        return 0
+    fi
+    if [[ "${rest}" != '[' && "${rest}" != 'O' ]]; then
+        printf 'ESC'
+        return 0
+    fi
+
+    sequence=''
+    while IFS= read -rsn1 -t 0.05 -u "${TTY_FD}" char; do
+        sequence+="${char}"
+        [[ "${char}" =~ [A-Za-z~] ]] && break
+    done
+    [[ "${sequence}" =~ ^([0-9\;]*)([A-Za-z~])$ ]] || { printf 'ESC'; return 0; }
+    params="${BASH_REMATCH[1]}"
+    final="${BASH_REMATCH[2]}"
+
+    local shifted=''
+    [[ "${params}" == *';2'* || "${params}" == *';4'* || "${params}" == *';6'* ]] && shifted='S'
+    [[ "${params}" == *';5'* || "${params}" == *';7'* ]] && shifted='S'
+
+    case "${final}" in
+        A) printf '%sUP' "${shifted}" ;;
+        B) printf '%sDOWN' "${shifted}" ;;
+        C) printf '%sRIGHT' "${shifted}" ;;
+        D) printf '%sLEFT' "${shifted}" ;;
+        H) printf 'HOME' ;;
+        F) printf 'END' ;;
+        '~')
+            case "${params%%;*}" in
+                1|7) printf 'HOME' ;;
+                4|8) printf 'END' ;;
+                3)   printf 'DELETE' ;;
+                5)   printf 'PGUP' ;;
+                6)   printf 'PGDN' ;;
+                *)   printf 'ESC' ;;
+            esac
+            ;;
+        *) printf 'ESC' ;;
+    esac
+}
+
+# Cut a string to a width and pad it out to that width, so that a column stays
+# a column when a disk model is longer than the space for it.
+pad() {
+    local text="$1" width="$2"
+    ((width > 0)) || return 0
+    ((${#text} > width)) && text="${text:0:width}"
+    printf '%-*s' "${width}" "${text}"
+}
+
+# A frame is drawn into this and printed once. Writing it line by line makes a
+# serial console redraw visibly, from the top down.
+FRAME=''
+frame_reset() { FRAME=''; }
+frame_line() { FRAME+="$*"$'\e[K\n'; }
+frame_flush() {
+    printf '\e[H%s\e[J' "${FRAME}"
+}
+
+kind_colour() {
+    case "$1" in
+        ext4)     printf '%s' "${C_BLUE}" ;;
+        xfs)      printf '%s' "${C_CYAN}" ;;
+        btrfs)    printf '%s' "${C_MAGENTA}" ;;
+        efi)      printf '%s' "${C_YELLOW}" ;;
+        biosboot) printf '%s' "${C_RED}" ;;
+        raid)     printf '%s' "${C_GREEN}" ;;
+        lvm)      printf '%s' "${C_GREEN}" ;;
+        linux|root|home|var|srv|xbootldr) printf '%s' "${C_BLUE}" ;;
+        swap)     printf '%s' "${C_MAGENTA}" ;;
+        luks)     printf '%s' "${C_CYAN}" ;;
+        windows|recovery|msreserved) printf '%s' "${C_YELLOW}" ;;
+        *)        printf '%s' "${C_GREY}" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# The partition map
+#
+# The bar gparted draws: every partition and every gap gets a share of the
+# width in proportion to its size, except that a partition never gets zero -
+# a 1 MiB BIOS Boot Partition on a 2 TB disk is a hundred-thousandth of the
+# disk and still has to be visible and selectable.
+# ---------------------------------------------------------------------------
+
+# Builds the bar for the current plan into MAP_BAR, and a row of marks under
+# the selected segment into MAP_MARK. $1 is the index of the display row that is
+# selected, in the same order the disk view lists them.
+#
+# The selected segment is drawn solid in blinking bright white, with a thick
+# rule under it in its own colour. Three earlier attempts were worse, and each
+# was worse in an instructive way.
+#
+# Reverse video is wrong for a bar made of solid block characters: reversing one
+# paints the whole cell in the terminal's background colour, so the selected
+# segment turned black on a black terminal and the one thing that had to stand
+# out was the one thing that disappeared.
+#
+# A hairline rule underneath was visible but sat flush against the bar, where it
+# read as the bar being a pixel taller rather than as a mark on one part of it.
+#
+# Cutting the segment into dashes did stand out, and looked wrong: a bar whose
+# whole job is to show one partition as one continuous run should not show the
+# selected one as a row of separate blocks, which is what a fragmented segment
+# looks like whatever it means.
+#
+# So the segment stays whole and changes colour instead. White against the
+# type colours is the largest difference available without leaving the palette,
+# blink is the one attribute that cannot be mistaken for part of the picture,
+# and the rule underneath keeps the type colour so the association survives on
+# a terminal that renders neither.
+MAP_BAR=''
+MAP_MARK=''
+
+map_bar() {
+    local selected="$1"
+    local width=$(( COLS - 2 ))
+    ((width > 10)) || width=10
+
+    local -a seg_size=() seg_kind=() seg_new=()
+    local -a rows
+    mapfile -t rows < <(view_rows)
+    local row type index start size
+
+    for row in "${rows[@]}"; do
+        IFS=: read -r type index start size <<< "${row}"
+        seg_size+=("${size}")
+        if [[ "${type}" == p ]]; then
+            seg_kind+=("${P_KIND[index]}")
+            seg_new+=("$(( P_EXISTING[index] ? 0 : 1 ))")
+        else
+            seg_kind+=('free')
+            seg_new+=(0)
+        fi
+    done
+    ((${#seg_size[@]} > 0)) || { printf ''; return 0; }
+
+    # Cells by cumulative position, so rounding cannot accumulate: each segment
+    # gets whatever is between where the previous one ended and where this one
+    # should end.
+    local total=0 i
+    for ((i = 0; i < ${#seg_size[@]}; i++)); do total=$(( total + seg_size[i] )); done
+    ((total > 0)) || { printf ''; return 0; }
+
+    local -a cells=()
+    local cumulative=0 previous=0 boundary
+    for ((i = 0; i < ${#seg_size[@]}; i++)); do
+        cumulative=$(( cumulative + seg_size[i] ))
+        boundary=$(( cumulative * width / total ))
+        cells+=($(( boundary - previous )))
+        previous="${boundary}"
+    done
+
+    # Nothing that is really there may be invisible. A segment forced up to one
+    # cell takes it from the widest segment that can spare it.
+    for ((i = 0; i < ${#cells[@]}; i++)); do
+        ((cells[i] > 0)) && continue
+        [[ "${seg_kind[i]}" == free ]] && continue
+        local widest=-1 widest_size=1 j
+        for ((j = 0; j < ${#cells[@]}; j++)); do
+            ((cells[j] > widest_size)) && { widest="${j}"; widest_size="${cells[j]}"; }
+        done
+        ((widest >= 0)) || break
+        cells[widest]=$(( cells[widest] - 1 ))
+        cells[i]=1
+    done
+
+    MAP_BAR=''
+    MAP_MARK=''
+    local colour glyph count body marks n
+    for ((i = 0; i < ${#cells[@]}; i++)); do
+        count="${cells[i]}"
+        ((count > 0)) || continue
+        if [[ "${seg_kind[i]}" == free ]]; then
+            colour="${C_GREY}"
+            glyph="${G_FREE}"
+        elif ((seg_new[i])); then
+            # A partition that is only in the plan is drawn hatched, so the bar
+            # says at a glance how much of it is on the disk already.
+            colour="$(kind_colour "${seg_kind[i]}")"
+            glyph="${G_NEW}"
+        else
+            colour="$(kind_colour "${seg_kind[i]}")"
+            glyph="${G_BAR}"
+        fi
+
+        body=''
+        marks=''
+        if ((i == selected)); then
+            for ((n = 0; n < count; n++)); do
+                body+="${glyph}"
+                marks+="${G_MARK}"
+            done
+            MAP_BAR+="${C_BLINK}${C_BOLD}${C_WHITE}${body}${C_RESET}"
+            MAP_MARK+="${C_BOLD}${colour}${marks}${C_RESET}"
+        else
+            for ((n = 0; n < count; n++)); do
+                body+="${glyph}"
+                marks+=' '
+            done
+            MAP_BAR+="${colour}${body}${C_RESET}"
+            MAP_MARK+="${marks}"
+        fi
+    done
+    return 0
+}
+
+# The rows the disk view shows, partitions and gaps together in disk order,
+# as "p:<index>:<start>:<size>" or "f:-1:<start>:<size>". Both the list and the
+# bar are built from this, which is what keeps the selection in the one lined
+# up with the segment in the other.
+view_rows() {
+    local i
+    local -a gaps=()
+    mapfile -t gaps < <(plan_gaps)
+
+    local -a merged=()
+    for ((i = 0; i < P_COUNT; i++)); do
+        merged+=("${P_START[i]}:p:${i}:${P_SIZE[i]}")
+    done
+    local gap start size
+    for gap in "${gaps[@]}"; do
+        [[ -n "${gap}" ]] || continue
+        IFS=: read -r start size <<< "${gap}"
+        merged+=("${start}:f:-1:${size}")
+    done
+    ((${#merged[@]} > 0)) || return 0
+
+    local row type index
+    while IFS= read -r row; do
+        IFS=: read -r start type index size <<< "${row}"
+        printf '%s:%s:%s:%s\n' "${type}" "${index}" "${start}" "${size}"
+    done < <(printf '%s\n' "${merged[@]}" | sort -t: -k1,1n)
+}
+
+# ---------------------------------------------------------------------------
+# Dialogs
+# ---------------------------------------------------------------------------
+
+DIALOG_RESULT=''
+
+# A message and a key. Used for anything that has to be read before the screen
+# goes back to what it was.
+dialog_message() {
+    local title="$1"
+    shift
+    frame_reset
+    frame_line "${C_BOLD}${title}${C_RESET}"
+    frame_line ''
+    local line
+    for line in "$@"; do frame_line "  ${line}"; done
+    frame_line ''
+    frame_line "${C_DIM}  press any key${C_RESET}"
+    frame_flush
+    read_key > /dev/null
+}
+
+# Yes or no, defaulting to no. Anything destructive is behind one of these, and
+# the answer has to be typed rather than picked, so that a held-down arrow key
+# cannot walk onto it and press it.
+dialog_confirm() {
+    local title="$1"
+    shift
+    local -a lines=("$@")
+    local answer='' key
+
+    while :; do
+        frame_reset
+        frame_line "${C_BOLD}${C_RED}${title}${C_RESET}"
+        frame_line ''
+        local line
+        for line in "${lines[@]}"; do frame_line "  ${line}"; done
+        frame_line ''
+        frame_line "  Type ${C_BOLD}yes${C_RESET} to go ahead, or Esc to stop."
+        frame_line ''
+        frame_line "  > ${answer}${C_REV} ${C_RESET}"
+        frame_flush
+
+        key="$(read_key)" || return 1
+        case "${key}" in
+            ENTER) [[ "${answer}" == yes ]] && return 0 || return 1 ;;
+            ESC|CTRL-C) return 1 ;;
+            BACKSPACE) answer="${answer%?}" ;;
+            [A-Za-z]) answer+="${key}" ;;
+        esac
+    done
+}
+
+# A list to pick from. Items are "value<TAB>label" lines on stdin; the value of
+# whatever was chosen lands in DIALOG_RESULT.
+dialog_menu() {
+    local title="$1"
+    shift
+    local -a values=() labels=()
+    local line value label
+    while IFS= read -r line; do
+        value="${line%%$'\t'*}"
+        label="${line#*$'\t'}"
+        values+=("${value}")
+        labels+=("${label}")
+    done
+    ((${#values[@]} > 0)) || return 1
+
+    local cursor=0 key
+    while :; do
+        term_size
+        frame_reset
+        frame_line "${C_BOLD}${title}${C_RESET}"
+        frame_line ''
+        local i
+        for ((i = 0; i < ${#values[@]}; i++)); do
+            if ((i == cursor)); then
+                frame_line "${C_REV}  $(pad "${labels[i]}" $(( COLS - 4 )))${C_RESET}"
+            else
+                frame_line "  $(pad "${labels[i]}" $(( COLS - 4 )))"
+            fi
+        done
+        frame_line ''
+        frame_line "${C_DIM}  up/down to move, Enter to choose, Esc to go back${C_RESET}"
+        frame_flush
+
+        key="$(read_key)" || return 1
+        case "${key}" in
+            UP|SUP)     ((cursor > 0)) && cursor=$(( cursor - 1 )) ;;
+            DOWN|SDOWN) ((cursor < ${#values[@]} - 1)) && cursor=$(( cursor + 1 )) ;;
+            HOME)       cursor=0 ;;
+            END)        cursor=$(( ${#values[@]} - 1 )) ;;
+            ENTER)      DIALOG_RESULT="${values[cursor]}"; return 0 ;;
+            ESC|CTRL-C|q) return 1 ;;
+        esac
+    done
+}
+
+# A line of text. Returns what was typed in DIALOG_RESULT.
+dialog_text() {
+    local title="$1" prompt="$2" value="${3:-}"
+    local key
+
+    while :; do
+        term_size
+        frame_reset
+        frame_line "${C_BOLD}${title}${C_RESET}"
+        frame_line ''
+        frame_line "  ${prompt}"
+        frame_line ''
+        frame_line "  > ${value}${C_REV} ${C_RESET}"
+        frame_line ''
+        frame_line "${C_DIM}  Enter to accept, Esc to go back${C_RESET}"
+        frame_flush
+
+        key="$(read_key)" || return 1
+        case "${key}" in
+            ENTER) DIALOG_RESULT="${value}"; return 0 ;;
+            ESC|CTRL-C) return 1 ;;
+            BACKSPACE) value="${value%?}" ;;
+            SPACE) value+=' ' ;;
+            ?) value+="${key}" ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# The size widget
+#
+# A slider and a text field that are the same value seen two ways. Arrow keys
+# move the slider and rewrite the text to match; typing replaces the text and
+# moves the slider to whatever it parses to. Either way what comes out is a
+# whole number of alignment units, because that is the only kind of answer a
+# partition can have.
+#
+# The step is a share of the range rather than a fixed size: one arrow press
+# should mean something on a 4 GiB disk and on a 20 TiB one, and a fixed 1 GiB
+# is either far too coarse or a thousand presses.
+# ---------------------------------------------------------------------------
+
+# In: title, minimum sectors, maximum sectors, starting sectors, and what a
+# percentage is of, in sectors. Out: sectors, in DIALOG_RESULT.
+dialog_size() {
+    local title="$1" minimum="$2" maximum="$3" current="$4" percent_base="$5"
+    local text='' key typed=0
+
+    minimum=$(align_up "${minimum}")
+    maximum=$(align_down "${maximum}")
+    ((maximum >= minimum)) || return 1
+    ((current < minimum)) && current="${minimum}"
+    ((current > maximum)) && current="${maximum}"
+    current=$(align_down "${current}")
+    ((current < minimum)) && current="${minimum}"
+
+    local range=$(( maximum - minimum ))
+    local step=$(( range / 100 )) big=$(( range / 10 ))
+    ((step < ALIGN)) && step="${ALIGN}"
+    ((big < step * 10)) && big=$(( step * 10 ))
+    step=$(align_up "${step}")
+    big=$(align_up "${big}")
+
+    text="$(format_sectors "${current}")"
+    text="${text// /}"
+
+    while :; do
+        term_size
+        local width=$(( COLS - 8 ))
+        ((width > 12)) || width=12
+        local filled=0
+        ((range > 0)) && filled=$(( (current - minimum) * width / range )) || filled="${width}"
+        ((filled > width)) && filled="${width}"
+        local percent=0
+        ((percent_base > 0)) && percent=$(( current * 100 / percent_base ))
+
+        local bar='' n
+        for ((n = 0; n < width; n++)); do
+            if ((n < filled)); then bar+="${G_BAR}"; else bar+="${G_LINE}"; fi
+        done
+
+        frame_reset
+        frame_line "${C_BOLD}${title}${C_RESET}"
+        frame_line ''
+        frame_line "  smallest $(format_sectors "${minimum}")   largest $(format_sectors "${maximum}")"
+        frame_line ''
+        frame_line "  ${C_GREEN}${bar}${C_RESET}"
+        frame_line ''
+        frame_line "  ${C_BOLD}$(format_sectors "${current}")${C_RESET}  ${C_DIM}(${percent}% of $(format_sectors "${percent_base}"), ${current} sectors)${C_RESET}"
+        frame_line ''
+        frame_line "  > ${text}${C_REV} ${C_RESET}"
+        frame_line ''
+        frame_line "${C_DIM}  left/right by $(format_sectors "${step}"), shift or PgUp/PgDn by $(format_sectors "${big}"), Home/End for the ends${C_RESET}"
+        frame_line "${C_DIM}  or type a size - 10G, 512MiB, 2048s, 50% - and press Enter${C_RESET}"
+        frame_flush
+
+        key="$(read_key)" || return 1
+        case "${key}" in
+            LEFT)   current=$(( current - step )); typed=0 ;;
+            RIGHT)  current=$(( current + step )); typed=0 ;;
+            SLEFT|PGDN|DOWN|SDOWN)  current=$(( current - big )); typed=0 ;;
+            SRIGHT|PGUP|UP|SUP)     current=$(( current + big )); typed=0 ;;
+            HOME)   current="${minimum}"; typed=0 ;;
+            END)    current="${maximum}"; typed=0 ;;
+            BACKSPACE)
+                text="${text%?}"
+                typed=1
+                ;;
+            ESC|CTRL-C) return 1 ;;
+            ENTER)
+                if ((typed)) && [[ -n "${text}" ]]; then
+                    local bytes
+                    if ! bytes="$(parse_size "${text}" $(( percent_base * SECTOR )) 2> /dev/null)"; then
+                        dialog_message 'That is not a size' \
+                            "\"${text}\" could not be read as a size." \
+                            'Sizes look like 10G, 512MiB, 2048s or 50%.' \
+                            'A bare number is refused: it would be bytes, which is never what was meant.'
+                        continue
+                    fi
+                    current=$(align_down $(( bytes / SECTOR )))
+                fi
+                ((current < minimum)) && current="${minimum}"
+                ((current > maximum)) && current="${maximum}"
+                DIALOG_RESULT=$(align_down "${current}")
+                ((DIALOG_RESULT < minimum)) && DIALOG_RESULT="${minimum}"
+                return 0
+                ;;
+            [0-9.%A-Za-z])
+                ((typed)) || text=''
+                text+="${key}"
+                typed=1
+                # Shown on the slider as it is typed, when it is far enough
+                # along to mean something.
+                local preview
+                if preview="$(parse_size "${text}" $(( percent_base * SECTOR )) 2> /dev/null)"; then
+                    local sectors
+                    sectors=$(align_down $(( preview / SECTOR )))
+                    ((sectors >= minimum && sectors <= maximum)) && current="${sectors}"
+                fi
+                continue
+                ;;
+        esac
+        ((current < minimum)) && current="${minimum}"
+        ((current > maximum)) && current="${maximum}"
+        current=$(align_down "${current}")
+        ((current < minimum)) && current="${minimum}"
+        text="$(format_sectors "${current}")"
+        text="${text// /}"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# The disk view
+# ---------------------------------------------------------------------------
+
+VIEW_CURSOR=0
+
+screen_disk_draw() {
+    local -a rows
+    mapfile -t rows < <(view_rows)
+    local count="${#rows[@]}"
+    ((VIEW_CURSOR >= count)) && VIEW_CURSOR=$(( count > 0 ? count - 1 : 0 ))
+    ((VIEW_CURSOR < 0)) && VIEW_CURSOR=0
+
+    term_size
+    frame_reset
+
+    local table
+    table="$(label_name)"
+    [[ "${LABEL}" == none ]] && table='none'
+    local dirty=''
+    ((PLAN_DIRTY)) && dirty="   ${C_YELLOW}${C_BOLD}* unapplied changes${C_RESET}"
+
+    frame_line "${C_BOLD}${DISK}${C_RESET}  $(format_size "${DISK_BYTES}")  ${C_DIM}$(device_model "${DISK}")${C_RESET}"
+    frame_line "partition table: ${C_BOLD}${table}${C_RESET}   sector ${SECTOR} B   ${DISK_SECTORS} sectors${dirty}"
+    if [[ "${LABEL}" == none ]]; then
+        frame_line "${C_YELLOW}there is no partition table; go back with q and press l to write one${C_RESET}"
+    else
+        frame_line "${C_DIM}$(firmware_summary) - f for what that means here${C_RESET}"
+    fi
+    frame_line ''
+    map_bar "${VIEW_CURSOR}"
+    frame_line " ${MAP_BAR}"
+    frame_line " ${MAP_MARK}"
+    frame_line "${C_BOLD}$(pad '  PARTITION' 16)$(pad 'START' 13)$(pad 'SIZE' 12)$(pad 'TYPE' 14)$(pad 'CONTENTS' $(( COLS - 55 )))${C_RESET}"
+
+    local i row type index start size
+    for ((i = 0; i < count; i++)); do
+        IFS=: read -r type index start size <<< "${rows[i]}"
+        local device kindname contents colour
+        if [[ "${type}" == p ]]; then
+            device="$(part_device "${P_NUMBER[index]}")"
+            device="${device#/dev/}"
+            kindname="$(partition_type_label "${index}")"
+            colour="$(kind_colour "${P_KIND[index]}")"
+            contents="${P_FSTYPE[index]}"
+            if [[ -z "${contents}" ]]; then
+                # A raw image is not probed for filesystems, so "unknown" there
+                # would be this program's ignorance rather than the disk's.
+                is_image "${DISK}" && contents='-' || contents='unknown'
+            fi
+            # A GPT partition name is not its contents, so it is shown as what
+            # it is: a label somebody wrote, in quotes, beside them.
+            [[ -n "${P_NAME[index]}" ]] \
+                && contents+=" ${C_DIM}\"${P_NAME[index]}\"${C_RESET}"
+            ((P_EXISTING[index])) || contents="${C_YELLOW}new${C_RESET}"
+            case "${P_ACTION[index]}" in
+                resize)   contents="${C_YELLOW}resized${C_RESET} - ${P_FSTYPE[index]:-unknown}, not resized with it" ;;
+                reformat) contents="${C_YELLOW}to be reformatted${C_RESET} - was ${P_FSTYPE[index]:-unknown}" ;;
+            esac
+            if ((DO_FORMAT)) && ((P_FORMAT[index])); then
+                case "${P_KIND[index]}" in
+                    ext4|xfs|btrfs|efi) contents+=" ${C_DIM}(mkfs on apply)${C_RESET}" ;;
+                esac
+            fi
+            [[ -n "${P_MOUNT[index]}" ]] && contents+=" ${C_YELLOW}mounted on ${P_MOUNT[index]}${C_RESET}"
+        else
+            device='-'
+            kindname='free space'
+            colour="${C_GREY}"
+            contents=''
+        fi
+
+        local line
+        line="$(pad "  ${device}" 16)$(pad "${start}" 13)$(pad "$(format_sectors "${size}")" 12)${colour}$(pad "${kindname}" 14)${C_RESET}${contents}"
+        if ((i == VIEW_CURSOR)); then
+            frame_line "${C_REV}${line}${C_RESET}"
+        else
+            frame_line "${line}"
+        fi
+    done
+
+    frame_line ''
+    frame_line "${C_DIM}  n new partition   d delete   t type   z resize   w wipe${C_RESET}"
+    frame_line "${C_DIM}  a apply   u reload   f firmware   R build RAID   V manage LVM   q back${C_RESET}"
+    frame_flush
+}
+
+# The row under the cursor, as "type:index:start:size".
+view_selected() {
+    local -a rows
+    mapfile -t rows < <(view_rows)
+    ((VIEW_CURSOR < ${#rows[@]})) || return 1
+    printf '%s' "${rows[VIEW_CURSOR]}"
+}
+
+action_new_partition() {
+    local row type index start size
+    row="$(view_selected)" || return 0
+    IFS=: read -r type index start size <<< "${row}"
+    if [[ "${type}" != f ]]; then
+        dialog_message 'Not free space' \
+            'A new partition goes in free space.' \
+            'Move to a "free space" row and press n there.'
+        return 0
+    fi
+    if [[ "${LABEL}" == none ]]; then
+        dialog_message 'No partition table' \
+            "${DISK} has no partition table, and a partition needs one to be described in." \
+            'Go back with q and press l on the disk list to write one, or s to lay the' \
+            'whole disk out for Sowa in one step.'
+        return 0
+    fi
+    if ((P_COUNT >= $(plan_max_partitions))); then
+        dialog_message 'No room in the table' \
+            "$(label_name) tables hold $(plan_max_partitions) partitions and there are already ${P_COUNT}." \
+            'Delete one, or write a GPT table instead of an MBR one.'
+        return 0
+    fi
+
+    local -a choices=()
+    local kind
+    for kind in "${KINDS[@]}"; do
+        kind_supported "${kind}" "${LABEL}" || continue
+        choices+=("${kind}"$'\t'"$(kind_label "${kind}") - $(kind_description "${kind}")")
+    done
+    dialog_menu 'What kind of partition?' < <(printf '%s\n' "${choices[@]}") || return 0
+    kind="${DIALOG_RESULT}"
+
+    local minimum
+    minimum=$(( $(kind_min_bytes "${kind}") / SECTOR ))
+    minimum=$(align_up "${minimum}")
+    if ((size < minimum)); then
+        dialog_message 'Not enough room' \
+            "$(kind_label "${kind}") needs at least $(format_sectors "${minimum}")." \
+            "This free region is $(format_sectors "${size}")."
+        return 0
+    fi
+
+    # A BIOS Boot Partition is 1 MiB and there is no reason to ask.
+    local chosen
+    if [[ "${kind}" == biosboot ]]; then
+        chosen="${ALIGN}"
+    else
+        local suggested="${size}"
+        [[ "${kind}" == efi ]] && suggested=$(( $(parse_size "${SCHEME_ESP_DEFAULT}" 0) / SECTOR ))
+        ((suggested > size)) && suggested="${size}"
+        dialog_size "How big should the $(kind_label "${kind}") partition be?" \
+            "${minimum}" "${size}" "${suggested}" "${size}" || return 0
+        chosen="${DIALOG_RESULT}"
+    fi
+
+    plan_add "${start}" "${chosen}" "${kind}" "$(kind_label "${kind}")"
+}
+
+action_delete_partition() {
+    local row type index start size
+    row="$(view_selected)" || return 0
+    IFS=: read -r type index start size <<< "${row}"
+    [[ "${type}" == p ]] || return 0
+
+    if [[ -n "${P_MOUNT[index]}" ]]; then
+        dialog_message 'It is mounted' \
+            "That partition is mounted on ${P_MOUNT[index]}." \
+            'Unmount it before removing it from the table.'
+        return 0
+    fi
+    if ((P_EXISTING[index])); then
+        dialog_confirm 'Remove an existing partition from the table' \
+            "$(format_sectors "${size}") $(kind_label "${P_KIND[index]}"), containing ${P_FSTYPE[index]:-something unrecognised}." \
+            'Nothing is written until the plan is applied, but applying it will' \
+            'make whatever is in this partition unreachable.' || return 0
+    fi
+    plan_delete "${index}"
+    ((VIEW_CURSOR > 0)) && VIEW_CURSOR=$(( VIEW_CURSOR - 1 ))
+    return 0
+}
+
+action_change_type() {
+    local row type index start size
+    row="$(view_selected)" || return 0
+    IFS=: read -r type index start size <<< "${row}"
+    [[ "${type}" == p ]] || return 0
+
+    local -a choices=()
+    local kind
+    for kind in "${KINDS[@]}"; do
+        kind_supported "${kind}" "${LABEL}" || continue
+        choices+=("${kind}"$'\t'"$(kind_label "${kind}") - $(kind_description "${kind}")")
+    done
+    dialog_menu 'What should this partition be?' < <(printf '%s\n' "${choices[@]}") || return 0
+    kind="${DIALOG_RESULT}"
+
+    local minimum
+    minimum=$(( $(kind_min_bytes "${kind}") / SECTOR ))
+    if ((size < minimum)); then
+        dialog_message 'Too small for that' \
+            "$(kind_label "${kind}") needs at least $(format_size "$(kind_min_bytes "${kind}")")." \
+            "This partition is $(format_sectors "${size}")."
+        return 0
+    fi
+
+    if ((P_EXISTING[index])); then
+        dialog_confirm 'Change the type of an existing partition' \
+            "It is $(kind_label "${P_KIND[index]}") now and would become $(kind_label "${kind}")." \
+            "It contains ${P_FSTYPE[index]:-something unrecognised}." \
+            'Changing the type marks it to be reformatted when the plan is applied.' || return 0
+        # Its own type code and its identity go: the new type is written
+        # instead, and a fresh UUID with it, so that an fstab entry naming the
+        # old PARTUUID fails to find anything rather than silently finding an
+        # empty filesystem where its data used to be.
+        P_TYPE[index]=''
+        P_UUID[index]=''
+        P_FORMAT[index]=1
+        P_ACTION[index]=reformat
+    fi
+    P_KIND[index]="${kind}"
+    P_NAME[index]="$(kind_label "${kind}")"
+    PLAN_DIRTY=1
+}
+
+action_resize_partition() {
+    local row type index start size
+    row="$(view_selected)" || return 0
+    IFS=: read -r type index start size <<< "${row}"
+    [[ "${type}" == p ]] || return 0
+
+    if ((P_EXISTING[index])); then
+        dialog_confirm 'Resize an existing partition' \
+            'This changes where the partition ends without moving the filesystem' \
+            'inside it. Growing one is harmless; shrinking one below the size of' \
+            'its filesystem destroys it. Nothing here resizes a filesystem.' || return 0
+        # It is still the partition that was on the disk: same type code, same
+        # identity, and emphatically not reformatted. Only its end moves.
+        P_ACTION[index]=resize
+    fi
+
+    # How far it can grow: to the start of the next partition, or to the end of
+    # what the table can address.
+    local limit
+    if ((index + 1 < P_COUNT)); then
+        limit="${P_START[index + 1]}"
+    else
+        limit=$(( $(plan_last_usable) + 1 ))
+    fi
+    local maximum
+    maximum=$(align_down $(( limit - start )))
+    local minimum
+    minimum=$(( $(kind_min_bytes "${P_KIND[index]}") / SECTOR ))
+    minimum=$(align_up "${minimum}")
+    ((maximum >= minimum)) || {
+        dialog_message 'It cannot be resized' 'There is no room between it and what follows it.'
+        return 0
+    }
+
+    dialog_size "How big should $(part_device "${P_NUMBER[index]}") be?" \
+        "${minimum}" "${maximum}" "${size}" "${maximum}" || return 0
+    P_SIZE[index]="${DIALOG_RESULT}"
+    PLAN_DIRTY=1
+}
+
+action_firmware() {
+    local -a advice=()
+    mapfile -t advice < <(firmware_advice)
+    dialog_message "This machine $(firmware_summary)" "${advice[@]}"
+}
+
+action_wipe() {
+    dialog_menu "Wipe ${DISK} with zeros" < <(printf '%s\n' \
+        $'signatures\tSignatures only - the table areas and the ends of each partition' \
+        $'full\tThe whole disk - every byte of it, which is as slow as it sounds' \
+        $'size\tA size or a percentage from the start of the disk' \
+        $'partition\tOne whole partition') || return 0
+    local mode="${DIALOG_RESULT}" argument=''
+
+    case "${mode}" in
+        size)
+            dialog_text 'How much to wipe' \
+                "From the start of ${DISK}, which is $(format_size "${DISK_BYTES}"). Try 10G or 25%." \
+                '1G' || return 0
+            argument="${DIALOG_RESULT}"
+            ;;
+        partition)
+            local -a choices=() i
+            for ((i = 0; i < P_COUNT; i++)); do
+                ((P_EXISTING[i])) || continue
+                choices+=("${i}"$'\t'"$(part_device "${P_NUMBER[i]}") - $(format_sectors "${P_SIZE[i]}") $(kind_label "${P_KIND[i]}") ${P_FSTYPE[i]}")
+            done
+            ((${#choices[@]} > 0)) || { dialog_message 'Nothing to wipe' 'There are no partitions on the disk.'; return 0; }
+            dialog_menu 'Which partition?' < <(printf '%s\n' "${choices[@]}") || return 0
+            argument="${DIALOG_RESULT}"
+            ;;
+    esac
+
+    # The same refusal action_apply makes, and for a stronger reason: zeros
+    # written under a mounted filesystem destroy it while it is in use. wipe_run
+    # refuses as well, but it does it by exiting, which is no way to leave a
+    # full-screen program.
+    local wipe_target=''
+    [[ "${mode}" == partition ]] && wipe_target="$(part_device "${P_NUMBER[argument]}")"
+    local -a holders=()
+    mapfile -t holders < <(device_holders "${DISK}" "${wipe_target}")
+    if ((${#holders[@]} > 0)); then
+        dialog_message 'It is in use' "${holders[@]}" '' \
+            'Writing zeros under a mounted filesystem destroys it while it is' \
+            'still being used. Unmount it, stop any array it is a member of,' \
+            'and deactivate any volume group on it first.'
+        return 0
+    fi
+
+    local description
+    case "${mode}" in
+        signatures) description="the partition table areas and the first and last $(format_size "${SIGNATURE_BYTES}") of every partition" ;;
+        full)       description="all $(format_size "${DISK_BYTES}") of it" ;;
+        size)       description="the first ${argument} of it" ;;
+        partition)  description="all of $(part_device "${P_NUMBER[argument]}")" ;;
+    esac
+
+    dialog_confirm "Write zeros over ${DISK}" \
+        "This writes ${description}." \
+        'It happens immediately. There is no undo and nothing to apply afterwards.' || return 0
+
+    tui_suspend
+    printf '\n'
+    wipe_run "${mode}" "${argument}" || true
+    tty_pause
+    tui_resume
+    VIEW_CURSOR=0
+}
+
+action_apply() {
+    if ((!PLAN_DIRTY)); then
+        dialog_message 'Nothing to apply' 'The plan matches what is on the disk.'
+        return 0
+    fi
+    local problems
+    if ! problems="$(plan_validate)"; then
+        local -a lines=()
+        mapfile -t lines <<< "${problems}"
+        dialog_message 'The plan cannot be written' "${lines[@]}"
+        return 0
+    fi
+
+    local -a holders=()
+    mapfile -t holders < <(device_holders "${DISK}")
+    if ((${#holders[@]} > 0)); then
+        dialog_message 'The disk is in use' "${holders[@]}" '' \
+            'The kernel will not re-read a partition table while anything on the' \
+            'disk is open. Unmount it, stop any array it is a member of, and' \
+            'deactivate any volume group on it first.'
+        return 0
+    fi
+
+    local -a changes=()
+    mapfile -t changes < <(plan_changes)
+    dialog_confirm "Apply the plan to ${DISK}" "${changes[@]}" \
+        '' 'Everything above happens now.' || return 0
+
+    tui_suspend
+    printf '\n'
+    if ! plan_apply; then
+        printf '\nThe plan was not fully applied.\n'
+    fi
+    tty_pause
+    tui_resume
+    VIEW_CURSOR=0
+}
+
+screen_disk() {
+    local disk="$1"
+    plan_load "${disk}"
+    VIEW_CURSOR=0
+    local key
+
+    while :; do
+        screen_disk_draw
+        key="$(read_key)" || return 0
+        case "${key}" in
+            UP|SUP)     ((VIEW_CURSOR > 0)) && VIEW_CURSOR=$(( VIEW_CURSOR - 1 )) ;;
+            DOWN|SDOWN) VIEW_CURSOR=$(( VIEW_CURSOR + 1 )) ;;
+            HOME)       VIEW_CURSOR=0 ;;
+            n)          action_new_partition ;;
+            d|DELETE)   action_delete_partition ;;
+            t)          action_change_type ;;
+            z)          action_resize_partition ;;
+            f)          action_firmware ;;
+            w)          action_wipe ;;
+            a)          action_apply ;;
+            u)          plan_load "${disk}"; VIEW_CURSOR=0 ;;
+            R)          screen_build_raid ;;
+            V)          screen_lvm ;;
+            q|ESC)
+                if ((PLAN_DIRTY)); then
+                    dialog_confirm 'Leave without applying' \
+                        'The plan has changes that have not been written to the disk.' \
+                        'Nothing has been changed on the disk; going back forgets the plan.' \
+                        || continue
+                fi
+                return 0
+                ;;
+            CTRL-C) return 1 ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Building md and LVM out of partitions that exist
+#
+# These take device nodes, so they list what is on the machine now rather than
+# what is in any plan. A partition that is still only planned is not offered,
+# because there is nothing yet to give mdadm.
+# ---------------------------------------------------------------------------
+
+# Every partition on every disk, as "device<TAB>description" lines. RAID and
+# LVM members are marked, since a partition of that type is what somebody
+# building one is usually looking for.
+list_candidate_partitions() {
+    local line kname type fstype mount size
+    while IFS= read -r line; do
+        kname="$(kv "${line}" KNAME)"
+        type="$(kv "${line}" TYPE)"
+        [[ "${type}" == part ]] || continue
+        fstype="$(kv "${line}" FSTYPE)"
+        mount="$(kv "${line}" MOUNTPOINT)"
+        size="$(kv "${line}" SIZE)"
+        local note=''
+        case "${fstype}" in
+            linux_raid_member) note='RAID member' ;;
+            LVM2_member)       note='LVM2 member' ;;
+            '')                note='empty' ;;
+            *)                 note="${fstype}" ;;
+        esac
+        [[ -n "${mount}" ]] && note+=" - mounted on ${mount}"
+        printf '/dev/%s\t%-14s %10s  %s\n' "${kname}" "/dev/${kname}" "$(format_size "${size}")" "${note}"
+    done < <(lsblk -b -n -P -o KNAME,TYPE,FSTYPE,MOUNTPOINT,SIZE 2> /dev/null)
+}
+
+# Pick several. Space marks, Enter accepts; the marks are what makes this
+# different from dialog_menu and the reason it is written out again.
+dialog_multi() {
+    local title="$1"
+    shift
+    local -a values=() labels=() marked=()
+    local line
+    while IFS= read -r line; do
+        values+=("${line%%$'\t'*}")
+        labels+=("${line#*$'\t'}")
+        marked+=(0)
+    done
+    ((${#values[@]} > 0)) || return 1
+
+    local cursor=0 key i
+    while :; do
+        term_size
+        frame_reset
+        frame_line "${C_BOLD}${title}${C_RESET}"
+        frame_line ''
+        for ((i = 0; i < ${#values[@]}; i++)); do
+            local mark='[ ]'
+            ((marked[i])) && mark="[${C_GREEN}x${C_RESET}]"
+            local text="  ${mark} ${labels[i]}"
+            if ((i == cursor)); then
+                frame_line "${C_REV}${text}${C_RESET}"
+            else
+                frame_line "${text}"
+            fi
+        done
+        frame_line ''
+        frame_line "${C_DIM}  space to mark, Enter when they are all marked, Esc to go back${C_RESET}"
+        frame_flush
+
+        key="$(read_key)" || return 1
+        case "${key}" in
+            UP|SUP)     ((cursor > 0)) && cursor=$(( cursor - 1 )) ;;
+            DOWN|SDOWN) ((cursor < ${#values[@]} - 1)) && cursor=$(( cursor + 1 )) ;;
+            SPACE)      marked[cursor]=$(( 1 - marked[cursor] )) ;;
+            ENTER)
+                DIALOG_RESULT=''
+                for ((i = 0; i < ${#values[@]}; i++)); do
+                    ((marked[i])) && DIALOG_RESULT+="${values[i]} "
+                done
+                DIALOG_RESULT="${DIALOG_RESULT% }"
+                [[ -n "${DIALOG_RESULT}" ]] || continue
+                return 0
+                ;;
+            ESC|CTRL-C|q) return 1 ;;
+        esac
+    done
+}
+
+screen_build_raid() {
+    if ! command -v mdadm > /dev/null 2>&1; then
+        dialog_message 'mdadm is not installed' 'Install the mdadm package first.'
+        return 0
+    fi
+    dialog_multi 'Which partitions should the array be built from?' \
+        < <(list_candidate_partitions) || return 0
+    local chosen="${DIALOG_RESULT}"
+    local -a member_list=()
+    read -r -a member_list <<< "${chosen}"
+
+    dialog_menu 'Which RAID level?' < <(printf '%s\n' \
+        $'1\tRAID 1 - a mirror: every member holds everything, any one may fail' \
+        $'0\tRAID 0 - a stripe: capacity added up, no redundancy at all' \
+        $'5\tRAID 5 - one parity member: needs three, survives one failure' \
+        $'6\tRAID 6 - two parity members: needs four, survives two failures' \
+        $'10\tRAID 10 - mirrored stripes: needs four') || return 0
+    local level="${DIALOG_RESULT}"
+
+    local minimum
+    minimum="$(raid_min_devices "${level}")"
+    if ((${#member_list[@]} < minimum)); then
+        dialog_message 'Not enough members' \
+            "RAID ${level} needs at least ${minimum} members." \
+            "${#member_list[@]} were chosen."
+        return 0
+    fi
+
+    local suggestion=0
+    while [[ -e "/dev/md${suggestion}" ]]; do suggestion=$(( suggestion + 1 )); done
+    dialog_text 'What should the array be called?' \
+        'A device node under /dev, conventionally /dev/md0, /dev/md1 and so on.' \
+        "/dev/md${suggestion}" || return 0
+    local node="${DIALOG_RESULT}"
+
+    dialog_confirm "Create ${node}" \
+        "RAID ${level} from ${chosen}." \
+        'Everything on those partitions is destroyed. This happens immediately.' || return 0
+
+    tui_suspend
+    printf '\n'
+    if raid_create "${level}" "${node}" "${member_list[@]}"; then
+        printf '\nRecord %s in /etc/mdadm.conf so it is assembled at boot? [y/N] ' "${node}"
+        local answer=''
+        read -r -u "${TTY_FD}" answer || true
+        [[ "${answer}" == [Yy]* ]] && raid_record "${node}"
+    fi
+    tty_pause
+    tui_resume
+}
+
+screen_build_lvm() {
+    if ! command -v vgcreate > /dev/null 2>&1; then
+        dialog_message 'LVM2 is not installed' 'Install the lvm2 package first.'
+        return 0
+    fi
+    # An md array is the usual thing to put a volume group on, so arrays are
+    # offered beside partitions here.
+    dialog_multi 'Which devices should the volume group be built from?' < <(
+        list_candidate_partitions
+        # An md array is the usual thing to put a volume group on.
+        local line kname size
+        while IFS= read -r line; do
+            kname="$(kv "${line}" KNAME)"
+            [[ "$(kv "${line}" TYPE)" == raid* ]] || continue
+            size="$(kv "${line}" SIZE)"
+            printf '/dev/%s\t%-14s %10s  md array\n' "${kname}" "/dev/${kname}" "$(format_size "${size}")"
+        done < <(lsblk -b -n -P -o KNAME,TYPE,SIZE 2> /dev/null)
+    ) || return 0
+    local chosen="${DIALOG_RESULT}"
+    local -a device_list=()
+    read -r -a device_list <<< "${chosen}"
+
+    dialog_text 'What should the volume group be called?' \
+        'A name, not a path: "data" becomes /dev/data/<volume>.' 'data' || return 0
+    local vg="${DIALOG_RESULT}"
+
+    dialog_confirm "Create the volume group ${vg}" \
+        "From ${chosen}." \
+        'Everything on those devices is destroyed. This happens immediately.' || return 0
+
+    tui_suspend
+    printf '\n'
+    lvm_create_vg "${vg}" "${device_list[@]}" || true
+    tty_pause
+    tui_resume
+
+    # A group with no volumes in it holds nothing yet, so this lands where the
+    # volumes are made rather than announcing success and going back.
+    screen_volumes "${vg}"
+}
+
+# ---------------------------------------------------------------------------
+# Volume groups and logical volumes
+#
+# A logical volume is what a partition is, one layer up: a named, resizable
+# region of a volume group that a filesystem goes on. So the screen that
+# manages them is the partition screen's counterpart, with the same size widget
+# and the same idea of free space - and, unlike partitioning, the operations
+# happen when they are asked for, because LVM has its own notion of a
+# transaction and there is nothing to be gained by inventing a second one.
+# ---------------------------------------------------------------------------
+
+lvm_available() { command -v vgs > /dev/null 2>&1 && command -v lvcreate > /dev/null 2>&1; }
+
+# name:size:free, in bytes. "--units b --nosuffix" is what makes those numbers
+# rather than the human-readable strings LVM prints by default.
+lvm_groups() {
+    lvm_available || return 0
+    vgs --noheadings --units b --nosuffix -o vg_name,vg_size,vg_free 2> /dev/null \
+        | awk 'NF >= 3 { sub(/\..*/, "", $2); sub(/\..*/, "", $3); printf "%s:%s:%s\n", $1, $2, $3 }'
+    return 0
+}
+
+lvm_group_field() {
+    local want="$1" field="$2" line name size free
+    while IFS=: read -r name size free; do
+        [[ "${name}" == "${want}" ]] || continue
+        case "${field}" in
+            size) printf '%s' "${size}" ;;
+            free) printf '%s' "${free}" ;;
+        esac
+        return 0
+    done < <(lvm_groups)
+    printf '0'
+}
+
+# name:size:path:fstype:mountpoint, for one volume group. The last two come
+# from lsblk rather than from LVM, which knows how big a volume is and nothing
+# at all about what was put in it.
+lvm_volume_rows() {
+    local vg="$1" line name size path fstype mount lsblk_line lsblk_path
+    lvm_available || return 0
+
+    local -a paths=() types=() mounts=()
+    while IFS= read -r lsblk_line; do
+        lsblk_path="$(kv "${lsblk_line}" PATH)"
+        [[ -n "${lsblk_path}" ]] || continue
+        paths+=("${lsblk_path}")
+        types+=("$(kv "${lsblk_line}" FSTYPE)")
+        mounts+=("$(kv "${lsblk_line}" MOUNTPOINT)")
+    done < <(lsblk -n -P -o PATH,FSTYPE,MOUNTPOINT 2> /dev/null)
+
+    while IFS=: read -r name size path; do
+        [[ -n "${name}" ]] || continue
+        fstype=""
+        mount=""
+        local i
+        for ((i = 0; i < ${#paths[@]}; i++)); do
+            if [[ "${paths[i]}" == "${path}" ]]; then
+                fstype="${types[i]}"
+                mount="${mounts[i]}"
+                break
+            fi
+        done
+        printf '%s:%s:%s:%s:%s\n' "${name}" "${size}" "${path}" "${fstype}" "${mount}"
+    done < <(lvs --noheadings --units b --nosuffix -o lv_name,lv_size,lv_path "${vg}" 2> /dev/null \
+        | awk 'NF >= 3 { sub(/\..*/, "", $2); printf "%s:%s:%s\n", $1, $2, $3 }')
+    return 0
+}
+
+# dialog_size thinks in sectors, because partitions do. A logical volume is
+# measured in bytes, so this is the same widget with the units changed around
+# it rather than a second one written to think in bytes.
+dialog_size_bytes() {
+    local title="$1" minimum="$2" maximum="$3" current="$4" base="$5"
+    local saved_sector="${SECTOR}" saved_align="${ALIGN}" status=0
+
+    SECTOR=512
+    ALIGN=$(( ALIGN_BYTES / 512 ))
+    dialog_size "${title}" $(( minimum / 512 )) $(( maximum / 512 )) \
+        $(( current / 512 )) $(( base / 512 )) || status=1
+    ((status == 0)) && DIALOG_RESULT=$(( DIALOG_RESULT * 512 ))
+    SECTOR="${saved_sector}"
+    ALIGN="${saved_align}"
+    return "${status}"
+}
+
+# Only the filesystems this machine can actually make are offered: choosing one
+# whose mkfs is not installed would fail after the confirmation rather than
+# before it.
+filesystem_menu() {
+    local -a items=()
+    local kind tool
+    for kind in ext4 xfs btrfs; do
+        tool="$(mkfs_for_kind "${kind}")"
+        command -v "${tool}" > /dev/null 2>&1 || continue
+        items+=("${kind}"$'\t'"$(kind_description "${kind}")")
+    done
+    items+=($'\tnone - leave it unformatted')
+    dialog_menu "$1" < <(printf '%s\n' "${items[@]}")
+}
+
+volume_new() {
+    local vg="$1"
+    local free minimum
+    free="$(lvm_group_field "${vg}" free)"
+    minimum=$(( 4 * ALIGN_BYTES ))
+    if ((free < minimum)); then
+        dialog_message 'The group is full' \
+            "${vg} has $(format_size "${free}") free, and a volume needs at least $(format_size "${minimum}")." \
+            'Add another physical volume to the group, or remove a volume.'
+        return 0
+    fi
+
+    dialog_text "A new volume in ${vg}" \
+        "It becomes /dev/${vg}/<name>." 'files' || return 0
+    local name="${DIALOG_RESULT}"
+    [[ "${name}" =~ ^[A-Za-z0-9_+.-]+$ ]] || {
+        dialog_message 'Not a usable name' \
+            'A logical volume name may hold letters, digits, and _ + . or -.'
+        return 0
+    }
+
+    dialog_size_bytes "How big should ${name} be?" \
+        "${minimum}" "${free}" "${free}" "${free}" || return 0
+    local bytes="${DIALOG_RESULT}"
+
+    filesystem_menu "What filesystem on ${name}?" || return 0
+    local filesystem="${DIALOG_RESULT}"
+
+    tui_suspend
+    printf '\n'
+    # 100% of the free space is asked for as a share rather than as a number of
+    # bytes, because LVM knows what its own metadata has taken and a byte count
+    # rounded to an extent boundary here would be a few extents short.
+    local size="${bytes}B"
+    ((bytes >= free)) && size='100%'
+    lvm_create_lv "${vg}" "${name}" "${size}" "${filesystem}" || true
+    tty_pause
+    tui_resume
+}
+
+volume_remove() {
+    local vg="$1" name="$2" path="$3" mount="$4"
+    if [[ -n "${mount}" ]]; then
+        dialog_message 'It is mounted' \
+            "${path} is mounted on ${mount}." 'Unmount it before removing it.'
+        return 0
+    fi
+    dialog_confirm "Remove the volume ${name}" \
+        "${path} and everything in it is destroyed." \
+        'This happens immediately.' || return 0
+
+    tui_suspend
+    printf '\n'
+    log "removing ${path}"
+    run lvremove -f "${path}" > /dev/null || warn "lvremove failed"
+    tty_pause
+    tui_resume
+}
+
+volume_format() {
+    local path="$1" mount="$2"
+    if [[ -n "${mount}" ]]; then
+        dialog_message 'It is mounted' \
+            "${path} is mounted on ${mount}." 'Unmount it before making a filesystem on it.'
+        return 0
+    fi
+    filesystem_menu "What filesystem on ${path}?" || return 0
+    local filesystem="${DIALOG_RESULT}"
+    [[ -n "${filesystem}" ]] || return 0
+
+    dialog_confirm "Make a ${filesystem} filesystem on ${path}" \
+        'Everything in the volume is destroyed. This happens immediately.' || return 0
+
+    tui_suspend
+    printf '\n'
+    log "making a ${filesystem} filesystem on ${path}"
+    case "${filesystem}" in
+        ext4)  run "${MKFS_EXT4}" -F -O '^orphan_file,^metadata_csum_seed' "${path}" > /dev/null || warn "mkfs.ext4 failed" ;;
+        xfs)   run mkfs.xfs -f "${path}" > /dev/null || warn "mkfs.xfs failed" ;;
+        btrfs) run mkfs.btrfs -f "${path}" > /dev/null || warn "mkfs.btrfs failed" ;;
+    esac
+    tty_pause
+    tui_resume
+}
+
+screen_volumes() {
+    local vg="$1" cursor=0 key
+    local -a rows=()
+
+    while :; do
+        mapfile -t rows < <(lvm_volume_rows "${vg}")
+        ((cursor >= ${#rows[@]})) && cursor=$(( ${#rows[@]} > 0 ? ${#rows[@]} - 1 : 0 ))
+        ((cursor < 0)) && cursor=0
+
+        local size free
+        size="$(lvm_group_field "${vg}" size)"
+        free="$(lvm_group_field "${vg}" free)"
+
+        term_size
+        frame_reset
+        frame_line "${C_BOLD}volume group ${vg}${C_RESET}  $(format_size "${size}")  ${C_DIM}$(format_size "${free}") free${C_RESET}"
+        frame_line ''
+        frame_line "${C_BOLD}$(pad '  VOLUME' 20)$(pad 'SIZE' 12)$(pad 'FILESYSTEM' 12)$(pad 'MOUNTED ON' $(( COLS - 46 )))${C_RESET}"
+
+        if ((${#rows[@]} == 0)); then
+            frame_line "  ${C_DIM}no volumes yet - press n to make one${C_RESET}"
+        fi
+        local i name volume_size path fstype mount line
+        for ((i = 0; i < ${#rows[@]}; i++)); do
+            IFS=: read -r name volume_size path fstype mount <<< "${rows[i]}"
+            line="$(pad "  ${name}" 20)$(pad "$(format_size "${volume_size}")" 12)$(pad "${fstype:-none}" 12)${mount}"
+            if ((i == cursor)); then
+                frame_line "${C_REV}$(pad "${line}" $(( COLS - 1 )))${C_RESET}"
+            else
+                frame_line "${line}"
+            fi
+        done
+
+        frame_line ''
+        frame_line "${C_DIM}  n new volume   d remove   t make a filesystem   q back${C_RESET}"
+        frame_flush
+
+        key="$(read_key)" || return 0
+        case "${key}" in
+            UP|SUP)     ((cursor > 0)) && cursor=$(( cursor - 1 )) ;;
+            DOWN|SDOWN) ((cursor < ${#rows[@]} - 1)) && cursor=$(( cursor + 1 )) ;;
+            n)          volume_new "${vg}" ;;
+            d)
+                ((${#rows[@]} > 0)) || continue
+                IFS=: read -r name volume_size path fstype mount <<< "${rows[cursor]}"
+                volume_remove "${vg}" "${name}" "${path}" "${mount}"
+                ;;
+            t)
+                ((${#rows[@]} > 0)) || continue
+                IFS=: read -r name volume_size path fstype mount <<< "${rows[cursor]}"
+                volume_format "${path}" "${mount}"
+                ;;
+            q|ESC|CTRL-C) return 0 ;;
+        esac
+    done
+}
+
+# The way in: pick a group to manage, or build one.
+screen_lvm() {
+    if ! lvm_available; then
+        dialog_message 'LVM2 is not installed' \
+            'The lvm2 package supplies pvcreate, vgcreate, lvcreate and the rest.'
+        return 0
+    fi
+
+    local -a groups=() choices=()
+    mapfile -t groups < <(lvm_groups)
+    local group name size free
+    for group in "${groups[@]}"; do
+        [[ -n "${group}" ]] || continue
+        IFS=: read -r name size free <<< "${group}"
+        choices+=("${name}"$'\t'"${name} - $(format_size "${size}"), $(format_size "${free}") free")
+    done
+    choices+=($'\t'"build a new volume group out of partitions")
+
+    dialog_menu 'Volume groups on this machine' < <(printf '%s\n' "${choices[@]}") || return 0
+    if [[ -z "${DIALOG_RESULT}" ]]; then
+        screen_build_lvm
+        return 0
+    fi
+    screen_volumes "${DIALOG_RESULT}"
+}
+
+# ---------------------------------------------------------------------------
+# The disk list
+# ---------------------------------------------------------------------------
+
+# Writing a new, empty table and laying out a whole disk are both operations on
+# the disk rather than on any partition of it, so both live on the disk list.
+# They used to be on the partition screen, next to the keys that edit one
+# partition, where "l" looked like a small change and was the largest one there.
+screen_new_table() {
+    local target="$1"
+
+    plan_load "${target}"
+    dialog_menu "A new, empty partition table for ${target}" < <(printf '%s\n' \
+        $'gpt\tGPT - 128 partitions, a backup copy, and room for GRUB on BIOS' \
+        $'dos\tMBR - four primary partitions, for anything that cannot read GPT') || return 0
+    local label="${DIALOG_RESULT}"
+
+    local -a lines=()
+    if ((P_COUNT > 0)); then
+        lines+=("${target} has ${P_COUNT} partitions on it. An empty $(label_name "${label}") table")
+        lines+=('describes none of them, so everything on the disk becomes unreachable:')
+        lines+=('')
+        local i
+        for ((i = 0; i < P_COUNT; i++)); do
+            lines+=("    $(pad "$(part_device "${P_NUMBER[i]}")" 18)$(pad "$(format_sectors "${P_SIZE[i]}")" 12)$(pad "$(partition_type_label "${i}")" 14)${P_FSTYPE[i]}${P_MOUNT[i]:+, mounted on ${P_MOUNT[i]}}")
+        done
+        lines+=('')
+    else
+        lines+=("${target} has no partition table now; this writes an empty $(label_name "${label}") one.")
+        lines+=('')
+    fi
+    lines+=('This is written immediately.')
+
+    dialog_confirm "Write an empty $(label_name "${label}") partition table" "${lines[@]}" || return 0
+
+    plan_reset
+    LABEL="${label}"
+    LABEL_ID=''
+    PLAN_DIRTY=1
+
+    tui_suspend
+    printf '\n'
+    plan_apply
+    tty_pause
+    tui_resume
+    return 0
+}
+
+# The predefined layouts, shown as what the disk will look like rather than as
+# a sentence about it. This is the one operation that both replaces the table
+# and fills it, and the two are easy to confuse with each other and with the
+# "new table" above, so it says which it is by drawing both sides.
+screen_scheme() {
+    local target="$1"
+
+    plan_load "${target}"
+    firmware_probe
+    local recommended
+    recommended="$(firmware_recommended_label)"
+    local gpt_label='GPT - 1 MiB BIOS boot, an EFI System Partition, ext4 for the rest'
+    local dos_label='MBR - an EFI System Partition, ext4 for the rest'
+    if [[ "${recommended}" == gpt ]]; then
+        gpt_label+='  [recommended]'
+    else
+        dos_label+='  [recommended]'
+    fi
+
+    dialog_menu "Lay out ${target} for Sowa - this machine $(firmware_summary)" \
+        < <(printf '%s\n' "gpt"$'\t'"${gpt_label}" "dos"$'\t'"${dos_label}") || return 0
+    local label="${DIALOG_RESULT}"
+
+    dialog_text 'How big should the EFI System Partition be?' \
+        'At least 34 MiB. 512MiB is the default and leaves room for several kernels.' \
+        "${SCHEME_ESP_DEFAULT}" || return 0
+    local esp="${DIALOG_RESULT}"
+
+    local esp_sectors
+    if ! esp_sectors="$(scheme_check "${label}" "${esp}")"; then
+        dialog_message 'That layout does not fit' "${esp_sectors}"
+        return 0
+    fi
+
+    # What is there now, recorded before the plan is replaced by what will be.
+    local -a before=()
+    local i
+    for ((i = 0; i < P_COUNT; i++)); do
+        before+=("    $(pad "$(part_device "${P_NUMBER[i]}")" 18)$(pad "$(format_sectors "${P_SIZE[i]}")" 12)$(pad "$(partition_type_label "${i}")" 14)${P_FSTYPE[i]:-empty}${P_MOUNT[i]:+, mounted on ${P_MOUNT[i]}}")
+    done
+
+    scheme_plan "${label}" "${esp_sectors}"
+    map_bar -1
+
+    local -a lines=()
+    if ((${#before[@]} > 0)); then
+        lines+=("${C_BOLD}This replaces the whole partition table on ${target}.${C_RESET}")
+        lines+=("These ${#before[@]} partitions and everything in them are destroyed:")
+        lines+=('')
+        lines+=("${before[@]}")
+        lines+=('')
+        lines+=('and the disk becomes:')
+    else
+        lines+=("${target} has nothing on it now, and becomes:")
+    fi
+    lines+=('')
+    lines+=("  ${MAP_BAR}")
+    lines+=('')
+    for ((i = 0; i < P_COUNT; i++)); do
+        local note
+        case "${P_KIND[i]}" in
+            biosboot) note='left empty, for GRUB on BIOS firmware' ;;
+            efi)      note='FAT32, made now; where the UEFI bootloader goes' ;;
+            *)        note='made now; the root of the installed system' ;;
+        esac
+        lines+=("    $(pad "$(part_device "${P_NUMBER[i]}")" 18)$(pad "$(format_sectors "${P_SIZE[i]}")" 12)$(pad "$(kind_label "${P_KIND[i]}")" 14)${note}")
+    done
+    lines+=('')
+    lines+=('All of this happens immediately.')
+
+    if ! dialog_confirm "Lay out ${target} for Sowa" "${lines[@]}"; then
+        plan_load "${target}"
+        return 0
+    fi
+    if [[ "${label}" != "${recommended}" ]]; then
+        local -a advice=()
+        mapfile -t advice < <(firmware_advice)
+        if ! dialog_confirm 'That is not the layout this machine wants' "${advice[@]}"; then
+            plan_load "${target}"
+            return 0
+        fi
+    fi
+
+    tui_suspend
+    printf '\n'
+    plan_apply
+    tty_pause
+    tui_resume
+    return 0
+}
+
+screen_disks() {
+    local -a targets=()
+    local cursor=0 key
+
+    while :; do
+        mapfile -t targets < <(list_targets)
+        term_size
+        frame_reset
+        firmware_probe
+        local secure_colour="${C_DIM}"
+        [[ "${SECURE_BOOT}" == on ]] && secure_colour="${C_YELLOW}"
+        frame_line "${C_BOLD}${PROGRAM}${C_RESET}   ${C_DIM}what can be partitioned on this machine${C_RESET}"
+        frame_line "${secure_colour}$(firmware_summary) - recommended layout: $(firmware_recommended_label)${C_RESET}"
+        frame_line ''
+
+        if ((${#targets[@]} == 0)); then
+            frame_line '  Nothing found to partition.'
+            frame_line ''
+            frame_line "${C_DIM}  r to look again, q to quit${C_RESET}"
+            frame_flush
+            key="$(read_key)" || return 0
+            case "${key}" in
+                q|ESC|CTRL-C) return 0 ;;
+            esac
+            continue
+        fi
+
+        ((cursor >= ${#targets[@]})) && cursor=$(( ${#targets[@]} - 1 ))
+        local model_width=$(( COLS - 58 ))
+        ((model_width > 0)) || model_width=1
+        frame_line "${C_BOLD}$(pad '  TARGET' 24)$(pad 'SIZE' 12)$(pad 'KIND' 8)$(pad 'TABLE' 7)$(pad 'PARTS' 7)$(pad 'MODEL' "${model_width}")${C_RESET}"
+
+        local i kind target bytes table parts line
+        for ((i = 0; i < ${#targets[@]}; i++)); do
+            IFS=$'\t' read -r kind target <<< "${targets[i]}"
+            bytes="$(device_bytes "${target}")"
+            table="$(device_table "${target}")"
+            parts="$(target_partition_count "${target}")"
+            local model=''
+            [[ "${kind}" == image ]] || model="$(device_model "${target}")"
+            line="$(pad "  ${target}" 24)$(pad "$(format_size "${bytes}")" 12)$(pad "${kind}" 8)$(pad "${table}" 7)$(pad "${parts}" 7)$(pad "${model}" "${model_width}")"
+            if ((i == cursor)); then
+                frame_line "${C_REV}${line}${C_RESET}"
+            else
+                frame_line "${line}"
+            fi
+        done
+
+        # What is inside the highlighted one, so the list is worth reading
+        # before anything is opened.
+        IFS=$'\t' read -r kind target <<< "${targets[cursor]}"
+        frame_line ''
+        frame_line "${C_DIM}  inside ${target}:${C_RESET}"
+        local shown=0 name size kind_inner fstype mount
+        while IFS=$'\t' read -r name size kind_inner fstype mount; do
+            [[ -n "${name}" ]] || continue
+            frame_line "    $(pad "${name}" 18)$(pad "$(format_size "${size}")" 12)$(pad "${kind_inner}" 8)$(pad "${fstype:-unknown}" 14)${mount}"
+            shown=$(( shown + 1 ))
+            ((shown >= ROWS - ${#targets[@]} - 12)) && break
+        done < <(target_children "${target}")
+        ((shown == 0)) && frame_line "    ${C_DIM}nothing${C_RESET}"
+
+        frame_line ''
+        frame_line "${C_DIM}  Enter open and edit its partitions   s Sowa layout   l new empty table${C_RESET}"
+        frame_line "${C_DIM}  f firmware   R build RAID   V manage LVM   r rescan   q quit${C_RESET}"
+        frame_flush
+
+        key="$(read_key)" || return 0
+        IFS=$'\t' read -r kind target <<< "${targets[cursor]}"
+        case "${key}" in
+            UP|SUP)     ((cursor > 0)) && cursor=$(( cursor - 1 )) ;;
+            DOWN|SDOWN) ((cursor < ${#targets[@]} - 1)) && cursor=$(( cursor + 1 )) ;;
+            HOME)       cursor=0 ;;
+            END)        cursor=$(( ${#targets[@]} - 1 )) ;;
+            ENTER)      screen_disk "${target}" || return 0 ;;
+            s)          screen_scheme "${target}" ;;
+            l)          screen_new_table "${target}" ;;
+            r)          : ;;
+            f)          action_firmware ;;
+            R)          screen_build_raid ;;
+            V)          screen_lvm ;;
+            q|ESC|CTRL-C) return 0 ;;
+        esac
+    done
+}
+
+# With a target, the full-screen program opens straight onto it and the disk
+# list is skipped; that is what "raw" wants, and there is nothing else on the
+# machine a raw image belongs beside.
+cmd_tui() {
+    local target="${1:-}"
+    [[ -t 0 && -t 1 ]] || die "there is no terminal to draw on; use a subcommand instead (try '${PROGRAM} help')"
+    require_tools lsblk "${TABLE_TOOLS[@]}"
+    term_setup
+    term_size
+    tty_open
+    trap tui_cleanup EXIT
+    tui_enter
+    TARGET_ONLY="${target}"
+    screen_disks || true
+    tui_leave
+    tty_close
+    # Back to the program's own handler, not to none: an image may still be
+    # attached to a loop device at this point.
+    trap exit_cleanup EXIT
+}
+
+cmd_raw() {
+    local file="${1:-}"
+    [[ -n "${file}" ]] || die "usage: ${PROGRAM} raw <file>"
+    if [[ ! -e "${file}" ]]; then
+        die "no such file: ${file} (make one first, for example: fallocate -l 1G ${file})"
+    fi
+    [[ -f "${file}" ]] || die "${file} is not a regular file; name it without 'raw' to treat it as a device"
+    [[ -w "${file}" ]] || warn "${file} is not writable; nothing can be applied to it"
+    require_whole_disk "${file}"
+    cmd_tui "${file}"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+cmd_list() {
+    local disk bytes table parts
+    printf '%-18s %12s  %-6s %5s  %s\n' DEVICE SIZE TABLE PARTS MODEL
+    while IFS= read -r disk; do
+        bytes="$(device_bytes "${disk}")"
+        table="$(device_table "${disk}")"
+        parts="$(target_partition_count "${disk}")"
+        printf '%-18s %12s  %-6s %5s  %s\n' \
+            "${disk}" "$(format_size "${bytes}")" "${table}" "${parts}" "$(device_model "${disk}")"
+        local line kname size fstype mount
+        while IFS= read -r line; do
+            [[ "$(kv "${line}" TYPE)" == part ]] || continue
+            kname="$(kv "${line}" KNAME)"
+            size="$(kv "${line}" SIZE)"
+            fstype="$(kv "${line}" FSTYPE)"
+            mount="$(kv "${line}" MOUNTPOINT)"
+            printf '  %-16s %12s  %-6s %5s  %s\n' \
+                "/dev/${kname}" "$(format_size "${size}")" "${fstype:--}" '' "${mount}"
+        done < <(lsblk -b -n -P -o KNAME,TYPE,FSTYPE,MOUNTPOINT,SIZE "${disk}" 2> /dev/null)
+    done < <(list_disk_names)
+}
+
+cmd_show() {
+    local disk="${1:-}"
+    [[ -n "${disk}" ]] || die "usage: ${PROGRAM} show <disk>"
+    require_whole_disk "${disk}"
+    plan_load "${disk}"
+
+    printf '%s  %s  %s\n' "${disk}" "$(format_size "${DISK_BYTES}")" "$(device_model "${disk}")"
+    printf 'partition table: %s\n' "$(label_name)"
+    [[ -n "${LABEL_ID}" ]] && printf 'table id: %s\n' "${LABEL_ID}"
+    printf 'sector size: %s bytes, %s sectors\n\n' "${SECTOR}" "${DISK_SECTORS}"
+
+    printf '%-18s %12s %12s %12s  %-14s %s\n' PARTITION START SECTORS SIZE TYPE CONTENTS
+    local -a rows
+    mapfile -t rows < <(view_rows)
+    local row type index start size
+    for row in "${rows[@]}"; do
+        [[ -n "${row}" ]] || continue
+        IFS=: read -r type index start size <<< "${row}"
+        if [[ "${type}" == p ]]; then
+            printf '%-18s %12s %12s %12s  %-14s %s\n' \
+                "$(part_device "${P_NUMBER[index]}")" "${start}" "${size}" \
+                "$(format_sectors "${size}")" "$(partition_type_label "${index}")" \
+                "${P_FSTYPE[index]:-}${P_MOUNT[index]:+ (mounted on ${P_MOUNT[index]})}"
+        else
+            printf '%-18s %12s %12s %12s  %-14s\n' \
+                '-' "${start}" "${size}" "$(format_sectors "${size}")" 'free space'
+        fi
+    done
+}
+
+confirm_or_die() {
+    local prompt="$1"
+    ((ASSUME_YES)) && return 0
+    ((DRY_RUN)) && return 0
+    [[ -t 0 ]] || die "${prompt} - refusing to do this without a terminal; pass --yes"
+    printf '%s\n' "${prompt}"
+    printf 'Type "yes" to continue: '
+    local answer
+    read -r answer
+    [[ "${answer}" == yes ]] || die "stopped at your request"
+}
+
+cmd_label() {
+    local disk="${1:-}" label="${2:-}"
+    [[ -n "${disk}" && -n "${label}" ]] || die "usage: ${PROGRAM} label <disk> gpt|dos"
+    require_whole_disk "${disk}"
+    [[ "${label}" == mbr ]] && label=dos
+    [[ "${label}" == gpt || "${label}" == dos ]] || die "a partition table is gpt or dos"
+
+    plan_load "${disk}"
+    confirm_or_die "This writes an empty $(label_name "${label}") partition table to ${disk}, and everything the ${P_COUNT} partitions on it describe becomes unreachable."
+    plan_reset
+    LABEL="${label}"
+    LABEL_ID=''
+    PLAN_DIRTY=1
+    plan_apply
+}
+
+cmd_scheme() {
+    local disk="${1:-}" label="${2:-}"
+    shift 2 2> /dev/null || true
+    local esp="${SCHEME_ESP_DEFAULT}"
+    local argument
+    for argument in "$@"; do
+        case "${argument}" in
+            --esp-size=*) esp="${argument#*=}" ;;
+            *) die "unknown option for scheme: ${argument}" ;;
+        esac
+    done
+    [[ -n "${disk}" && -n "${label}" ]] || die "usage: ${PROGRAM} scheme <disk> gpt|dos [--esp-size=512MiB]"
+    require_whole_disk "${disk}"
+    [[ "${label}" == mbr ]] && label=dos
+    [[ "${label}" == gpt || "${label}" == dos ]] || die "a partition table is gpt or dos"
+
+    firmware_probe
+    local recommended
+    recommended="$(firmware_recommended_label)"
+    if [[ "${label}" != "${recommended}" ]]; then
+        warn "this machine $(firmware_summary), where ${recommended} is the better layout"
+        firmware_advice | sed 's/^/    /' >&2
+    fi
+    [[ "${SECURE_BOOT}" == on ]] \
+        && warn "Secure Boot is enabled and Sowa's GRUB is unsigned; this disk will not boot until it is turned off"
+
+    plan_load "${disk}"
+    local esp_sectors
+    esp_sectors="$(scheme_check "${label}" "${esp}")" || die "${esp_sectors}"
+    scheme_plan "${label}" "${esp_sectors}"
+    printf 'This would do the following:\n'
+    plan_changes | sed 's/^/  /'
+    confirm_or_die "Everything on ${disk} becomes unreachable."
+    plan_apply
+}
+
+cmd_create() {
+    local disk="${1:-}" kind="${2:-}" size="${3:-}"
+    [[ -n "${disk}" && -n "${kind}" && -n "${size}" ]] \
+        || die "usage: ${PROGRAM} create <disk> <${KINDS[*]// /|}> <size|percent>"
+    require_whole_disk "${disk}"
+
+    plan_load "${disk}"
+    [[ "${LABEL}" == none ]] && die "${disk} has no partition table; run '${PROGRAM} label ${disk} gpt' first"
+    kind_supported "${kind}" "${LABEL}" || die "$(label_name) tables cannot hold a $(kind_label "${kind}")"
+
+    local gap start available
+    gap="$(plan_largest_gap)" || die "there is no free space on ${disk}"
+    IFS=: read -r start available <<< "${gap}"
+
+    local bytes sectors
+    bytes="$(parse_size "${size}" $(( available * SECTOR )))" || die "could not read a size from ${size}"
+    sectors=$(align_down $(( bytes / SECTOR )))
+    local minimum
+    minimum=$(align_up $(( $(kind_min_bytes "${kind}") / SECTOR )))
+    ((sectors >= minimum)) || die "$(kind_label "${kind}") must be at least $(format_size "$(kind_min_bytes "${kind}")")"
+    ((sectors <= available)) || die "the largest free region on ${disk} is $(format_sectors "${available}")"
+
+    plan_add "${start}" "${sectors}" "${kind}" "$(kind_label "${kind}")"
+    printf 'This would do the following:\n'
+    plan_changes | sed 's/^/  /'
+    confirm_or_die "The partition table on ${disk} will be rewritten."
+    plan_apply
+}
+
+cmd_delete() {
+    local disk="${1:-}" number="${2:-}"
+    [[ -n "${disk}" && -n "${number}" ]] || die "usage: ${PROGRAM} delete <disk> <number>"
+    require_whole_disk "${disk}"
+    [[ "${number}" =~ ^[0-9]+$ ]] || die "a partition number is a number"
+
+    plan_load "${disk}"
+    local index
+    index="$(plan_index_of "${number}")" || die "${disk} has no partition ${number}"
+    [[ -z "${P_MOUNT[index]}" ]] || die "$(part_device "${number}") is mounted on ${P_MOUNT[index]}"
+
+    printf 'This would remove %s, a %s %s containing %s.\n' \
+        "$(part_device "${number}")" "$(format_sectors "${P_SIZE[index]}")" \
+        "$(kind_label "${P_KIND[index]}")" "${P_FSTYPE[index]:-something unrecognised}"
+    plan_delete "${index}"
+    confirm_or_die "The partition table on ${disk} will be rewritten and what follows will be renumbered."
+    plan_apply
+}
+
+cmd_wipe() {
+    local disk="${1:-}"
+    shift 2> /dev/null || true
+    local mode=signatures argument='' number=''
+    local option
+    for option in "$@"; do
+        case "${option}" in
+            --mode=*) mode="${option#*=}" ;;
+            --size=*) argument="${option#*=}"; mode=size ;;
+            --partition=*) number="${option#*=}"; mode=partition ;;
+            *) die "unknown option for wipe: ${option}" ;;
+        esac
+    done
+    [[ -n "${disk}" ]] || die "usage: ${PROGRAM} wipe <disk> [--mode=signatures|full] [--size=10G] [--partition=N]"
+    require_whole_disk "${disk}"
+
+    plan_load "${disk}"
+    local target=''
+    if [[ "${mode}" == partition ]]; then
+        [[ "${number}" =~ ^[0-9]+$ ]] || die "--partition takes a partition number"
+        argument="$(plan_index_of "${number}")" || die "${disk} has no partition ${number}"
+        target="$(part_device "${number}")"
+    fi
+
+    # wipe_run refuses this too, so nothing can write over a mounted filesystem
+    # whichever way it is reached; asking here as well is what keeps the
+    # refusal in front of the confirmation rather than behind it.
+    local -a holders=()
+    mapfile -t holders < <(device_holders "${disk}" "${target}")
+    if ((${#holders[@]} > 0)) && ((!DRY_RUN)); then
+        printf '%s\n' "${holders[@]}" >&2
+        die "${target:-${disk}} is in use; unmount it and stop any array or volume group on it first"
+    fi
+
+    local description
+    case "${mode}" in
+        signatures) description="the partition table areas and the first and last $(format_size "${SIGNATURE_BYTES}") of each of the ${P_COUNT} partitions" ;;
+        full)       description="all $(format_size "${DISK_BYTES}")" ;;
+        size)       description="the first ${argument}" ;;
+        partition)  description="all of $(part_device "${number}")" ;;
+        *)          die "wipe mode is signatures, full, size or partition" ;;
+    esac
+    confirm_or_die "This writes zeros over ${description} of ${disk}."
+    wipe_run "${mode}" "${argument}"
+}
+
+cmd_raid() {
+    local level=1 node='' record=0
+    local -a members=()
+    local option
+    for option in "$@"; do
+        case "${option}" in
+            --level=*) level="${option#*=}" ;;
+            --name=*|--node=*) node="${option#*=}" ;;
+            --record) record=1 ;;
+            -*) die "unknown option for raid: ${option}" ;;
+            *) members+=("${option}") ;;
+        esac
+    done
+    [[ -n "${node}" ]] || die "usage: ${PROGRAM} raid --level=1 --name=/dev/md0 <partition>..."
+    ((${#members[@]} > 0)) || die "name the partitions the array is built from"
+
+    confirm_or_die "This destroys everything on ${members[*]} and builds RAID ${level} on ${node}."
+    raid_create "${level}" "${node}" "${members[@]}"
+    ((record)) && raid_record "${node}"
+    return 0
+}
+
+cmd_lvm() {
+    local vg='' lv='' size='' filesystem=''
+    local -a devices=()
+    local option
+    for option in "$@"; do
+        case "${option}" in
+            --vg=*|--group=*) vg="${option#*=}" ;;
+            --lv=*|--volume=*) lv="${option#*=}" ;;
+            --size=*) size="${option#*=}" ;;
+            --filesystem=*|--fs=*) filesystem="${option#*=}" ;;
+            -*) die "unknown option for lvm: ${option}" ;;
+            *) devices+=("${option}") ;;
+        esac
+    done
+    [[ -n "${vg}" ]] || die "usage: ${PROGRAM} lvm --vg=<name> [--lv=<name> --size=20G [--fs=ext4]] <device>..."
+
+    if ((${#devices[@]} > 0)); then
+        confirm_or_die "This destroys everything on ${devices[*]} and builds the volume group ${vg} from them."
+        lvm_create_vg "${vg}" "${devices[@]}"
+    fi
+    if [[ -n "${lv}" ]]; then
+        [[ -n "${size}" ]] || die "--lv needs a --size (20G, or 100% of the free space)"
+        lvm_create_lv "${vg}" "${lv}" "${size}" "${filesystem}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+${PROGRAM} - look at the disks, lay out partitions, build RAID and LVM
+
+Usage:
+  ${PROGRAM}                              the full-screen partitioner
+  ${PROGRAM} list                         every disk, with its table and partitions
+  ${PROGRAM} show <disk>                  one disk in detail, including free space
+  ${PROGRAM} firmware                     how this machine booted, and which layout suits it
+  ${PROGRAM} raw <file>                   partition a raw image file instead of a disk
+  ${PROGRAM} label <disk> gpt|dos         write an empty partition table
+  ${PROGRAM} scheme <disk> gpt|dos        lay the disk out for Sowa
+  ${PROGRAM} create <disk> <kind> <size>  add a partition in the largest free region
+  ${PROGRAM} delete <disk> <number>       remove a partition from the table
+  ${PROGRAM} wipe <disk>                  write zeros over it
+  ${PROGRAM} raid --level=N --name=/dev/mdN <partition>...
+  ${PROGRAM} lvm --vg=<name> <device>...
+  ${PROGRAM} help
+
+Partition kinds:
+  ${KINDS[*]}
+
+Partitions keep the numbers they already have; a new one takes the lowest
+number nothing is using. An md array or a logical volume can be partitioned
+like any disk, and V manages volume groups and the volumes inside them.
+
+Sizes are read the way sfdisk reads them: 10G and 10GiB are 1024-based and
+10GB is 1000-based. A percentage is of whatever is being filled - the free
+region for a new partition, the disk for a wipe - so 100% is always "the rest".
+A number with no unit is refused.
+
+Options:
+  --yes           do not ask before writing
+  --dry-run       print what would be run and write nothing
+  --no-format     write the table but do not make any filesystems
+  --allow-loop    treat loop devices as disks, for testing
+  --sector-size=N the sector size a raw image is treated as having (512)
+
+A raw image is a regular file partitioned as though it were a disk. Every
+subcommand takes one wherever it takes a disk, and "raw" opens the full-screen
+program on it:
+
+  fallocate -l 1G fake_disk && ${PROGRAM} raw fake_disk
+
+Filesystems inside an image are made by attaching it to a loop device, which
+needs root; without that the partition table is still written and the
+filesystems are left to be made after a "losetup -P".
+
+Wipe options:
+  --mode=signatures   the table areas and the ends of every partition (default)
+  --mode=full         every byte of the disk
+  --size=10G          that much, or that percentage, from the start of the disk
+  --partition=N       all of one partition
+
+Predefined layouts, both of which sowa-setup can install onto:
+  gpt   1 MiB BIOS boot, 512 MiB EFI System, ext4 for the rest
+  dos   512 MiB EFI System, ext4 for the rest
+EOF
+}
+
+main() {
+    local -a operands=()
+    local argument
+
+    for argument in "$@"; do
+        case "${argument}" in
+            --yes|-y) ASSUME_YES=1 ;;
+            --dry-run|-n) DRY_RUN=1 ;;
+            --no-format) DO_FORMAT=0 ;;
+            --allow-loop) ALLOW_LOOP=1 ;;
+            --sector-size=*)
+                IMAGE_SECTOR="${argument#*=}"
+                case "${IMAGE_SECTOR}" in
+                    512|1024|2048|4096) ;;
+                    *) die "--sector-size is 512, 1024, 2048 or 4096" ;;
+                esac
+                ;;
+            --help|-h) usage; return 0 ;;
+            *) operands+=("${argument}") ;;
+        esac
+    done
+
+    local command="${operands[0]:-}"
+    ((${#operands[@]} > 0)) && operands=("${operands[@]:1}")
+
+    trap exit_cleanup EXIT
+
+    # Reading is allowed without being root; everything else is not, and
+    # finding out at the first write would be after a plan had been built.
+    case "${command}" in
+        # Reading is allowed without being root, and so is partitioning a file:
+        # the only thing a raw image needs permission for is the file itself,
+        # which the kernel already checks.
+        ''|list|show|firmware|help|raw) ;;
+        *) require_privilege "${operands[0]:-}" ;;
+    esac
+    require_tools lsblk
+
+    case "${command}" in
+        '')       cmd_tui ;;
+        raw)      require_tools "${TABLE_TOOLS[@]}"; cmd_raw "${operands[@]}" ;;
+        list)     cmd_list ;;
+        show)     cmd_show "${operands[@]}" ;;
+        firmware) cmd_firmware ;;
+        label)    require_tools "${TABLE_TOOLS[@]}"; cmd_label "${operands[@]}" ;;
+        scheme)   require_tools "${TABLE_TOOLS[@]}"; cmd_scheme "${operands[@]}" ;;
+        create)   require_tools "${TABLE_TOOLS[@]}"; cmd_create "${operands[@]}" ;;
+        delete)   require_tools "${TABLE_TOOLS[@]}"; cmd_delete "${operands[@]}" ;;
+        wipe)     require_tools dd sort blockdev; cmd_wipe "${operands[@]}" ;;
+        raid)     require_tools mdadm; cmd_raid "${operands[@]}" ;;
+        lvm)      require_tools pvcreate vgcreate lvcreate; cmd_lvm "${operands[@]}" ;;
+        help)     usage ;;
+        *)        die "unknown command: ${command} (try '${PROGRAM} help')" ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

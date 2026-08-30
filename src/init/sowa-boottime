@@ -1,0 +1,310 @@
+#!/bin/bash
+#
+# sowa-boottime - what the boot and the shutdown spent their time on.
+#
+# Every init script announces what it is about to do with begin() and reports
+# how it went with ok(), failed() or skipped(); those helpers time the gap and
+# file one line per action. /etc/rc.d/rc does the same for a runlevel pass as a
+# whole, and /etc/rc.d/rc.sysinit for the mounting that happens before any
+# runlevel. See /etc/rc.d/init.d/functions.
+#
+# Each line is:
+#
+#   <boot> <at> <took> <outcome> <service> <label...>
+#
+# <boot> is the first field of the kernel's per-boot UUID, so the records of one
+# boot can be told from the next. <at> is when the action started, in seconds
+# since the kernel started, and <took> is how long it ran; both come from
+# /proc/uptime, which is monotonic, so a clock chronyd steps in the middle of a
+# boot cannot turn a service into one that took less than no time.
+#
+# There are two files. /run/sowa/timing is this boot, on the tmpfs, and goes away
+# with it. /var/log/service-timing.log is every boot that has left a record on
+# this machine, which is what makes "the boot got slower" a question with an
+# answer. This program reads the first by default and the second when asked for
+# anything that outlives the boot it is running in - a shutdown among them, since
+# the records of one are written seconds before the machine stops existing.
+
+set -Eeuo pipefail
+
+readonly PROGRAM=sowa-boottime
+readonly RUN_FILE=/run/sowa/timing
+readonly LOG_FILE=/var/log/service-timing.log
+
+usage() {
+    cat <<'EOF'
+usage: sowa-boottime [options]
+
+With no options, the timeline of the boot that is running.
+
+options:
+  -a, --all              every boot in the history, oldest first
+  -b, --boot <id>        one boot, named by the id sowa-boottime prints
+  -H, --history          one line per boot: when, how long, what failed
+  -s, --slowest [<n>]    the n slowest actions on record, default 10
+  -f, --file <path>      read this file instead
+  -h, --help             this
+
+exit status:
+  0  the records were read
+  1  there are none to read, and why is on standard error
+EOF
+}
+
+die() {
+    printf '%s: %s\n' "${PROGRAM}" "$*" >&2
+    exit 1
+}
+
+# The file a mode reads. This boot's records are in both files; only the log has
+# the ones from boots that have ended, so anything looking across boots has to
+# read it and anything looking at this one may as well read the shorter file.
+source_file() {
+    local want="$1"
+
+    [[ -n "${FILE}" ]] && { printf '%s\n' "${FILE}"; return 0; }
+    if [[ "${want}" == history ]]; then
+        printf '%s\n' "${LOG_FILE}"
+    else
+        printf '%s\n' "${RUN_FILE}"
+    fi
+}
+
+# This boot, as the records spell it. Answering from /proc rather than from the
+# file means "sowa-boottime" on a system whose log has many boots in it still
+# shows the one it is running in.
+current_boot() {
+    local boot_id
+
+    read -r boot_id < /proc/sys/kernel/random/boot_id 2>/dev/null || return 1
+    printf '%s\n' "${boot_id%%-*}"
+}
+
+# A table of actions, with the runlevel and rc.sysinit lines - the ones that
+# cover other lines rather than sitting beside them - pulled out as totals.
+#
+# awk rather than a read loop: this is the one place that formats a column and
+# sums a fixed-point field, and doing that a line at a time in bash would be a
+# fork per line to get the arithmetic right.
+print_timeline() {
+    local file="$1" boot="$2"
+
+    awk -v want="${boot}" '
+        # <at> and <took> are seconds with two decimals. They are read as
+        # hundredths so the sums stay exact: awk would be doing binary floating
+        # point on a decimal fraction otherwise, and 0.07 + 0.05 would not be
+        # 0.12.
+        function cs(text) {
+            split(text, part, ".")
+            return part[1] * 100 + part[2] + 0
+        }
+        function seconds(hundredths) {
+            return sprintf("%d.%02d", hundredths / 100, hundredths % 100)
+        }
+        $1 != want { next }
+        {
+            label = ""
+            for (i = 6; i <= NF; i++)
+                label = label (i > 6 ? " " : "") $i
+            # A runlevel pass and rc.sysinit are spans that contain other spans;
+            # adding them to the same total would count their contents twice.
+            if ($5 == "rc") {
+                passes[++passcount] = sprintf("%s %s %s", $2, $3, label)
+                next
+            }
+            rows[++count] = sprintf("  %8s  %8s  %-7s %-12s %s",
+                seconds(cs($2)), seconds(cs($3)), $4, $5, label)
+            total += cs($3)
+            if ($4 == "failed")
+                failures[++failed] = sprintf("%s %s", $5, label)
+            last = cs($2) + cs($3)
+        }
+        END {
+            if (count == 0 && passcount == 0) {
+                print "no records for this boot" > "/dev/stderr"
+                exit 1
+            }
+            printf "  %8s  %8s  %-7s %-12s %s\n", "at", "took", "how", "service", "what"
+            for (i = 1; i <= count; i++)
+                print rows[i]
+            print ""
+            printf "  %d actions, %ss of them spent working", count, seconds(total)
+            if (last)
+                printf ", last one done at %ss\n", seconds(last)
+            else
+                printf "\n"
+            for (i = 1; i <= passcount; i++) {
+                split(passes[i], field, " ")
+                label = passes[i]
+                sub(/^[^ ]+ [^ ]+ /, "", label)
+                printf "  %s took %ss, starting at %ss\n",
+                    label, seconds(cs(field[2])), seconds(cs(field[1]))
+            }
+            if (failed) {
+                print ""
+                printf "  %d failed:\n", failed
+                for (i = 1; i <= failed; i++)
+                    print "    " failures[i]
+            }
+        }
+    ' "${file}"
+}
+
+# One line per boot: what its runlevel passes cost coming up and going down, and
+# whether anything in it said [FAILED]. This is the view for "the boot got
+# slower" - two numbers per boot, comparable down the column.
+#
+# The first runlevel pass of a boot is the one that started it and the last is
+# the one that stopped it, so a boot still running has only the first. The order
+# is the order the boots appear in the log, which is the order they happened.
+print_history() {
+    local file="$1"
+
+    awk '
+        function cs(text) {
+            split(text, part, ".")
+            return part[1] * 100 + part[2] + 0
+        }
+        function seconds(hundredths) {
+            return sprintf("%d.%02d", hundredths / 100, hundredths % 100)
+        }
+        {
+            if (!($1 in seen)) {
+                seen[$1] = 1
+                order[++boots] = $1
+            }
+            if ($5 == "rc") {
+                passes[$1]++
+                if (passes[$1] == 1) {
+                    startup[$1] = cs($3)
+                    entered[$1] = $6 " " $7
+                } else {
+                    shutdown[$1] = cs($3)
+                }
+                next
+            }
+            actions[$1]++
+            if ($4 == "failed")
+                bad[$1]++
+        }
+        END {
+            if (boots == 0) {
+                print "no records" > "/dev/stderr"
+                exit 1
+            }
+            printf "  %-10s %8s %9s %9s %s\n",
+                "boot", "actions", "startup", "shutdown", "failed"
+            for (i = 1; i <= boots; i++) {
+                id = order[i]
+                printf "  %-10s %8d %9s %9s %s\n",
+                    id, actions[id],
+                    (id in startup) ? seconds(startup[id]) "s" : "-",
+                    (id in shutdown) ? seconds(shutdown[id]) "s" : "-",
+                    (id in bad) ? bad[id] : "-"
+            }
+        }
+    ' "${file}"
+}
+
+# The slowest actions on record, whichever boot they belong to. What to look at
+# first when a boot has become slower and it is not obvious which part of it did.
+print_slowest() {
+    local file="$1" count="$2"
+
+    awk '
+        function cs(text) {
+            split(text, part, ".")
+            return part[1] * 100 + part[2] + 0
+        }
+        $5 == "rc" { next }
+        {
+            label = ""
+            for (i = 6; i <= NF; i++)
+                label = label (i > 6 ? " " : "") $i
+            printf "%d\t  %8s  %-7s %-10s %-12s %s\n",
+                cs($3), $3, $4, $1, $5, label
+        }
+    ' "${file}" | sort -rn -k1,1 | head -n "${count}" | cut -f2-
+}
+
+# Every boot in the log, oldest first, each as its own timeline.
+print_all() {
+    local file="$1" boot
+
+    while IFS= read -r boot; do
+        printf 'Boot %s\n\n' "${boot}"
+        print_timeline "${file}" "${boot}" || true
+        printf '\n'
+    done < <(awk '!seen[$1]++ { print $1 }' "${file}")
+}
+
+MODE=timeline
+BOOT=""
+FILE=""
+SLOWEST=10
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -a | --all) MODE=all; shift ;;
+        -H | --history) MODE=history; shift ;;
+        -b | --boot)
+            [[ $# -ge 2 ]] || die "--boot needs the id of a boot"
+            MODE=timeline; BOOT="$2"; shift 2
+            ;;
+        -s | --slowest)
+            MODE=slowest
+            shift
+            # The count is optional, so it is only taken if it looks like one.
+            if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+                SLOWEST="$1"
+                shift
+            fi
+            ;;
+        -f | --file)
+            [[ $# -ge 2 ]] || die "--file needs a path"
+            FILE="$2"; shift 2
+            ;;
+        -h | --help) usage; exit 0 ;;
+        *) die "unknown option $1 (try --help)" ;;
+    esac
+done
+
+case "${MODE}" in
+    timeline) file="$(source_file boot)" ;;
+    *) file="$(source_file history)" ;;
+esac
+
+# A named boot is only in the history, so that is where to look for it even
+# though the mode is the per-boot one.
+if [[ "${MODE}" == timeline && -n "${BOOT}" && -z "${FILE}" ]]; then
+    file="${LOG_FILE}"
+fi
+
+if [[ ! -r "${file}" ]]; then
+    die "no timing records in ${file}." \
+        "They are written by the init scripts as they run;" \
+        "a system that has not run one since it booted has none yet."
+fi
+[[ -s "${file}" ]] || die "${file} is empty"
+
+case "${MODE}" in
+    timeline)
+        if [[ -z "${BOOT}" ]]; then
+            BOOT="$(current_boot)" || die "cannot read this boot's id from /proc"
+        fi
+        # The kernel version and how long the machine has been up put the
+        # timeline in context: the same numbers mean something different on a
+        # boot that happened a week ago.
+        read -r kernel < /proc/sys/kernel/osrelease 2>/dev/null || kernel="?"
+        read -r up _ < /proc/uptime 2>/dev/null || up="?"
+        printf 'Boot %s, kernel %s, up %ss\n\n' "${BOOT}" "${kernel}" "${up%.*}"
+        print_timeline "${file}" "${BOOT}"
+        ;;
+    all) print_all "${file}" ;;
+    history) print_history "${file}" ;;
+    slowest)
+        printf 'The %d slowest actions in %s\n\n' "${SLOWEST}" "${file}"
+        printf '  %8s  %-7s %-10s %-12s %s\n' took how boot service what
+        print_slowest "${file}" "${SLOWEST}"
+        ;;
+esac

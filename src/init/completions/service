@@ -1,0 +1,85 @@
+# bash completion for service(8)                           -*- shell-script -*-
+# shellcheck shell=bash
+#
+# Three positions, each answered from the machine rather than from a list kept
+# here: the services are the executable files in /etc/rc.d/init.d, the actions
+# are the ones the chosen script says it takes, and the arguments after that
+# are whatever that particular service names - a tunnel, an interface.
+#
+# The actions come from the script's own usage line, which every Sowa init
+# script ends with:
+#
+#     printf 'usage: %s {start|stop|restart|reload|status}\n' "$0" >&2
+#
+# Reading it there is what keeps this file from claiming a service takes
+# "reload" when it does not, and from missing an action a script grows later.
+# A script that does not print such a line falls back to the four every Sowa
+# service has.
+
+_sowa_comp_initd_scripts()
+{
+    local script
+    for script in /etc/rc.d/init.d/*; do
+        [[ -x ${script} && ! -d ${script} ]] || continue
+        [[ ${script##*/} == functions ]] && continue
+        printf '%s\n' "${script##*/}"
+    done
+}
+
+# The actions named between braces on the script's usage line.
+_sowa_comp_initd_actions()
+{
+    local script=/etc/rc.d/init.d/$1 line actions=""
+
+    if [[ -r ${script} ]]; then
+        while IFS= read -r line; do
+            [[ ${line} == *usage:*\{*\}* ]] || continue
+            line=${line#*\{}
+            actions=${line%%\}*}
+            break
+        done < "${script}"
+    fi
+    printf '%s\n' "${actions//|/ }"
+}
+
+# What a service takes after the action. Only the two VPN services take
+# anything: each manages one tunnel per configuration file and can be told to
+# act on one of them alone.
+_sowa_comp_service_operands()
+{
+    local directory config
+
+    case $1 in
+        openvpn) directory=/etc/openvpn ;;
+        wg-quick) directory=/etc/wireguard ;;
+        *) return 0 ;;
+    esac
+    for config in "${directory}"/*.conf; do
+        [[ -f ${config} ]] || continue
+        config=${config##*/}
+        printf '%s\n' "${config%.conf}"
+    done
+}
+
+_sowa_comp_service()
+{
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    local words=""
+
+    case ${COMP_CWORD} in
+        1)
+            words="--list --status-all $(_sowa_comp_initd_scripts)"
+            ;;
+        2)
+            words="$(_sowa_comp_initd_actions "${COMP_WORDS[1]}")"
+            [[ -n ${words} ]] || words="start stop restart status"
+            ;;
+        *)
+            words="$(_sowa_comp_service_operands "${COMP_WORDS[1]}")"
+            ;;
+    esac
+
+    mapfile -t COMPREPLY < <(compgen -W "${words}" -- "${current}")
+}
+
+complete -F _sowa_comp_service service

@@ -1,0 +1,150 @@
+.Dd August 17, 2026
+.Dt SERVICE 8
+.Os Sowa
+.Sh NAME
+.Nm service
+.Nd run an init script the way boot runs it
+.Sh SYNOPSIS
+.Nm
+.Ar name
+.Ar action
+.Op Ar argument ...
+.Nm
+.Fl -status-all
+.Nm
+.Fl -list
+.Sh DESCRIPTION
+.Nm
+runs
+.Pa /etc/rc.d/init.d/ Ns Ar name
+with
+.Ar action ,
+and the point of the command is the environment.
+A service started by hand gets the one it would get at boot rather than
+whatever the shell it was typed into happens to be carrying: an inherited
+.Ev LD_PRELOAD ,
+a
+.Ev PATH
+with
+.Pa /usr/local/bin
+at the front, or a variable set for an unrelated reason are all things a daemon
+would then keep for as long as it runs, and the machine would behave one way
+after a manual restart and another way after a reboot.
+.Pp
+The environment a script is given is:
+.Bd -literal -offset indent
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+HOME=/
+PWD=/
+TERM=$TERM   (or "linux")
+LANG=$LANG   (or "C")
+.Ed
+.Pp
+.Ev TERM
+and
+.Ev LANG
+are carried across so the output is readable.
+Everything else is dropped.
+.Pp
+The working directory is part of this, and
+.Nm
+changes to
+.Pa /
+before running the script, because that is what a service inherits at boot:
+.Xr init 8
+never changes directory, so
+.Pa /
+is the working directory of process 1 and of everything it starts.
+A service left in the directory it was started from is one whose daemon holds
+that directory open for as long as it runs, which is a filesystem that cannot
+then be unmounted.
+.Pp
+Any
+.Ar argument
+after the action is passed to the script.
+Most take none; the two VPN services take the name of one tunnel or interface,
+so that
+.Ic service openvpn restart office
+acts on that tunnel alone and leaves the others running.
+.Ss Actions
+The action is whatever the init script implements, and
+.Nm
+neither checks it nor knows what it means.
+Every Sowa init script has these:
+.Bl -tag -width restart -offset indent
+.It Cm start
+start the service, unless it is already running.
+.It Cm stop
+stop it.
+.It Cm restart
+stop it and start it again.
+.It Cm status
+say whether it is running, and exit 0 if it is.
+.El
+.Pp
+Some have more:
+.Cm reload
+where the daemon can be told to reread its configuration without being
+restarted.
+A script run with no action, or with one it does not implement, prints what it
+accepts and exits 2.
+.Sh OPTIONS
+.Bl -tag -width "--status-all"
+.It Fl -list
+Print the name of every init script in
+.Pa /etc/rc.d/init.d ,
+whether or not it starts at boot.
+.It Fl -status-all
+Run
+.Cm status
+on each of them, in that order.
+.El
+.Sh FILES
+.Bl -tag -width "/etc/rc.d/init.d" -compact
+.It Pa /etc/rc.d/init.d
+the init scripts.
+.It Pa /etc/rc.d/init.d/functions
+the shell library each one sources.
+.It Pa /run/lock/subsys
+one file per running service.
+This is how the runlevel driver knows a service is already up, so entering a
+runlevel twice does not start anything twice.
+.It Pa /var/log/ Ns Ar name Ns Pa .log
+where a service's output goes.
+Services are kept in the foreground under
+.Xr setsid 1
+and their standard output and standard error are appended to a file of their
+own.
+This is separate from what
+.Xr syslog-ng 8
+collects: that is what programs send to
+.Pa /dev/log ,
+while this is what a service says on its own descriptors, which is where the
+reason it would not start is.
+.El
+.Sh EXIT STATUS
+The exit status is the init script's.
+.Cm status
+exits 0 when the service is running.
+.Nm
+itself exits 1 when there is no such service and 2 when its own arguments make
+no sense.
+.Sh EXAMPLES
+.Bd -literal -offset indent
+service --status-all
+service sshd restart
+service openvpn start office
+service network status
+.Ed
+.Sh SEE ALSO
+.Xr inittab 5 ,
+.Xr chkconfig 8 ,
+.Xr init 8 ,
+.Xr runlevel 8
+.Sh CAVEATS
+.Nm
+does nothing about boot: a service started here is running now and will not be
+running after a reboot unless
+.Xr chkconfig 8
+has been told to start it.
+The two commands are deliberately separate.

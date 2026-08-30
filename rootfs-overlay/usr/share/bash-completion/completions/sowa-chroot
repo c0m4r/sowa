@@ -1,0 +1,34 @@
+# bash completion for sowa-chroot(8)                       -*- shell-script -*-
+# shellcheck shell=bash
+#
+# The first operand is the tree to enter, so directories. Everything after it is
+# a command to run inside that tree and its arguments - so commands, and then
+# ordinary filenames. The commands offered are this system's, which is a guess:
+# what the chroot has is what matters, and a directory that has not been entered
+# yet cannot be asked. For a Sowa tree, which is what this program requires,
+# the two are the same set often enough to be worth offering.
+
+_sowa_comp_sowa_chroot()
+{
+    local current="${COMP_WORDS[COMP_CWORD]}"
+
+    if [[ ${current} == -* && ${COMP_CWORD} -eq 1 ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "--help" -- "${current}")
+        return 0
+    fi
+    case ${COMP_CWORD} in
+        1)
+            compopt -o filenames
+            mapfile -t COMPREPLY < <(compgen -d -- "${current}")
+            ;;
+        2)
+            mapfile -t COMPREPLY < <(compgen -c -- "${current}")
+            ;;
+        *)
+            compopt -o filenames
+            mapfile -t COMPREPLY < <(compgen -f -- "${current}")
+            ;;
+    esac
+}
+
+complete -F _sowa_comp_sowa_chroot sowa-chroot

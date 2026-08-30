@@ -1,0 +1,44 @@
+Manual pages
+============
+
+Almost every package here installs its pages under /usr/share/man, and man
+reads them. It is mandoc, and so are apropos, whatis and makewhatis - one
+binary under four names.
+
+    man wg                      # any section
+    man 5 crontab               # a named one
+    man -w openvpn              # where the page is, without formatting it
+    mandoc ./some.1             # format a page by path rather than by name
+
+Sowa's own programs have pages too, which is what to read instead of this
+directory when you want the reference rather than the tour:
+
+    man sowa-pkg                and man sowa-pkg.conf for its configuration
+    man sowa-setup              man sowa-bootstrap, man sowa-chroot
+    man sowa-sshd-keygen        man resize, man serial-getty
+    man service                 man chkconfig
+    man init                    man 5 inittab
+    man shutdown                man telinit, man runlevel, man halt
+
+apropos and whatis search an index that is not shipped, because it would be
+wrong as soon as a package was installed. Build it, and rebuild it after
+installing packages:
+
+    makewhatis /usr/share/man
+    apropos tunnel
+    whatis wg
+
+"man name" needs no index - it walks the manual tree when the index cannot
+answer - so only the search commands are affected.
+
+Pages are paged through /usr/bin/less, which mandoc has compiled in. mandoc
+marks bold and underline by overstriking and GNU less resolves that back, so
+pages render with their formatting. $MANPAGER and $PAGER both come first if you
+prefer another pager.
+
+Output is UTF-8, which mandoc reaches by asking for the C.UTF-8 locale the
+image compiles. It falls back to ASCII if that locale is not there - if
+"locale -a" does not list C.utf8, "locale-gen" puts it back. See locale.txt.
+
+mdoc(7) and man(7) are the two languages a page can be written in, and both are
+documented here: "man mdoc" and "man man".
