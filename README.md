@@ -2,7 +2,7 @@
 
 [ISO](https://sowa.wolfet.pl/sowa-0.1-x86_64.iso) | 
 [RAW Image .xz](https://sowa.wolfet.pl/sowa-0.1-x86_64.img.xz) |
-[QCOW2 Image .xz](https://sowa.wolfet.pl/sowa-0.1-x86_64.img.xz) | 
+[QCOW2 Image .xz](https://sowa.wolfet.pl/sowa-0.1-x86_64.qcow2.xz) | 
 [Sowa Installer](https://sowa.wolfet.pl/sowa-install) & [rootfs.tar.xz](https://sowa.wolfet.pl/sowa-0.1-x86_64-rootfs.tar.xz)
 
 # Sowa Linux
