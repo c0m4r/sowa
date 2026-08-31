@@ -110,19 +110,30 @@ never a number that has to mean something.
 
 Every completed stage writes a stamp below `work/stamps`, in the directory its
 group names, and the stamp holds a key over everything the stage's result
-depends on: its own script, the shared build libraries and `config/build.conf`,
-the `config/sources.lock` rows it was observed to use, any patch or local source
-tree or configuration file it names, the package, licence, hook and message rows
-it consumes, allowlisted environment/build flags, recorded dependency stage
-keys, and — for everything outside `toolchain/` — the combined input and
-recorded-output identity of the cross toolchain. Metadata scope is deliberate: a
-component gets its own package, `image/10-rootfs` gets the complete catalogue,
-`image/11-initramfs` gets Linux's metadata, and the cross toolchain, host tools
-and payload-only artifacts get none. Thus a Docker packaging revision cannot
-become a compiler input and fan out into a full rebuild. A stage is skipped only
-when the key it would build under is the key recorded beside its result, so a
-bumped source, edited recipe, new patch, rebuilt library or rebuilt compiler
-reruns the affected closure without anybody deleting anything.
+depends on: its own script, the executable shared-library functions it calls,
+effective settings from `config/build.conf`, the `config/sources.lock` rows it
+was observed to use, any patch or local source tree or configuration file it
+names, the package, licence, hook and message rows it consumes, allowlisted
+environment/build flags, recorded dependency stage keys, and — for everything
+outside `toolchain/` — the combined input and recorded-output identity of the
+cross toolchain.
+
+Shared shell libraries are fingerprinted from Bash's parsed function
+definitions rather than their source bytes. Commands, strings and here-document
+payloads therefore count, while comments and formatting do not. The fingerprint
+is scoped too: `common.sh` applies to every stage, while `package.sh` and
+`license.sh` apply only to package and image stages that execute them. Package
+metadata has the same deliberate scope: a component gets its own package,
+`image/10-rootfs` gets the complete catalogue, `image/11-initramfs` gets Linux's
+metadata, and the cross toolchain, host tools and payload-only artifacts get
+none. Thus neither a Docker packaging revision nor an implementation edit to a
+package helper can become a compiler input and fan out through the toolchain. A
+stage is skipped only when the key it would build under equals the key recorded
+beside its result, so a bumped source, executable recipe change, new patch,
+rebuilt library or rebuilt compiler reruns the affected closure without anybody
+deleting anything. Changing from the older byte-oriented shared digest changes
+the key format once; existing build trees rebuild once rather than having their
+stamps rewritten without rebuilding.
 `make stage-key STAGE=packages/openssh` prints those inputs as text and says
 whether the stage is current, which is how to find out why something rebuilt.
 

@@ -6,11 +6,11 @@ source "$(dirname "$0")/lib/common.sh"
 
 # stage_key() is normally called through command substitution, so assignments
 # made inside it live only in that subshell. Seed what can be seeded now, in
-# this process, so every later key calculation inherits it: the shared digest
-# and the driver's own package-to-stage table. The toolchain digest is seeded
-# separately, in toolchain(), because it is only settled once the toolchain
-# stamps are.
-stage_shared_digest > /dev/null
+# this process, so every later key calculation inherits it: the shared library
+# digests and the driver's own package-to-stage table. The toolchain digest is
+# seeded separately, in toolchain(), because it is only settled once the
+# toolchain stamps are.
+preheat_stage_shared_digests
 load_stage_dispatch
 
 # Package helpers form a dependency graph, but they are ordinary shell

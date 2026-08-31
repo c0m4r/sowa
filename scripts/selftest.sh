@@ -355,6 +355,11 @@ rm -f "${PKG_MERGED_DIR}/.dirty"
 # distribution, which is why it is now scripts/lib/stage.sh and deliberately not
 # hashed: a stage key is a digest of the text stage_inputs prints, so what that
 # machinery does is already visible in the answer it gives.
+#
+# Shared libraries had the same byte-oriented problem. Their executable
+# function definitions are now fingerprinted instead, and package/licence code
+# is only attached to stages that execute it. This makes a comment inert and
+# keeps a packaging change out of the compiler bootstrap.
 
 checking "invalidation scope"
 printf '==> invalidation scope\n'
@@ -368,28 +373,95 @@ key_of() (
     STAGE_DISPATCH_LOADED=0
     STAGE_DISPATCH_PACKAGE=()
     STAGE_DISPATCH_STAGE=()
+    STAGE_COMMON_DIGEST=""
+    STAGE_PACKAGE_DIGEST=""
+    STAGE_LICENSE_DIGEST=""
     STAGE_TOOLCHAIN_DIGEST=""
     stage_key "$@"
 )
 
-# The widest input there is, so what it covers is worth stating rather than
-# assuming. These four are build code: a change in any of them really can change
-# every binary in the distribution. Nothing else belongs here, and this fails if
-# the driver or the stage machinery is ever put back.
+# The three implementation digests are kept separate so a stage receives only
+# the libraries it executes. Fixed probe values make the expected composition
+# explicit instead of merely repeating the implementation under test.
 # shellcheck disable=SC2329,SC2034
-shared_digest_covers_the_build_code_only() (
-    local expected
-    expected="$({
-        hash_file "${SELFTEST_ROOT}/scripts/lib/common.sh"
-        hash_file "${SELFTEST_ROOT}/scripts/lib/package.sh"
-        hash_file "${SELFTEST_ROOT}/scripts/lib/license.sh"
-        hash_file "${SELFTEST_ROOT}/config/build.conf"
-    } | sha256sum | cut -c1-64)"
-    STAGE_SHARED_DIGEST=""
-    [[ "$(stage_shared_digest)" == "${expected}" ]]
+shared_digest_has_the_right_scope() (
+    local kind="$1" stage="$2" expected
+    STAGE_COMMON_DIGEST="common-probe"
+    STAGE_PACKAGE_DIGEST="package-probe"
+    STAGE_LICENSE_DIGEST="license-probe"
+    case "${kind}" in
+        common)
+            expected="$(printf 'common common-probe\n' \
+                | sha256sum | cut -c1-64)"
+            ;;
+        package)
+            expected="$({
+                printf 'common common-probe\n'
+                printf 'package package-probe\n'
+                printf 'license license-probe\n'
+            } | sha256sum | cut -c1-64)"
+            ;;
+        package-without-license)
+            expected="$({
+                printf 'common common-probe\n'
+                printf 'package package-probe\n'
+            } | sha256sum | cut -c1-64)"
+            ;;
+        *) return 1 ;;
+    esac
+    [[ "$(stage_shared_digest "${stage}")" == "${expected}" ]]
 )
-assert "the shared digest covers the build code and nothing else" \
-    shared_digest_covers_the_build_code_only
+assert "toolchain stages carry only common build helpers" \
+    shared_digest_has_the_right_scope common toolchain/01-binutils
+assert "package stages carry package and licence helpers" \
+    shared_digest_has_the_right_scope package packages/nano
+assert "the ISO carries package metadata helpers but not licence copying" \
+    shared_digest_has_the_right_scope package-without-license image/iso
+
+# Bash can serialize a parsed function definition itself. Its representation
+# excludes comments but includes executable statements and here-document data,
+# which is safer than trying to strip shell comments as text.
+implementation_probe="${SCRATCH}/implementation-probe.sh"
+cat > "${implementation_probe}" <<'PROBE'
+stage_digest_probe() {
+    # first wording
+    printf 'one\n'
+}
+PROBE
+# shellcheck source=/dev/null
+source "${implementation_probe}"
+implementation_before="$(
+    stage_function_definitions stage_digest_probe | sha256sum | cut -c1-64
+)"
+sed -i 's/first wording/second wording/' "${implementation_probe}"
+# shellcheck source=/dev/null
+source "${implementation_probe}"
+same "a comment in a shared library changes no implementation digest" \
+    "$(stage_function_definitions stage_digest_probe | sha256sum | cut -c1-64)" \
+    "${implementation_before}"
+sed -i "s/printf 'one/printf 'two/" "${implementation_probe}"
+# shellcheck source=/dev/null
+source "${implementation_probe}"
+differs "an executable shared-library change moves its implementation digest" \
+    "$(stage_function_definitions stage_digest_probe | sha256sum | cut -c1-64)" \
+    "${implementation_before}"
+unset -f stage_digest_probe
+
+# A functional package-library change still rebuilds its consumers, but it is
+# not a compiler input. Alter the memoized component to stand in for such a
+# change without editing a repository file during the test.
+# shellcheck disable=SC2329,SC2034
+package_library_change_is_scoped() (
+    local toolchain_before package_before
+    preheat_stage_shared_digests
+    toolchain_before="$(stage_shared_digest toolchain/01-binutils)"
+    package_before="$(stage_shared_digest packages/nano)"
+    STAGE_PACKAGE_DIGEST="changed-package-implementation"
+    [[ "$(stage_shared_digest toolchain/01-binutils)" == "${toolchain_before}" \
+        && "$(stage_shared_digest packages/nano)" != "${package_before}" ]]
+)
+assert "a package-library change leaves toolchain keys alone" \
+    package_library_change_is_scoped
 
 # shellcheck disable=SC2329,SC2034
 dispatch_table_answers_both_ways() (

@@ -4,15 +4,16 @@
 #
 # This file is the machinery that answers "should this stage be rebuilt", and
 # it is deliberately separate from the code that does the building. The
-# separation is not tidiness: scripts/lib/common.sh is hashed into every stage
-# key, because a change to the compiler flags or the source preparation in it
-# really can change every binary in the distribution. This file is not hashed,
-# and must not be, because everything it does is already visible in the answer
-# it produces - a stage key is a digest of the text stage_inputs prints, so a
+# separation is not tidiness: the executable functions loaded from
+# scripts/lib/common.sh are fingerprinted into every stage key, because a
+# change to the compiler flags or source preparation in them really can change
+# every binary in the distribution. This file is not fingerprinted, and must
+# not be, because everything it does is already visible in the answer it
+# produces - a stage key is a digest of the text stage_inputs prints, so a
 # change to what goes into that text moves the key by itself, and a change that
-# does not move it correctly rebuilds nothing. Hashing this file as well would
-# mean that touching the machinery which decides what to rebuild rebuilt the
-# whole distribution, every time.
+# does not move it correctly rebuilds nothing. Fingerprinting this file as well
+# would mean that touching the machinery which decides what to rebuild rebuilt
+# the whole distribution, every time.
 #
 # It is sourced by scripts/lib/common.sh, and nothing sources it directly.
 
@@ -87,9 +88,12 @@ STAGE_DEPS_FILE="${STAGE_DEPS_FILE:-}"
 # this is what lets stage_recorded_sources tell "the stage running now" from
 # every other stage, whose record is complete and beside its stamp.
 STAGE_RUNNING_NAME="${STAGE_RUNNING_NAME:-}"
-# Both are the same for every stage in a run and are hashed once rather than
-# ninety times.
-STAGE_SHARED_DIGEST=""
+# Loaded library implementations are the same for every stage in a run and are
+# hashed once rather than ninety times. They remain separate because a
+# toolchain stage does not execute package staging or licence handling code.
+STAGE_COMMON_DIGEST=""
+STAGE_PACKAGE_DIGEST=""
+STAGE_LICENSE_DIGEST=""
 STAGE_TOOLCHAIN_DIGEST=""
 
 hash_file() {
@@ -133,16 +137,114 @@ hash_path() {
     fi
 }
 
-# The code every stage is built by, and nothing else.
+# The executable implementation loaded from one shell library. `declare -f`
+# is Bash's own serialization of a parsed function: it retains commands,
+# strings and here-document payloads, but not comments or source formatting.
+# That is the distinction a stage key needs. A changed command can change the
+# result and must invalidate it; revised prose cannot and must not.
 #
-# This is the widest input there is: a change here rebuilds the distribution.
-# That is right for what it names - the compiler flags in target_configure_env,
-# the source preparation every recipe calls, the manifest and merge rules that
-# decide what a stage leaves in the sysroot, the licence copier, and the
-# build-wide settings - because each of those really can change every binary.
-#
-# It is not right for anything else, and two things used to be in here that do
-# not belong.
+# extdebug makes `declare -F NAME` report the source file of a function. The
+# anchor is one function known to belong to the wanted library; matching its
+# source spelling avoids making the checkout path part of the digest. The
+# option is restored before returning because this helper is identity
+# machinery, not a change to how the build runs.
+stage_function_definitions() {
+    local anchor="$1"
+    local name metadata _definition _line source wanted_source
+    local extdebug_was_set=0
+
+    shopt -q extdebug && extdebug_was_set=1
+    shopt -s extdebug
+    metadata="$(declare -F "${anchor}")" \
+        || die "cannot fingerprint shell library without function ${anchor}"
+    read -r _definition _line wanted_source <<< "${metadata}"
+    [[ -n "${wanted_source}" ]] \
+        || die "cannot find the source library of function ${anchor}"
+
+    while IFS= read -r name; do
+        metadata="$(declare -F "${name}")"
+        read -r _definition _line source <<< "${metadata}"
+        [[ "${source}" == "${wanted_source}" ]] || continue
+        declare -f "${name}"
+    done < <(compgen -A function | LC_ALL=C sort)
+
+    ((extdebug_was_set != 0)) || shopt -u extdebug
+}
+
+stage_common_digest() {
+    if [[ -z "${STAGE_COMMON_DIGEST}" ]]; then
+        STAGE_COMMON_DIGEST="$(
+            stage_function_definitions log | sha256sum | cut -c1-64
+        )"
+    fi
+    printf '%s\n' "${STAGE_COMMON_DIGEST}"
+}
+
+stage_package_digest() {
+    if [[ -z "${STAGE_PACKAGE_DIGEST}" ]]; then
+        STAGE_PACKAGE_DIGEST="$({
+            stage_function_definitions package_record
+            # These values are the only executable package-library state not
+            # held in a function body.
+            printf 'newline %q\n' "${NEWLINE}"
+            printf 'hook-events %s\n' "${PACKAGE_HOOK_EVENTS}"
+            printf 'hook-actions %s\n' "${PACKAGE_HOOK_ACTIONS}"
+        } | sha256sum | cut -c1-64)"
+    fi
+    printf '%s\n' "${STAGE_PACKAGE_DIGEST}"
+}
+
+stage_license_digest() {
+    if [[ -z "${STAGE_LICENSE_DIGEST}" ]]; then
+        STAGE_LICENSE_DIGEST="$(
+            stage_function_definitions license_record | sha256sum | cut -c1-64
+        )"
+    fi
+    printf '%s\n' "${STAGE_LICENSE_DIGEST}"
+}
+
+# Package helpers execute while component trees are staged and while the image
+# assigns ownership. The ISO also calls package_version to write its version
+# list. No toolchain, host-tool, kernel or payload-only artifact stage calls
+# them, so making those stages answer for package.sh would create a false edge.
+stage_uses_package_library() {
+    case "$1" in
+        packages/* | image/10-rootfs | image/11-initramfs | image/iso) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+stage_uses_license_library() {
+    case "$1" in
+        packages/* | image/10-rootfs | image/11-initramfs) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# The shared code a particular stage executes, and nothing else. Effective
+# build.conf values are printed individually by stage_inputs below; hashing the
+# source file as well made a comment or a repository-signing default rebuild
+# binaries whose build environment had not changed.
+stage_shared_digest() {
+    local name="$1"
+    {
+        printf 'common %s\n' "$(stage_common_digest)"
+        if stage_uses_package_library "${name}"; then
+            printf 'package %s\n' "$(stage_package_digest)"
+        fi
+        if stage_uses_license_library "${name}"; then
+            printf 'license %s\n' "$(stage_license_digest)"
+        fi
+    } | sha256sum | cut -c1-64
+}
+
+preheat_stage_shared_digests() {
+    stage_common_digest > /dev/null
+    stage_package_digest > /dev/null
+    stage_license_digest > /dev/null
+}
+
+# Two whole files used to be in every stage key and did not belong there.
 #
 # scripts/build.sh was one. The driver is a dispatcher: it says which stage
 # builds which package and in what order, and one line per package. Adding a
@@ -157,26 +259,17 @@ hash_path() {
 # declared dependencies, and an undeclared one was never covered by hashing the
 # driver either.
 #
-# scripts/lib/stage.sh is the other, and it is not hashed for a stronger
+# scripts/lib/stage.sh was the other, and it is not hashed for a stronger
 # reason: everything it does is already visible. A stage key is a digest of the
 # text stage_inputs prints, so a change to what goes into that text changes the
 # key by itself, and a change that does not - a comment, a refactor, a faster
 # way to reach the same answer - correctly changes nothing. Hashing the file as
 # well would rebuild the distribution every time the machinery that decides
-# what to rebuild was touched.
-stage_shared_digest() {
-    if [[ -z "${STAGE_SHARED_DIGEST}" ]]; then
-        STAGE_SHARED_DIGEST="$({
-            hash_file "${PROJECT_ROOT}/scripts/lib/common.sh"
-            hash_file "${PROJECT_ROOT}/scripts/lib/package.sh"
-            hash_file "${PROJECT_ROOT}/scripts/lib/license.sh"
-            hash_file "${PROJECT_ROOT}/config/build.conf"
-        } | sha256sum | cut -c1-64)"
-    fi
-    printf '%s\n' "${STAGE_SHARED_DIGEST}"
-}
+# what to rebuild was touched. package.sh and license.sh are now scoped for the
+# same reason: they affect package and image stages, not the cross toolchain.
 
-# Both digests, computed once in the shell that is about to ask for many keys.
+# The shared-library and toolchain digests, computed once in the shell that is
+# about to ask for many keys.
 #
 # They are memoized in a variable, and every caller asks for a key through a
 # command substitution - which is a subshell, which gets a copy of the memo and
@@ -191,7 +284,7 @@ stage_shared_digest() {
 # toolchain() in scripts/build.sh, and stage_execute, which drops it again when
 # a toolchain stage has just rewritten one of those stamps.
 preheat_stage_digests() {
-    stage_shared_digest > /dev/null
+    preheat_stage_shared_digests
     stage_toolchain_digest > /dev/null
     load_stage_dispatch
 }
@@ -494,7 +587,7 @@ stage_inputs() {
     printf 'artifact %s %s %s %s\n' \
         "${ARTIFACT_ARCH}" "${ISO_GFXMODE}" "${SFS_COMPRESSOR}" "${SFS_BLOCK_SIZE}"
     stage_environment_inputs "${name}"
-    printf 'shared %s\n' "$(stage_shared_digest)"
+    printf 'shared %s\n' "$(stage_shared_digest "${name}")"
     printf 'script %s\n' "$(hash_path "${script}")"
     # The stage's own line in the driver, which is the part of scripts/build.sh
     # that is about this stage: which package it produces, or that it produces

@@ -194,18 +194,22 @@ revision would not contain. An interrupted merge marks the sysroot dirty and
 requires `make clean` rather than letting another stage consume mixed output.
 
 **A stage reruns when its inputs change.** Its stamp holds a key over its
-script, the shared build libraries, `config/build.conf`, the lock rows it was
-observed to use, any `${PROJECT_ROOT}/...` path it names, its package and
-licence rows, its own line in the driver, dependency stage keys, selected
-environment/build flags, and the cross toolchain. Package metadata is scoped to
-its consumer: component stages get their own row, rootfs assembly and the ISO
-version list get the complete catalogue, and toolchain, host-tool, and
-payload-only artifact stages get none. Nothing has to be declared for source and
-repository inputs: the lock rows are recorded as the stage asks for them, so a
-loop over patch names works, and the repository paths are found by scanning the
-script, so a literal path cannot be forgotten. Runtime/build relationships still
-live in the package table and the reverse lists in item 6, and `make check`
-cross-checks them against ELF dependencies.
+script, the executable shared-library functions it calls, effective
+`config/build.conf` settings, the lock rows it was observed to use, any
+`${PROJECT_ROOT}/...` path it names, its package and licence rows, its own line
+in the driver, dependency stage keys, selected environment/build flags, and the
+cross toolchain. Package metadata is scoped to its consumer: component stages
+get their own row, rootfs assembly and the ISO version list get the complete
+catalogue, and toolchain, host-tool, and payload-only artifact stages get none.
+Shared-library code follows the same boundary: package and licence helpers are
+inputs to package/image stages, not to the compiler bootstrap. Their parsed
+function bodies are fingerprinted, so executable edits count but comments and
+formatting do not. Nothing has to be declared for source and repository inputs:
+the lock rows are recorded as the stage asks for them, so a loop over patch
+names works, and the repository paths are found by scanning the script, so a
+literal path cannot be forgotten. Runtime/build relationships still live in
+the package table and the reverse lists in item 6, and `make check` cross-checks
+them against ELF dependencies.
 `make stage-key STAGE=packages/<name>` shows the whole input list and says
 whether the stage is current.
 
@@ -231,10 +235,12 @@ a new package does reach. The same reasoning keeps `scripts/lib/stage.sh` out of
 the key: it is the machinery that computes keys, and everything it does is
 already visible in the key it computes.
 
-What still rebuilds everything, correctly, is a change to the code that builds:
-`scripts/lib/common.sh`, `scripts/lib/package.sh`, `scripts/lib/license.sh` or
-`config/build.conf`. A compiler flag or a change to how sources are prepared
-really can change every binary in the distribution.
+What still rebuilds everything, correctly, is an executable change to common
+build code such as source preparation in `scripts/lib/common.sh`, or an
+effective compiler/build setting in `config/build.conf`. Executable changes in
+`scripts/lib/package.sh` and `scripts/lib/license.sh` rebuild their package and
+image consumers without rebuilding the cross toolchain. Comment-only edits to
+those shared libraries rebuild nothing.
 
 **Path precedence is fixed.** The rootfs overlay wins first, then image packages
 in `packages.conf` order. Incremental merges reassert the same order for shared

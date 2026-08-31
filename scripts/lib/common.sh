@@ -61,13 +61,21 @@ if [[ "${JOBS}" == auto ]]; then
 fi
 readonly JOBS
 
-export LC_ALL=C
-export LANG=C
-export TZ=UTC
-export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}"
-export PATH="${TOOLS_DIR}/bin:/usr/bin:/bin"
-export CONFIG_SITE=/dev/null
-umask 022
+# This is a function rather than loose setup code because its implementation is
+# part of every stage key. lib/stage.sh fingerprints loaded function bodies, so
+# a change to this build environment invalidates stages while a comment beside
+# it does not.
+configure_build_environment() {
+    export LC_ALL=C
+    export LANG=C
+    export TZ=UTC
+    export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}"
+    export PATH="${TOOLS_DIR}/bin:/usr/bin:/bin"
+    export CONFIG_SITE=/dev/null
+    umask 022
+}
+
+configure_build_environment
 
 log() {
     printf '==> %s\n' "$*"
@@ -291,8 +299,9 @@ remove_tree() {
 
 # The stage identity machinery - stage keys, stamps and the driver's view of
 # which stage builds what - lives in lib/stage.sh, which is sourced at the end
-# of this file. It is kept out of this one because this one is hashed into
-# every stage key and that one deliberately is not; see stage_shared_digest.
+# of this file. It is kept out of this one because the executable functions in
+# this file are inputs to every stage key and that machinery deliberately is
+# not; see stage_shared_digest.
 
 # The two memory figures the live medium has, in MiB, and the reason there are
 # two of them.
