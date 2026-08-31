@@ -62,13 +62,17 @@ filesystem overlay as part of `sowa-release`: `/etc/inittab`,
    the tmpfs that now covers the one it made in step 2. It also runs
    `swapon -a`, since `mount -a` walks past a `swap` line in `/etc/fstab`
    without doing anything with it.
-4. init enters the default runlevel from `initdefault`, which is 3.
-5. The runlevel entry `l3:3:wait:/etc/rc.d/rc 3` runs the K and S links in
+4. The `bootwait` entry runs `/etc/rc.d/rc.setup`. It normally exits at once;
+   when the ISO's Install entry supplied `sowa.setup=y`, it runs the interactive
+   `sowa-setup` installer and waits for it. Returning from setup continues this
+   boot normally.
+5. init enters the default runlevel from `initdefault`, which is 3.
+6. The runlevel entry `l3:3:wait:/etc/rc.d/rc 3` runs the K and S links in
    `/etc/rc.d/rc3.d`: zram, then the network, then chronyd, then sshd, then
    crond. zram is first because swap that appears after the memory ran out was
    not there when it mattered, and is stopped last for the mirror image of the
    same reason.
-6. The getty entries start a login prompt on `tty1`, `tty2` and `ttyS0`, each
+7. The getty entries start a login prompt on `tty1`, `tty2` and `ttyS0`, each
    on its own device, and init keeps them alive for the rest of the runlevel.
 
 ## The inittab

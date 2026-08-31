@@ -1,0 +1,38 @@
+#!/bin/bash
+#
+# /etc/rc.d/rc.setup - enter sowa-setup directly from the live boot menu.
+#
+# init runs this once, after rc.sysinit has prepared the live root and before
+# it enters the normal runlevel. On every boot except the ISO's Install entry
+# this is a no-op. If the installer returns -- after completing or because the
+# operator cancelled it -- init carries on to the ordinary live login prompts.
+
+set -u
+
+arguments=()
+read -r -a arguments < /proc/cmdline || exit 0
+
+for argument in "${arguments[@]}"; do
+    case "${argument}" in
+        sowa.setup | sowa.setup=y | sowa.setup=yes | sowa.setup=1)
+            # The hook travels onto installed systems with the rest of the
+            # live root. Do not turn a stale or hand-edited installed GRUB
+            # command line into an invitation to reinstall the running disk.
+            # liveinit always leaves the mounted squashfs at this path.
+            if [[ ! -d /run/sowa/sfs ]]; then
+                printf 'Skipping Sowa setup: this is not a live-system boot.\n' >&2
+                exit 0
+            fi
+            printf '\nStarting Sowa setup...\n\n'
+            # bootwait jobs normally borrow /dev/console without claiming it
+            # as a controlling terminal because they are non-interactive rc
+            # tasks. Setup is interactive: give its child a fresh session and
+            # claim the current console so Ctrl-C and job-control signals go
+            # where the operator expects. --wait preserves the installer exit
+            # status while init waits for this boot task to finish.
+            exec /usr/bin/setsid --fork --wait --ctty /usr/sbin/sowa-setup
+            ;;
+    esac
+done
+
+exit 0

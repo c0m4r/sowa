@@ -115,6 +115,15 @@ menuentry "${DISTRO_NAME^} Linux ${DISTRO_VERSION}" --id sowa {
     initrd /boot/initramfs.img
 }
 
+# Start the installer as soon as the live root has completed its essential
+# system initialization. The boot hook waits for sowa-setup to finish before
+# the ordinary live runlevel and login prompts are started; cancelling setup
+# therefore leaves a usable live system rather than a dead end.
+menuentry "Install ${DISTRO_NAME^} Linux ${DISTRO_VERSION}" --id sowa-install {
+    linux /boot/vmlinuz ${cmdline} checksum=y sowa.setup=y
+    initrd /boot/initramfs.img
+}
+
 # The escape hatch for slow or already independently verified media. Integrity
 # checking is the default because a successful boot should not silently depend
 # on corrupt squashfs blocks that happen not to have been read yet. This check
@@ -135,9 +144,9 @@ menuentry "${DISTRO_NAME^} Linux ${DISTRO_VERSION} (single user)" --id sowa-sing
 EOF
 
 # Booting the ISO as a file. A GRUB on some other system loopback-mounts the
-# image, sources this, and gets a menu entry that tells liveinit where the file
-# is rather than which device to look at - which is the only way to boot an
-# image that is not a medium of its own.
+# image, sources this, and gets live and install entries that tell liveinit
+# where the file is rather than which device to look at - which is the only way
+# to boot an image that is not a medium of its own.
 #
 #   menuentry "Sowa" {
 #       set isofile=/sowa.iso
@@ -147,6 +156,11 @@ EOF
 cat > "${staging}/boot/grub/loopback.cfg" <<EOF
 menuentry "${DISTRO_NAME^} Linux ${DISTRO_VERSION} (from \${iso_path})" --id sowa-loopback {
     linux /boot/vmlinuz ${cmdline} checksum=y img_loop="\${iso_path}"
+    initrd /boot/initramfs.img
+}
+
+menuentry "Install ${DISTRO_NAME^} Linux ${DISTRO_VERSION} (from \${iso_path})" --id sowa-loopback-install {
+    linux /boot/vmlinuz ${cmdline} checksum=y sowa.setup=y img_loop="\${iso_path}"
     initrd /boot/initramfs.img
 }
 EOF

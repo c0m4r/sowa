@@ -74,7 +74,11 @@ With the default 512 MiB ESP that puts the practical minimum disk at roughly
 
 ## Usage
 
-Boot the ISO, log in as root, then:
+Choose `Install Sowa Linux` in the ISO's GRUB menu to boot directly into the
+installer. The medium is verified first, then `sowa-setup` starts on the boot
+console before the live login prompts appear.
+
+Alternatively, choose the normal live entry, log in as root, then run:
 
 ```sh
 sowa-setup

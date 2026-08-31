@@ -34,6 +34,12 @@ id:3:initdefault:
 # Nothing else runs until it has finished.
 si::sysinit:/etc/rc.d/rc.sysinit
 
+# The ISO's Install entry adds sowa.setup=y to the kernel command line. This
+# waited boot task launches sowa-setup in that case and otherwise exits at
+# once. It precedes the runlevel so no login prompt can compete for the console;
+# if setup returns, normal services and prompts start afterwards.
+st::bootwait:/etc/rc.d/rc.setup
+
 # One entry per runlevel. /etc/rc.d/rc runs the K and S links in
 # /etc/rc.d/rc<N>.d, which is where services are turned on and off - with
 # chkconfig(8), or by making the links by hand.

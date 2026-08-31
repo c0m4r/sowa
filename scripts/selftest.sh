@@ -119,6 +119,43 @@ has_key() { stage_key "$@" > /dev/null; }
 # shellcheck disable=SC2329
 trees_equal() { diff -qr -- "$1" "$2" > /dev/null; }
 
+# Called through assert/refute's "$@", which shellcheck cannot see.
+# shellcheck disable=SC2329
+iso_install_entry_has() {
+    sed -n '/--id sowa-install {/,/^}/p' \
+        "${SELFTEST_ROOT}/scripts/stages/image/iso.sh" | grep -q "$1"
+}
+# shellcheck disable=SC2329
+iso_loopback_install_entry_has() {
+    sed -n '/--id sowa-loopback-install {/,/^}/p' \
+        "${SELFTEST_ROOT}/scripts/stages/image/iso.sh" | grep -q "$1"
+}
+# shellcheck disable=SC2329
+iso_default_entry_has_setup() {
+    sed -n '/--id sowa {/,/^}/p' \
+        "${SELFTEST_ROOT}/scripts/stages/image/iso.sh" | grep -q 'sowa\.setup'
+}
+
+# ------------------------------------------------------ ISO installer entry
+
+checking "ISO installer entry"
+printf '==> ISO installer entry\n'
+
+assert "the install entry verifies the medium and requests setup" \
+    iso_install_entry_has 'checksum=y sowa\.setup=y'
+assert "the loopback install entry retains its ISO path and requests setup" \
+    iso_loopback_install_entry_has 'sowa\.setup=y img_loop='
+refute "the default live entry does not request setup" iso_default_entry_has_setup
+assert "init waits for the setup boot hook" \
+    grep -q '^st::bootwait:/etc/rc.d/rc.setup$' \
+        "${SELFTEST_ROOT}/rootfs-overlay/etc/inittab"
+assert "the setup hook gives the installer a controlling terminal" \
+    grep -q 'setsid --fork --wait --ctty /usr/sbin/sowa-setup' \
+        "${SELFTEST_ROOT}/rootfs-overlay/etc/rc.d/rc.setup"
+assert "the setup hook is restricted to a live-system boot" \
+    grep -q '/run/sowa/sfs' \
+        "${SELFTEST_ROOT}/rootfs-overlay/etc/rc.d/rc.setup"
+
 # ------------------------------------------------------------- stage identity
 
 checking "stage keys"

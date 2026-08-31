@@ -817,12 +817,22 @@ done < <(cd "${howto_dir}" && find . -maxdepth 1 -type f -printf '%P\n')
 [[ ! -e "${ROOTFS_DIR}/root/sowa-howto.txt" ]] \
     || die "the old /root/sowa-howto.txt is still in the image; the howto is a directory now"
 # The inittab is the whole of init's configuration, so a boot that goes nowhere
-# is almost always one of these four lines missing.
+# is almost always one of these entries missing.
 inittab="${ROOTFS_DIR}/etc/inittab"
 grep -qE '^id:[1-5]:initdefault:' "${inittab}" \
     || die "the shipped inittab has no initdefault; init would not know what to enter"
 grep -q '^si::sysinit:/etc/rc.d/rc.sysinit$' "${inittab}" \
     || die "the shipped inittab does not run rc.sysinit; nothing would be mounted"
+[[ -x "${ROOTFS_DIR}/etc/rc.d/rc.setup" ]] \
+    || die "the ISO setup boot hook is missing or not executable"
+[[ -x "${ROOTFS_DIR}/usr/bin/setsid" ]] \
+    || die "the ISO setup boot hook cannot claim its console; setsid is missing"
+grep -q '^st::bootwait:/etc/rc.d/rc.setup$' "${inittab}" \
+    || die "the shipped inittab does not schedule the ISO setup boot hook"
+grep -q 'sowa\.setup' "${ROOTFS_DIR}/etc/rc.d/rc.setup" \
+    || die "the ISO setup boot hook does not recognize its kernel parameter"
+grep -q '/run/sowa/sfs' "${ROOTFS_DIR}/etc/rc.d/rc.setup" \
+    || die "the ISO setup boot hook is not restricted to a live-system boot"
 for level in 0 1 2 3 4 5 6; do
     grep -q "^l${level}:${level}:wait:/etc/rc.d/rc ${level}\$" "${inittab}" \
         || die "the shipped inittab has no entry for runlevel ${level}"

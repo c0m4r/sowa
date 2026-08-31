@@ -104,11 +104,12 @@ pulled from that moment.
 
 ## The boot menu
 
-Three entries. Integrity checking is on unless the second one explicitly turns
+Four entries. Integrity checking is on unless the third one explicitly turns
 it off:
 
 ```text
 Sowa Linux 0.1                            adds checksum=y; the default
+Install Sowa Linux 0.1                    adds checksum=y and sowa.setup=y
 Sowa Linux 0.1 (skip medium verification) omits checksum=y
 Sowa Linux 0.1 (single user)              adds checksum=y and single
 ```
@@ -123,6 +124,16 @@ The checksum and the image sit on the same medium. This is an integrity check,
 not authenticity: an attacker who replaces the ISO can replace both. Verify the
 external signed release manifest before writing or booting the image; see
 [Release authenticity](releases.md).
+
+`sowa.setup=y` makes the waited boot task in `/etc/inittab` run `sowa-setup`
+after `rc.sysinit` has prepared the live root and before the normal runlevel
+starts. The installer therefore owns the boot console without competing with a
+login prompt. If it returns, whether after installation or cancellation, boot
+continues to the ordinary live login. The entry keeps `checksum=y`: a system
+should not be installed from a damaged image merely because setup was selected
+directly. The hook also requires liveinit's `/run/sowa/sfs` mount, so an
+installed system ignores this parameter instead of offering to reinstall its
+running disk.
 
 `single` is not a parameter `liveinit` claims, so it is passed through to
 `/sbin/init` exactly as the kernel would have passed it had there been no
@@ -167,8 +178,10 @@ menuentry "Sowa" {
 }
 ```
 
-It passes `checksum=y img_loop=${iso_path}` instead of leaving `liveinit` to find
-a medium. `liveinit` then looks for that path on every block device it can mount
+The loopback menu offers both live and install entries. Both pass
+`checksum=y img_loop=${iso_path}` instead of leaving `liveinit` to find a
+medium, and the install entry also passes `sowa.setup=y`. `liveinit` then looks
+for that path on every block device it can mount
 — `img_dev=/dev/sda1` restricts the search to one — attaches the ISO to a loop
 device, mounts it, and carries on from there exactly as if it had been a
 medium. Searching for the file is what lets this work without teaching a
@@ -176,7 +189,7 @@ one-megabyte initramfs to resolve `UUID=`.
 
 ## Kernel command line
 
-Everything `liveinit` reads, all optional:
+The live boot path's parameters, all optional:
 
 | parameter | default | meaning |
 | --- | --- | --- |
@@ -185,6 +198,7 @@ Everything `liveinit` reads, all optional:
 | `copytoram=auto\|y\|n` | `auto` | copy the image into RAM before mounting it |
 | `cow_spacesize=SIZE` | half of RAM | `size=` for the writable overlay tmpfs |
 | `checksum=y` | off in `liveinit`; the ISO passes it by default | verify the image before mounting it |
+| `sowa.setup=y` | off | launch `sowa-setup` before entering the normal live runlevel |
 | `img_loop=PATH` | — | boot an ISO stored as a file |
 | `img_dev=DEVICE` | — | restrict the `img_loop` search to one device |
 | `rootdelay=SECONDS` | 30 | how long to wait for the medium to appear |
