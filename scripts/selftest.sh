@@ -10,8 +10,8 @@
 #     labels those bytes with the current version.
 #   * A sysroot that is never reconciled keeps files a package has stopped
 #     installing, so an incremental build ships what a clean build would not.
-#   * A package whose identity is only its version makes a rebuild invisible to
-#     every machine that already has that version.
+#   * Treating a build-host identity as a package version makes a clean build on
+#     another host offer unrelated packages as updates.
 #
 # None of that can be seen by reading a successful build log, so it is asserted
 # instead - against a scratch work directory rather than the real one, in a few
@@ -665,8 +665,9 @@ printf 'f|0755|%s|4|usr/bin/probe\nf|0644|%s|4|usr/share/probe\n' \
 differs "an added file changes the build id" \
     "$(pkg_build_id "${name}" "${manifest}")" "${first}"
 
-# The version is in the identity as well, so a release bump is still visible to
-# a client that only looks at the build id.
+# The version is in the provenance identity as well, so two releases cannot
+# accidentally share an archive/build address even though clients order them by
+# version alone.
 printf 'f|0755|%s|4|usr/bin/probe\n' "$(printf a | sha256sum | cut -c1-64)" \
     > "${manifest}"
 cp "${PACKAGES_CONF}" "${packages_backup}"
@@ -753,8 +754,11 @@ printf '==> index migration\n'
 
 new_index="${SCRATCH}/index.new"
 old_index="${SCRATCH}/index.old"
-printf 'probe|1-1|x86_64|probe.tar.xz|%064d|10|dep-a,dep-b|MIT|Example|%s|Probe package\n' \
+bare_build_index="${SCRATCH}/index.bare-build"
+printf 'probe|1-1|x86_64|probe.tar.xz|%064d|10|dep-a,dep-b|MIT|Example|pkgbuild=%s|Probe package\n' \
     4 "${first}" > "${new_index}"
+printf 'probe|1-1|x86_64|probe.tar.xz|%064d|10|dep-a,dep-b|MIT|Example|%s|Probe package\n' \
+    4 "${first}" > "${bare_build_index}"
 # The legacy layout deliberately names a gzip archive too: the current parser
 # and extractor retain read compatibility even though new repositories publish
 # XZ only.
@@ -765,14 +769,15 @@ printf 'probe|1-1|x86_64|probe.tar.gz|%064d|10|dep-a,dep-b|MIT|Example|Probe pac
 # shellcheck disable=SC2329
 old_client_reads_new_index() {
     local package rest _version _arch _archive_name _checksum _size depends license
-    local copyright description
+    local copyright build_or_description description
     IFS='|' read -r package rest < "${new_index}"
     IFS='|' read -r _version _arch _archive_name _checksum _size depends license \
-        copyright description <<< "${rest}"
+        copyright build_or_description description <<< "${rest}"
     [[ "${package}" == probe && "${depends}" == dep-a,dep-b \
-        && "${license}" == MIT && "${copyright}" == Example ]]
+        && "${license}" == MIT && "${copyright}" == Example \
+        && ! "${build_or_description}" =~ ^[0-9a-f]{64}$ ]]
 }
-assert "the previous client still parses dependencies in the new index" \
+assert "the previous client parses the index without treating its tag as a build" \
     old_client_reads_new_index
 
 # shellcheck disable=SC2329
@@ -789,26 +794,34 @@ new_client_migrates_indexes() (
     read_index_entry probe
     [[ "${IDX_DEPENDS}" == dep-a,dep-b && -z "${IDX_BUILD}" \
         && "${IDX_DESCRIPTION}" == "Probe package" ]] || return 1
-    build_differs probe "${IDX_BUILD}" && return 1
 
     # shellcheck disable=SC2034
     INDEX="${new_index}"
     read_index_entry probe
     [[ "${IDX_DEPENDS}" == dep-a,dep-b && "${IDX_BUILD}" == "${first}" \
         && "${IDX_DESCRIPTION}" == "Probe package" ]] || return 1
-    # An installed entry from before pkgbuild existed needs one convergence
-    # rebuild when the repository first offers an identity.
-    build_differs probe "${IDX_BUILD}" || return 1
-    printf 'pkgname=probe\npkgver=1-1\npkgbuild=%064d\n' 0 \
-        > "${DB_DIR}/probe/desc"
-    build_differs probe "${IDX_BUILD}" || return 1
-    printf 'pkgname=probe\npkgver=1-1\npkgbuild=%s\n' "${first}" \
-        > "${DB_DIR}/probe/desc"
-    build_differs probe "${IDX_BUILD}" && return 1
-    build_differs probe "${producer_id}"
+
+    # The bare digest is the first build-aware layout and remains readable.
+    INDEX="${bare_build_index}"
+    read_index_entry probe
+    [[ "${IDX_BUILD}" == "${first}" \
+        && "${IDX_DESCRIPTION}" == "Probe package" ]] || return 1
 )
-assert "the new client reads both layouts and detects missing or changed builds" \
+assert "the new client reads tagged, bare and absent build identities" \
     new_client_migrates_indexes
+
+# shellcheck disable=SC2329,SC2034
+license_client_reads_tagged_index() (
+    # The program is not a source library, but --help returns after defining its
+    # functions and is useful here for testing its shared index parser.
+    # shellcheck source=/dev/null
+    source "${SELFTEST_ROOT}/rootfs-overlay/usr/bin/sowa-license" --help \
+        > /dev/null
+    INDEX="${new_index}"
+    [[ "$(index_field probe description)" == "Probe package" ]]
+)
+assert "the licence client keeps the description after a tagged build identity" \
+    license_client_reads_tagged_index
 
 archive_info="${SCRATCH}/archive.PKGINFO"
 printf 'pkgname=probe\npkgver=1-1\npkgbuild=%s\narch=x86_64\n' "${first}" \
@@ -834,6 +847,35 @@ client_rejects_mismatched_archive_identity() (
 refute "the client rejects an archive whose embedded build id differs from the index" \
     client_rejects_mismatched_archive_identity
 
+# --------------------------------------------------------- download progress
+
+checking "download progress"
+printf '==> download progress\n'
+
+# shellcheck disable=SC2329
+progress_layouts_are_bounded() (
+    # shellcheck source=/dev/null
+    source "${SELFTEST_ROOT}/rootfs-overlay/usr/bin/sowa-pkg"
+    local wide narrow tiny complete
+    wide="$(download_progress_line 5242880 10485760 2000 120)"
+    narrow="$(download_progress_line 5242880 10485760 2000 32)"
+    tiny="$(download_progress_line 5242880 10485760 2000 12)"
+    complete="$(download_progress_line 10485760 10485760 4000 80)"
+
+    ((${#wide} <= PROGRESS_MAX_WIDTH)) \
+        && [[ "${wide}" == *'5.0/10.0 MiB'* \
+            && "${wide}" == *'2.5 MiB/s'* \
+            && "${wide}" == *'ETA 00:02'* ]] \
+        && ((${#narrow} < 32)) \
+        && [[ "${narrow}" == *'2.5 MiB/s'* \
+            && "${narrow}" == *'ETA 00:02'* ]] \
+        && ((${#tiny} < 12)) \
+        && [[ "${tiny}" == *'50%'* \
+            && "${complete}" == *'ETA 00:00'* ]]
+)
+assert "the meter is compact and keeps speed and ETA as width permits" \
+    progress_layouts_are_bounded
+
 # ------------------------------------------------------------- publication
 
 checking "repository publication"
@@ -856,7 +898,7 @@ write_publication_index() {
     {
         printf '# sowa-repo serial=%s expires=%s published=x valid-until=y\n' \
             "${serial}" "$((serial + 86400))"
-        printf 'probe|1-1|x86_64|%s|%s|%s|-|MIT|Example|%s|Probe package\n' \
+        printf 'probe|1-1|x86_64|%s|%s|%s|-|MIT|Example|pkgbuild=%s|Probe package\n' \
             "${archive}" \
             "$(sha256sum "${publication_packages}/${archive}" | cut -c1-64)" \
             "$(stat -c %s "${publication_packages}/${archive}")" "${build}"
@@ -884,6 +926,9 @@ write_publication_index "${archive_two}" "${producer_id}" \
 assert "a changed build id publishes under a new immutable name" publish_probe
 assert "the prior immutable archive remains available" \
     exists "${publication_dist}/x86_64/${archive_one}"
+assert "publication says an equal-version rebuild is not an installed update" \
+    grep -q 'installed systems will keep their current build' \
+        "${SCRATCH}/publish.log"
 
 # Serving an index older than the one already being served is what a rollback
 # looks like from a client, which refuses it. Finding that out here is better
@@ -1190,6 +1235,10 @@ index_accepts() (
 
 assert "a well-formed index is accepted" index_accepts \
     "probe|1-1|x86_64|sowa-probe-1-1.tar.xz|${probe_hash}|10|-|MIT|Nobody|${probe_hash}|A probe"
+assert "a tagged build identity is accepted" index_accepts \
+    "probe|1-1|x86_64|sowa-probe-1-1.tar.xz|${probe_hash}|10|-|MIT|Nobody|pkgbuild=${probe_hash}|A probe"
+refute "a malformed tagged build identity is refused" index_accepts \
+    "probe|1-1|x86_64|sowa-probe-1-1.tar.xz|${probe_hash}|10|-|MIT|Nobody|pkgbuild=short|A probe"
 assert "a dependency chain that closes is accepted" index_accepts \
     "one|1-1|x86_64|one.tar.xz|${probe_hash}|10|two|MIT|Nobody|${probe_hash}|d" \
     "two|1-1|x86_64|two.tar.xz|${probe_hash}|10|three|MIT|Nobody|${probe_hash}|d" \
@@ -1417,8 +1466,8 @@ refute "an archive with an absolute member name is refused" \
 checking "transaction policy"
 printf '==> transaction policy\n'
 
-# IDX_VERSION, IDX_BUILD, NAMED and ALLOW_DOWNGRADE are all consumed by the
-# sourced client.
+# IDX_VERSION, NAMED, ALLOW_DOWNGRADE and REINSTALL are consumed by the sourced
+# client. IDX_BUILD is deliberately varied to prove it is not update policy.
 # shellcheck disable=SC2329,SC2034
 plan_for() (
     # shellcheck source=/dev/null
@@ -1430,6 +1479,7 @@ plan_for() (
     [[ "$3" != named ]] || NAMED=(probe)
     ALLOW_DOWNGRADE="$4"
     IDX_BUILD="${5:-${probe_hash}}"
+    REINSTALL="${6:-0}"
     rm -rf "${DB_DIR}"
     mkdir -p "${DB_DIR}/probe"
     printf 'pkgname=probe\npkgver=%s\npkgbuild=%s\n' "${installed}" \
@@ -1449,9 +1499,10 @@ assert "a newer version in the repository is an upgrade" \
     plan_says "upgrade 1-1 -> 2-1|" 1-1 2-1 named 0
 assert "the same version and build is nothing to do" \
     plan_says "|" 1-1 1-1 named 0
-assert "the same version rebuilt is a rebuild" \
-    plan_says "rebuild 1-1 (build ${other_hash:0:12})|" 1-1 1-1 resolved 0 \
-    "${other_hash}"
+assert "a different build id at the same version is not an update" \
+    plan_says "|" 1-1 1-1 resolved 0 "${other_hash}"
+assert "an equal version can still be explicitly reinstalled" \
+    plan_says "reinstall 1-1|" 1-1 1-1 named 0 "${other_hash}" 1
 assert "a repository behind the machine is held rather than followed" \
     plan_says "|probe 2-1 (repository has 1-1)" 2-1 1-1 resolved 0
 refute "a downgrade of a package named on the command line is refused" \

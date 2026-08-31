@@ -136,9 +136,9 @@ package_description() {
     printf '%s\n' "${description}"
 }
 
-# The full "upstream-release" human version. The client uses version ordering
-# to describe an upgrade or downgrade and compares the machine-derived pkgbuild
-# as well, so an unchanged human version no longer hides rebuilt bytes.
+# The full "upstream-release" package version. This is the sole update identity
+# used by the client: a publisher bumps the upstream version or this release
+# counter when installed machines should take new bytes.
 package_version() {
     local _name source release _depends _profile _description version
     IFS='|' read -r _name source release _depends _profile _description \
@@ -674,25 +674,17 @@ pkg_manifest_paths() {
 # The build identity of a package: a digest of its installed state and the
 # provenance that produced it.
 #
-# A package version is an upstream version and a release counter somebody
-# maintains by hand, and nothing derives it from what was actually built.
-# Rebuilding curl against a new OpenSSL, correcting a recipe or adding a patch
-# produces different bytes under the same version - and the client plans an
-# install only where the versions differ, so those bytes never reach the
-# machines that already have the package. The release counter exists for
-# exactly that case and has to be remembered.
+# This is deliberately separate from the public package version. It covers the
+# manifest (including a SHA-256 per file), installed metadata, hooks and note,
+# plus the producer stage key, compiler/toolchain identity and direct dependency
+# stage keys. Two builds can therefore differ even when their output happens to
+# be byte-identical: the id records which audited inputs produced it.
 #
-# This is the same statement made by the build rather than by a person. It
-# covers the manifest (including a SHA-256 per file), installed metadata, hooks
-# and note, plus the producer stage key, compiler/toolchain identity and direct
-# dependency stage keys. Two builds can therefore differ even when their output
-# happens to be byte-identical: the id records which audited inputs produced
-# it. It travels in the .PKGINFO, database entry, archive filename and index;
-# sowa-pkg reinstalls a package whose version has not changed and whose build id
-# has.
-#
-# Bumping the release counter is still worth doing - it is the number a person
-# reads - but forgetting it no longer makes a rebuild invisible.
+# It travels in .PKGINFO, the installed database, immutable archive filename and
+# signed index. Those places use it to keep builds unambiguous and to validate
+# that an archive is the build the index names; sowa-pkg does not use it to plan
+# an update. A changed recipe, dependency or unchanged-source rebuild intended
+# for users therefore requires a release-counter bump in config/packages.conf.
 pkg_build_id() {
     local name="$1"
     local manifest="$2"
@@ -715,8 +707,8 @@ pkg_build_id() {
         # stage is running, before its successful stamp can exist. Compute the
         # same key the driver will record at the end; otherwise the image would
         # contain producer=absent while the repository built a moment later
-        # contained producer=<image/10-rootfs>, and a fresh installation would
-        # immediately plan a needless rebuild of both packages.
+        # contained producer=<image/10-rootfs>, leaving two contradictory build
+        # identities for the same release.
         producer_key="$(stage_key image/10-rootfs \
             "$(stage_script image/10-rootfs)" -)"
     else
@@ -759,7 +751,7 @@ pkg_write_info() {
     {
         printf 'pkgname=%s\n' "${name}"
         printf 'pkgver=%s\n' "$(package_version "${name}")"
-        # What the version cannot say: which build this is. See pkg_build_id.
+        # Provenance/integrity identity, not an update version. See pkg_build_id.
         printf 'pkgbuild=%s\n' "$(pkg_build_id "${name}" "${manifest}")"
         printf 'arch=%s\n' "${PKG_ARCH}"
         printf 'distro=%s %s\n' "${DISTRO_NAME}" "${DISTRO_VERSION}"

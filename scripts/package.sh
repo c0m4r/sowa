@@ -98,15 +98,12 @@ while IFS= read -r package; do
         || die "${package} has no manifest; run 'make rootfs' again"
 done < <(optional_package_names)
 
-# A package's build id is what tells an installed machine that bytes it already
-# has were built again. It is computed twice for everything the image ships:
-# once by image/10-rootfs, into the database the image carries, and once here,
-# into the index. The two have to agree, or every fresh installation opens by
-# offering to reinstall packages it received minutes earlier - which is what
-# happened while image/10-rootfs described sowa-base and sowa-release out of a
-# source record it had not finished writing. Nothing downstream can notice the
-# disagreement: both sides look internally consistent, and the client is right
-# to believe them.
+# A package's build id records the exact provenance and installed contents. It
+# is computed twice for everything the image ships: once by image/10-rootfs,
+# into the database the image carries, and once here, into the index. The two
+# have to agree so an image and the repository made from it make the same signed
+# claim, even though installed systems use the package version - not this id -
+# to decide whether an update exists.
 
 # Every package's build identity, worked out once.
 #
@@ -139,7 +136,7 @@ while IFS= read -r package; do
         || die "${package} has no build id in the image database; run 'make image' first"
     computed="${BUILD_ID[${package}]}"
     [[ "${installed}" == "${computed}" ]] \
-        || die "${package} is ${computed} here and ${installed} in the image; the image would ask to reinstall it on first update"
+        || die "${package} is ${computed} here and ${installed} in the image; image and repository provenance disagree"
 done < <(image_package_names)
 
 # Every path the image carries has to belong to exactly one package, or an
@@ -326,20 +323,22 @@ write_index() {
         # "sowa-license list --available" and "sowa-pkg info" can answer for a
         # package this machine has never installed. The description stays last,
         # because it is the one free-text field.
-        # pkgbuild is what makes a rebuild visible to a machine that already
-        # has the package at this version: the client compares it as well as the
-        # version, and reinstalls when it differs. See pkg_build_id.
-        # pkgbuild sits immediately before the free-text description. Older
-        # clients assign all remaining fields to their final description
-        # variable, so they continue to parse dependencies and licences while a
-        # new sowa-release package bootstraps the build-aware client.
+        # pkgbuild records which audited build the archive contains. It is
+        # verified against .PKGINFO when installing but is not part of version
+        # ordering: a publisher bumps the package release when users should
+        # receive a rebuild.
+        # pkgbuild sits immediately before the free-text description. Its
+        # "pkgbuild=" value prefix is a rollout marker: the previous client
+        # recognises only a bare digest and therefore does not turn a clean
+        # cross-host rebuild into updates while sowa-release bootstraps this
+        # version-only client. Current clients still authenticate the value.
         printf '# name|version|arch|archive|sha256|size|depends|license|copyright|pkgbuild|description\n'
         while IFS= read -r name; do
             build="${BUILD_ID[${name}]}"
             archive="$(release_package_archive_name "${name}" "${build}")"
             read -r checksum _ < <(sha256sum "${PACKAGE_DIR}/${archive}")
             size="$(stat -c '%s' "${PACKAGE_DIR}/${archive}")"
-            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+            printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|pkgbuild=%s|%s\n' \
                 "${name}" "$(package_version "${name}")" "${PKG_ARCH}" \
                 "${archive}" "${checksum}" "${size}" \
                 "$(package_depends "${name}")" "$(package_license "${name}")" \
@@ -388,8 +387,9 @@ verify_licenses
 
 # Archive names carry the package's complete build identity and are written by
 # rename, so an existing current name is a completed package that can be reused
-# after an interrupted or repeated run. The index and its signature still have
-# to be regenerated from the complete current set.
+# after an interrupted or repeated run. This is a build/cache identity, not the
+# version clients compare. The index and its signature still have to be
+# regenerated from the complete current set.
 rm -rf "${META_DIR}"
 rm -f "${PACKAGE_DIR}"/index "${PACKAGE_DIR}"/index.sig
 mkdir -p "${META_DIR}"

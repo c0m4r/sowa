@@ -1,4 +1,4 @@
-.Dd August 23, 2026
+.Dd August 31, 2026
 .Dt SOWA-PKG 8
 .Os Sowa
 .Sh NAME
@@ -117,10 +117,6 @@ Fetch the repository index and its signature, verify the signature, and replace
 the local copy.
 Says afterwards how many installed packages are out of date and warns when an
 installed package is newer than the repository.
-It also reports packages the repository has
-.Em rebuilt
-at the version this system already has; see
-.Sx BUILD IDENTITY .
 .Pp
 The index has to be well formed and current as well as signed: see
 .Sx WHAT IS CHECKED BEFORE ANYTHING IS WRITTEN
@@ -133,8 +129,8 @@ What is installed and at which version, with the repository's version noted
 where it differs.
 This is the default.
 .It Cm list Fl -upgradable
-Only the packages the repository differs on, labelled as an upgrade, a
-downgrade, or a rebuild.
+Only installed packages whose version differs from the repository, labelled as
+an upgrade or a downgrade.
 .It Cm list Fl -available
 What the repository offers and this system does not have, which is the question
 the word asks.
@@ -159,6 +155,8 @@ Which installed package owns a path.
 .It Cm install Ar package ...
 Install packages and everything they depend on.
 Prints the plan and the total download and asks before doing anything.
+On an interactive terminal, each download uses a compact meter with its
+percentage, transferred size, average speed and estimated time remaining.
 .Cm add
 is the same command.
 .It Cm upgrade Op Ar package ...
@@ -270,33 +268,35 @@ It is rotated by
 under
 .Pa /etc/logrotate.d/sowa .
 .El
-.Sh BUILD IDENTITY
-A version says which release a package is.
-It does not say which build: rebuilding a package against a new library,
-correcting its recipe or adding a patch produces different bytes under the same
-version, and comparing versions alone would leave that invisible on a machine
-that already has the package.
+.Sh VERSIONS AND BUILD IDENTITY
+A package version is its upstream version followed by Sowa's numeric release
+counter.
+It is the update contract:
+.Nm
+plans an upgrade only when the repository version is newer.
+A patch, recipe change, dependency rebuild or unchanged-source rebuild meant
+for installed machines therefore requires a release-counter bump.
 .Pp
-Every package therefore carries a
+Every package separately carries a
 .Va pkgbuild
-as well, which the build derives from the manifest and installed metadata
+which the build derives from the manifest and installed metadata
 together with the recipe/input key, compiler/toolchain identity, and dependency
 build keys.
 It therefore identifies the audited build rather than only bytes that happen to
 be identical.
-.Nm
-compares it as well as the version, and plans a
-.Em rebuild
-where the version matches and the build id does not:
-.Bd -literal -offset indent
-  curl               rebuild 8.21.0-1 (build 3f9c1a04be77)
-.Ed
 .Pp
-A repository entry with no build id \(em one published before this field
-existed \(em is treated as matching, so an unknown answer is never a reason to
-reinstall everything on the machine.
-When the repository has an id but an older installed database entry does not,
-one rebuild records the known identity and subsequent runs converge normally.
+The build id appears in the immutable archive filename, package metadata,
+signed index, installed database and audit log.
+It keeps builds unambiguous and lets
+.Nm
+check that an archive carries the identity promised by the index, but it is not
+used for update ordering.
+Two clean build hosts may therefore publish different build ids and archive
+SHA-256 values at the same package version without replacing packages already
+installed.
+With an equal version,
+.Fl -reinstall
+is the explicit way to replace one.
 .Sh REPOSITORY FRESHNESS
 A signature proves who wrote an index.
 It proves nothing about whether that index is the current one, and anybody who

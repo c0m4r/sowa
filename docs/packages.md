@@ -25,6 +25,10 @@ compression preset. The current client auto-detects older `.tar.gz` archives,
 but clients from before the format change must be updated before pointing them
 at an XZ-only repository.
 
+Interactive archive downloads use a meter capped at 72 columns. It shows the
+percentage, transferred size, average speed and ETA, and drops the bar or less
+essential detail as necessary on a narrow terminal.
+
 Packages are cut out of the assembled root filesystem rather than built
 separately. `scripts/stages/image/10-rootfs.sh` decides which package owns each
 path in the image, so what is published is byte for byte what the image ships,
@@ -102,13 +106,19 @@ compressed, and its 17,600 paths are a store rather than a prefix. See
 version comes from, a release counter, its dependencies, its profile, and a
 description. The published version is `<upstream>-<release>`.
 
-The client compares those strings for equality to decide whether they differ,
-and uses version ordering to decide what to do about it. An upgrade converges
-the system onto the repository; a version that has gone *backwards* does not.
-A repository behind the machine is either somebody rolling a package back on
-purpose or a repository that has been rolled back for them — a replayed index, a
-mirror that stopped being updated, a restored backup — and nothing on the client
-can tell those apart:
+That version is the update contract. The client uses version ordering to decide
+what to do and never treats a checksum or build-host identity as a newer
+package. Change an upstream pin when upstream changes; for a patch, recipe,
+dependency rebuild, or other change at the same upstream version, bump that
+package's release counter. Rebuilding the complete repository from the same Git
+revision on another host can then produce different archive hashes without
+offering every package as an update.
+
+An upgrade converges the system onto newer repository versions; a version that
+has gone *backwards* does not. A repository behind the machine is either
+somebody rolling a package back on purpose or a repository that has been rolled
+back for them — a replayed index, a mirror that stopped being updated, a
+restored backup — and nothing on the client can tell those apart:
 
 ```text
 $ sowa-pkg upgrade
@@ -120,38 +130,38 @@ Going back is a decision, so it has to be typed: the package by name, with
 
 ## Build identity
 
-A version says which release this is. It does not say which *build*: rebuilding
-curl against a new OpenSSL, correcting a recipe or adding a patch produces
-different bytes under the same version, and comparing versions alone would
-leave that rebuild invisible to every machine that already has the package.
+The version deliberately says *when users should update*, not which physical
+build produced an archive. Every package separately carries a `pkgbuild`: a
+digest over the manifest (with a SHA-256 for every file), installed metadata,
+hooks and note, together with the producer recipe/input key,
+compiler/toolchain identity, and dependency build keys. It identifies the
+audited build, not only coincidentally identical output.
 
-So every package also carries a `pkgbuild`: a digest over the manifest (with a
-SHA-256 for every file), installed metadata, hooks and note, together with the
-producer recipe/input key, compiler/toolchain identity, and dependency build
-keys. It identifies the audited build, not only coincidentally identical output.
-It travels in the `.PKGINFO`, database entry, immutable archive filename and
-index, and `sowa-pkg` plans a `rebuild` when the version matches and the build
-id does not:
+The id travels in `.PKGINFO`, the installed database, immutable archive
+filename, and signed index. It prevents two builds from colliding in caches and
+lets `sowa-pkg` verify that the archive's embedded identity agrees with the
+index. It is visible in `sowa-pkg info` and the audit log, but it does not take
+part in update planning. At an equal version, `--reinstall` is the explicit way
+to replace a package.
 
-```text
-$ sowa-pkg upgrade
+This separation is intentional: build ids and archive SHA-256 values can change
+between clean build hosts. Only an upstream-version change or a release-counter
+bump offers an update to installed systems. Forgetting the bump therefore means
+the new build is published for fresh installs but is not an update.
 
-  curl               rebuild 8.21.0-1 (build 3f9c1a04be77)
-```
+New indexes spell the build field `pkgbuild=<digest>`. The prefix is a migration
+detail with a useful property: the earlier client, which treated a bare digest
+as an update identity, sees no digest there and upgrades only the packages whose
+versions changed while the `sowa-release` package installs the new client. The
+current client accepts both tagged and older bare build identities and verifies
+either against the archive metadata.
 
-Bumping the release counter after an unchanged-source rebuild is still worth
-doing — it is the number a person reads, and it is what makes the change visible
-in `sowa-pkg list` — but forgetting it no longer means the rebuild never
-reaches the machines.
-
-That id is computed twice for everything the image ships: once by
+The build id is computed twice for everything the image ships: once by
 `image/10-rootfs`, into the database the image carries, and once by
 `make packages`, into the index. The two have to agree, or a machine installed
-from the image is told on its first `sowa-pkg update` that packages it received
-minutes earlier were built again. Neither side can notice on its own — both are
-internally consistent and the client is right to believe them — so
-`scripts/package.sh` compares them before publishing anything and refuses if
-they differ.
+from the image and the repository made alongside it would record contradictory
+provenance for the same release. `scripts/package.sh` compares them before
+publishing anything and refuses if they differ.
 
 They disagreed once, and the shape of it is worth remembering. `sowa-base` and
 `sowa-release` are described while `image/10-rootfs` is still running, so their
@@ -238,8 +248,10 @@ Republishing is incremental: an archive already present with identical content
 is left alone. The comparison is on content, not on the file name, because the
 build is not yet bit-reproducible - the same version rebuilt can produce a
 different archive, and publishing an index whose SHA-256 did not match the
-served file would make every client refuse the package. Archives the current
-index no longer lists are withdrawn, which `--keep-old` prevents.
+served file would make every client refuse the package. Such an archive gets a
+different build-addressed filename, but it is not an installed-system update
+until its package version is bumped. Archives the current index no longer lists
+are withdrawn, which `--keep-old` prevents.
 
 The index must be signed; `--allow-unsigned` stages it anyway with a warning,
 which is useful while bringing a server up but not something to serve.

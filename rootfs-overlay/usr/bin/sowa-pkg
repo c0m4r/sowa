@@ -460,6 +460,7 @@ release_lock() {
 # reads a log whose last entry is a plan that may or may not have happened.
 on_exit() {
     local status=$?
+    clear_download_progress
     release_lock
     if ((status == 0)); then
         audit "finished"
@@ -583,10 +584,16 @@ read_index_entry() {
                 IDX_SIZE IDX_DEPENDS IDX_LICENSE IDX_COPYRIGHT \
                 build_or_description description <<< "${rest}"
             # pkgbuild was added immediately before the final free-text field.
-            # An older index has its description in that slot; recognising the
-            # digest makes both layouts readable during the client rollout.
+            # Bare digests are the first build-aware layout. New indexes prefix
+            # one with "pkgbuild=" so clients from that generation treat it as
+            # an old-style description instead of reinstalling equal versions;
+            # that lets the version-only policy bootstrap without one last mass
+            # rebuild. This client accepts all three layouts.
             if [[ "${build_or_description}" =~ ^[0-9a-f]{64}$ ]]; then
                 IDX_BUILD="${build_or_description}"
+                IDX_DESCRIPTION="${description}"
+            elif [[ "${build_or_description}" =~ ^pkgbuild=([0-9a-f]{64})$ ]]; then
+                IDX_BUILD="${BASH_REMATCH[1]}"
                 IDX_DESCRIPTION="${description}"
             else
                 IDX_BUILD=""
@@ -598,30 +605,6 @@ read_index_entry() {
         fi
     done < "${INDEX}"
     return 1
-}
-
-# Whether the repository is offering a different build of the version this
-# machine already has.
-#
-# A version is an upstream release and a packaging counter, both written by
-# hand, and neither changes when a package is rebuilt: against a new OpenSSL,
-# after a corrected recipe, with a patch added. Comparing versions alone
-# therefore leaves such a rebuild invisible - the machine sees two equal strings
-# and skips bytes that are not the ones it has. The build id is derived from
-# both the installed bytes and their build provenance, so this asks "is what I
-# have the audited build being published" rather than trusting the label.
-#
-# An offered entry with no build id is from an older repository and is treated
-# as matching. The opposite migration is deliberately different: when the
-# repository has an identity and the installed entry predates it, one rebuild
-# is required to make the system's state knowable and convergent.
-build_differs() {
-    local name="$1"
-    local offered="$2"
-    local installed
-    [[ -n "${offered}" ]] || return 1
-    installed="$(installed_field "${name}" pkgbuild || true)"
-    [[ "${installed}" != "${offered}" ]]
 }
 
 # ---------------------------------------------------------- index validation
@@ -718,7 +701,14 @@ validate_index() {
         license="${fields[7]}"
         copyright="${fields[8]}"
         build="${fields[9]}"
-        [[ "${build}" =~ ${INDEX_HASH_RE} ]] || build=""
+        if [[ "${build}" == pkgbuild=* ]]; then
+            build="${build#pkgbuild=}"
+            [[ "${build}" =~ ${INDEX_HASH_RE} ]] \
+                || die "the repository index has an unusable build identity for ${name}"
+        elif [[ ! "${build}" =~ ${INDEX_HASH_RE} ]]; then
+            # The ten-field layout has its free-text description here.
+            build=""
+        fi
 
         [[ "${name}" =~ ${INDEX_NAME_RE} && ${#name} -le ${INDEX_MAX_FIELD} ]] \
             || die "the repository index has an unusable package name on line ${number}"
@@ -951,16 +941,17 @@ installed_dependents() {
 
 # ------------------------------------------------------------------ fetching
 
-# curl's progress bar only returns the cursor to column zero.  That is enough
-# until a terminal is resized: an old, wider bar is reflowed into several rows
-# and the next redraw leaves its tail behind.  Package archives have an exact
-# size in the signed index, so render their progress here and clear every row
-# occupied by the previous render before drawing at the current terminal width.
-PROGRESS_WIDTH=0
+# Package archives have an exact size in the signed index, so the client can
+# render a useful meter without relying on curl's terminal-dependent progress
+# output. Keep it deliberately narrower than an ordinary terminal: a meter that
+# consumes every column is easy to wrap (and particularly easy to leave behind
+# after a resize), while a compact one has room for the information that matters.
+readonly PROGRESS_MAX_WIDTH=72
+PROGRESS_ACTIVE=0
 
 terminal_columns() {
-    local rows columns
-    if read -r rows columns < <(stty size < /dev/tty 2> /dev/null) \
+    local _rows columns
+    if read -r _rows columns < <(stty size < /dev/tty 2> /dev/null) \
         && [[ "${columns}" =~ ^[0-9]+$ ]] && ((columns > 0)); then
         printf '%s\n' "${columns}"
     elif [[ "${COLUMNS:-}" =~ ^[0-9]+$ ]] && ((COLUMNS > 0)); then
@@ -971,53 +962,170 @@ terminal_columns() {
 }
 
 clear_download_progress() {
-    local columns rows row
-    ((PROGRESS_WIDTH > 0)) || return 0
+    ((PROGRESS_ACTIVE == 1)) || return 0
+    # Erase exactly the line we own. Cursor-up clearing is tempting after a
+    # resize, but terminals disagree about whether existing text is reflowed;
+    # on one that does not reflow it erases an unrelated log line. Capping every
+    # render and reserving the last terminal column prevents ordinary wrapping.
+    printf '\r\033[2K' >&2
+    PROGRESS_ACTIVE=0
+}
 
-    columns="$(terminal_columns)"
-    # A resize can reflow the old line.  Starting on its final row, erase it
-    # and each preceding row so a narrower terminal cannot retain fragments.
-    rows=$(((PROGRESS_WIDTH + columns - 1) / columns))
-    printf '\r\033[K' >&2
-    for ((row = 1; row < rows; row++)); do
-        printf '\033[1A\r\033[K' >&2
-    done
-    PROGRESS_WIDTH=0
+# Milliseconds are precise enough for a transfer rate without running date(1)
+# on every redraw. EPOCHREALTIME is a Bash 5 variable; the fallback keeps this
+# usable when the client is sourced by an older host Bash for recovery work.
+progress_time_ms() {
+    local now="${EPOCHREALTIME:-}"
+    local seconds fraction
+    if [[ "${now}" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+        seconds="${BASH_REMATCH[1]}"
+        fraction="${BASH_REMATCH[2]}000"
+        printf '%s\n' "$((10#${seconds} * 1000 + 10#${fraction:0:3}))"
+    else
+        printf '%s000\n' "$(date +%s)"
+    fi
+}
+
+progress_size_pair() {
+    local current="$1"
+    local total="$2"
+    local divisor unit
+    if ((total >= 1073741824)); then
+        divisor=1073741824
+        unit=GiB
+    elif ((total >= 1048576)); then
+        divisor=1048576
+        unit=MiB
+    elif ((total >= 1024)); then
+        divisor=1024
+        unit=KiB
+    else
+        printf '%s/%s B\n' "${current}" "${total}"
+        return 0
+    fi
+    printf '%s.%s/%s.%s %s\n' \
+        "$((current / divisor))" "$(((current % divisor) * 10 / divisor))" \
+        "$((total / divisor))" "$(((total % divisor) * 10 / divisor))" \
+        "${unit}"
+}
+
+progress_rate_text() {
+    local rate="$1"
+    if ((rate <= 0)); then
+        printf '%s\n' --
+    elif ((rate >= 1073741824)); then
+        printf '%s.%s GiB\n' "$((rate / 1073741824))" \
+            "$(((rate % 1073741824) * 10 / 1073741824))"
+    elif ((rate >= 1048576)); then
+        printf '%s.%s MiB\n' "$((rate / 1048576))" \
+            "$(((rate % 1048576) * 10 / 1048576))"
+    elif ((rate >= 1024)); then
+        printf '%s.%s KiB\n' "$((rate / 1024))" \
+            "$(((rate % 1024) * 10 / 1024))"
+    else
+        printf '%s B\n' "${rate}"
+    fi
+}
+
+progress_eta_text() {
+    local seconds="$1"
+    if ((seconds < 0)); then
+        printf '%s\n' --:--
+    elif ((seconds < 3600)); then
+        printf '%02d:%02d\n' "$((seconds / 60))" "$((seconds % 60))"
+    elif ((seconds < 360000)); then
+        printf '%d:%02d:%02d\n' "$((seconds / 3600))" \
+            "$(((seconds / 60) % 60))" "$((seconds % 60))"
+    else
+        printf '%s\n' 99h+
+    fi
+}
+
+# Pure formatter kept separate from the cursor handling so each narrow layout
+# and the speed/ETA arithmetic can be tested without a terminal or a download.
+download_progress_line() {
+    local current="$1"
+    local total="$2"
+    local elapsed_ms="$3"
+    local columns="$4"
+    local max_width percent rate=0 eta=-1 sizes speed details prefix
+    local bar_width filled pending bar line candidate
+
+    ((total > 0)) || total=1
+    ((current >= 0)) || current=0
+    ((current <= total)) || current="${total}"
+    ((columns > 1)) || columns=2
+    max_width=$((columns - 1))
+    ((max_width <= PROGRESS_MAX_WIDTH)) || max_width="${PROGRESS_MAX_WIDTH}"
+
+    percent=$((current * 100 / total))
+    ((current < total)) || eta=0
+    if ((elapsed_ms > 0 && current > 0)); then
+        rate=$((current * 1000 / elapsed_ms))
+        if ((current < total && rate > 0)); then
+            eta=$(((total - current + rate - 1) / rate))
+        fi
+    fi
+    sizes="$(progress_size_pair "${current}" "${total}")"
+    speed="$(progress_rate_text "${rate}")"
+    details="${sizes}  ${speed}/s  ETA $(progress_eta_text "${eta}")"
+    printf -v prefix '%3d%%' "${percent}"
+
+    # Prefer a modest bar plus all details. As the terminal narrows, preserve
+    # speed and ETA before decoration, and finally preserve the percentage.
+    bar_width=$((max_width - ${#prefix} - ${#details} - 4))
+    if ((bar_width >= 8)); then
+        filled=$((current * bar_width / total))
+        pending=$((bar_width - filled))
+        if ((filled > 0 && current < total)); then
+            printf -v bar '%*s' "$((filled - 1))" ''
+            bar="${bar// /=}>"
+        else
+            printf -v bar '%*s' "${filled}" ''
+            bar="${bar// /=}"
+        fi
+        printf -v candidate '%*s' "${pending}" ''
+        bar+="${candidate// /-}"
+        line="${prefix} [${bar}] ${details}"
+    else
+        candidate="${prefix} ${details}"
+        if ((${#candidate} <= max_width)); then
+            line="${candidate}"
+        else
+            candidate="${prefix} ${speed}/s ETA $(progress_eta_text "${eta}")"
+            if ((${#candidate} <= max_width)); then
+                line="${candidate}"
+            else
+                candidate="${prefix} ETA $(progress_eta_text "${eta}")"
+                if ((${#candidate} <= max_width)); then
+                    line="${candidate}"
+                else
+                    line="${prefix:0:${max_width}}"
+                fi
+            fi
+        fi
+    fi
+    printf '%s\n' "${line}"
 }
 
 render_download_progress() {
     local output="$1"
     local total="$2"
-    local current columns bar_width filled empty full remainder percent tenths
+    local started_ms="$3"
+    local current now elapsed columns line
 
     current="$(stat -c '%s' "${output}" 2> /dev/null || printf 0)"
     [[ "${current}" =~ ^[0-9]+$ ]] || current=0
     ((current <= total)) || current="${total}"
+    now="$(progress_time_ms)"
+    elapsed=$((now - started_ms))
+    ((elapsed >= 0)) || elapsed=0
     columns="$(terminal_columns)"
+    line="$(download_progress_line "${current}" "${total}" "${elapsed}" "${columns}")"
 
     clear_download_progress
-    percent=$((current * 1000 / total))
-    full=$((percent / 10))
-    tenths=$((percent % 10))
-
-    # Keep one spare column: terminals differ on whether a write in the final
-    # column wraps immediately or on the next character.
-    if ((columns < 12)); then
-        printf '\r%6s' "${full}.${tenths}%" >&2
-        PROGRESS_WIDTH=6
-        return 0
-    fi
-
-    # "[", "] ", and the fixed-width percentage take nine columns.
-    bar_width=$((columns - 10))
-    filled=$((current * bar_width / total))
-    remainder=$((bar_width - filled))
-    printf -v empty '%*s' "${filled}" ''
-    empty="${empty// /#}"
-    printf -v remainder '%*s' "${remainder}" ''
-    remainder="${remainder// /-}"
-    printf '\r[%s%s] %6s' "${empty}" "${remainder}" "${full}.${tenths}%" >&2
-    PROGRESS_WIDTH=$((bar_width + 9))
+    printf '\r%s' "${line}" >&2
+    PROGRESS_ACTIVE=1
 }
 
 fetch_with_progress() {
@@ -1025,27 +1133,30 @@ fetch_with_progress() {
     local output="$2"
     local total="$3"
     local error_file="${output}.error"
-    local pid status
+    local pid status started_ms
     local -a options=(--fail --location --retry 3 --silent --show-error --output "${output}")
 
     rm -f "${error_file}"
+    # Do not let a partial file left by an interrupted attempt make the first
+    # sample jump forwards before curl opens and truncates it.
+    : > "${output}"
+    started_ms="$(progress_time_ms)"
     "${CURL}" "${options[@]}" "${url}" 2> "${error_file}" &
     pid=$!
     while kill -0 "${pid}" 2> /dev/null; do
-        render_download_progress "${output}" "${total}"
-        sleep 0.1
+        render_download_progress "${output}" "${total}" "${started_ms}"
+        sleep 0.2
     done
 
     if wait "${pid}"; then
-        render_download_progress "${output}" "${total}"
+        render_download_progress "${output}" "${total}" "${started_ms}"
         printf '\n' >&2
-        PROGRESS_WIDTH=0
+        PROGRESS_ACTIVE=0
         rm -f "${error_file}"
         return 0
     else
         status=$?
         clear_download_progress
-        printf '\n' >&2
         cat "${error_file}" >&2
         rm -f "${error_file}"
         return "${status}"
@@ -1725,7 +1836,7 @@ cmd_update() {
     record_index_serial
     log "${INDEX_COUNT} packages available"
 
-    local name installed upgrades=0 downgrades=0 rebuilds=0
+    local name installed upgrades=0 downgrades=0
     while IFS= read -r name; do
         installed="$(installed_field "${name}" pkgver)" || continue
         read_index_entry "${name}" || continue
@@ -1733,28 +1844,12 @@ cmd_update() {
             upgrades=$((upgrades + 1))
         elif version_is_newer "${IDX_VERSION}" "${installed}"; then
             downgrades=$((downgrades + 1))
-        elif build_differs "${name}" "${IDX_BUILD}"; then
-            rebuilds=$((rebuilds + 1))
         fi
     done < <(installed_names)
     if ((upgrades > 0)); then
         log "${upgrades} installed package(s) are out of date; run '${PROGRAM} upgrade'"
-    elif ((rebuilds == 0)); then
+    else
         log "no installed packages need an upgrade"
-    fi
-    # A package rebuilt at the same version. The repository is publishing bytes
-    # this machine does not have, under a label that says it does, and only the
-    # build id can tell - so it is reported in its own words rather than
-    # counted as an upgrade.
-    #
-    # Said in two lines because one is not enough to be understood. The first
-    # names who has what: a version is not an identity, and the reader has to
-    # be told that the repository's copy of a package they already have is a
-    # different build of it. The second answers the question that follows - the
-    # version will look untouched afterwards, and this is still worth doing.
-    if ((rebuilds > 0)); then
-        log "the repository has a different build of ${rebuilds} installed package(s)"
-        log "the version is the same; run '${PROGRAM} upgrade' to replace them"
     fi
     # Said as a fact about the repository rather than as something about to
     # happen: an upgrade leaves these alone, and going back to an older version
@@ -1822,9 +1917,6 @@ cmd_list() {
                 elif version_is_newer "${IDX_VERSION}" "${installed}"; then
                     printf '%-18s downgrade %s -> %s\n' \
                         "${name}" "${installed}" "${IDX_VERSION}"
-                elif build_differs "${name}" "${IDX_BUILD}"; then
-                    printf '%-18s rebuild %s (build %s)\n' \
-                        "${name}" "${installed}" "${IDX_BUILD:0:12}"
                 fi
             done < <(installed_names)
             ;;
@@ -1837,8 +1929,6 @@ cmd_list() {
                         available="  (${IDX_VERSION} available)"
                     elif version_is_newer "${IDX_VERSION}" "${installed}"; then
                         available="  (${IDX_VERSION} available; downgrade)"
-                    elif build_differs "${name}" "${IDX_BUILD}"; then
-                        available="  (different build available)"
                     fi
                 fi
                 printf '%-18s %s%s\n' "${name}" "${installed}" "${available}"
@@ -1975,8 +2065,8 @@ verify_archive_metadata() {
 
     # Old indexes and archives predate pkgbuild and remain installable. Once a
     # signed index advertises an identity, however, the package metadata must
-    # make the same claim; otherwise installing it would immediately plan the
-    # same rebuild again forever.
+    # make the same claim: this is an integrity/provenance assertion even though
+    # the id is not part of update ordering.
     if [[ -n "${expected_build}" ]]; then
         [[ "${staged_build}" == "${expected_build}" ]] \
             || die "${archive} carries build ${staged_build:-none}, not ${expected_build}"
@@ -2260,11 +2350,6 @@ plan_package() {
             return 0
         fi
         PLAN_ACTION="downgrade ${installed} -> ${IDX_VERSION}"
-    elif build_differs "${name}" "${IDX_BUILD}"; then
-        # The same version, built again. Nothing about the label changed, so
-        # this is the one action a person did not ask for by name and the plan
-        # says so in as many words.
-        PLAN_ACTION="rebuild ${IDX_VERSION} (build ${IDX_BUILD:0:12})"
     elif [[ "${REINSTALL}" == 1 ]] && in_list "${name}" "${NAMED[@]}"; then
         PLAN_ACTION="reinstall ${IDX_VERSION}"
     fi
@@ -2402,8 +2487,7 @@ cmd_upgrade() {
             installed="$(installed_field "${name}" pkgver)" || continue
             read_index_entry "${name}" || continue
             if version_is_newer "${installed}" "${IDX_VERSION}" \
-                || version_is_newer "${IDX_VERSION}" "${installed}" \
-                || build_differs "${name}" "${IDX_BUILD}"; then
+                || version_is_newer "${IDX_VERSION}" "${installed}"; then
                 targets+=("${name}")
             fi
         done < <(installed_names)

@@ -114,7 +114,8 @@ index_field() {
         [[ "${name}" == "${wanted}" ]] || continue
         IFS='|' read -r version _arch _archive _sha256 _size _depends license \
             copyright build_or_description description <<< "${rest}"
-        if [[ ! "${build_or_description}" =~ ^[0-9a-f]{64}$ ]]; then
+        if [[ ! "${build_or_description}" =~ ^[0-9a-f]{64}$ \
+            && ! "${build_or_description}" =~ ^pkgbuild=[0-9a-f]{64}$ ]]; then
             description="${build_or_description}${description:+|${description}}"
         fi
         case "${field}" in

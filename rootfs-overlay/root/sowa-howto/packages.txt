@@ -24,16 +24,16 @@ made of before it has ever reached the repository:
     sowa-pkg info bash             # version, size, where it came from
     sowa-pkg verify                # every file, against its recorded SHA-256
 
-A version says which release a package is; it does not say which build. The
-same upstream version rebuilt against a new OpenSSL has different provenance
-under the same label, so every package also carries a build id derived from its
-contents, recipe, toolchain and dependency identities, and sowa-pkg compares
-that as well:
+A package version is the upstream version plus Sowa's release counter. That is
+the update contract: sowa-pkg upgrades only to a higher version. A recipe,
+patch, dependency or unchanged-source rebuild meant for installed machines
+therefore needs that package's release counter bumped.
 
-    curl               rebuild 8.21.0-1 (3f9c1a04be77)
-
-That is what makes "sowa-pkg upgrade" converge this machine onto what the
-repository is actually publishing, rather than onto what it says it is.
+Every package also carries a build id derived from its contents, recipe,
+toolchain and dependency identities. It keeps archives and caches unambiguous
+and is checked against the signed index, but a different build id at the same
+version does not cause an update. Use --reinstall when replacing an equal
+version is deliberate.
 
 Everything that changes something is recorded in /var/log/sowa-pkg.log: what
 was asked for, the plan, each package that went in or came out with its version

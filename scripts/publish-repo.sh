@@ -104,15 +104,17 @@ unchanged=0
 # The build id is part of every archive name, so an existing name is immutable:
 # different bytes there mean either a broken build identity or a reproducibility
 # defect and publication stops instead of changing what a signed old index
-# means. A new build at the same human version gets a new name and remains
-# visible to both caches and clients.
-declare -A previous_build=()
+# means. A new build at the same package version gets a new name for caches and
+# verification, but installed systems still compare the version alone.
+declare -A previous_build=() previous_version=()
 if [[ -f "${TARGET}/index" ]]; then
-    while IFS='|' read -r name _version _arch _archive _sha _size _depends \
+    while IFS='|' read -r name version _arch _archive _sha _size _depends \
         _license _copyright build _rest; do
         [[ -z "${name}" || "${name}" == \#* ]] && continue
+        build="${build#pkgbuild=}"
         [[ "${build}" =~ ^[0-9a-f]{64}$ ]] || build=""
         previous_build["${name}"]="${build}"
+        previous_version["${name}"]="${version}"
     done < "${TARGET}/index"
 fi
 
@@ -128,7 +130,8 @@ if published_serial="$(index_serial "${TARGET}/index")"; then
         || die "this index is older than the one already published (serial ${new_serial} against ${published_serial}); rebuild it, or set REPO_INDEX_SERIAL if this is deliberate"
 fi
 
-rebuilt=0
+same_version_rebuilds=0
+version_updates=0
 for archive in "${assets[@]}"; do
     show_progress "${archive}"
     if [[ -f "${TARGET}/${archive}" ]]; then
@@ -145,10 +148,14 @@ done
 while IFS='|' read -r name version _arch _archive _sha _size _depends \
     _license _copyright build _rest; do
     [[ -z "${name}" || "${name}" == \#* ]] && continue
+    build="${build#pkgbuild=}"
     was="${previous_build[${name}]:-}"
     if [[ -n "${was}" && "${was}" != "${build}" ]]; then
-        log "${name} ${version} is a new build (${was:0:12} -> ${build:0:12})"
-        rebuilt=$((rebuilt + 1))
+        if [[ "${previous_version[${name}]:-}" == "${version}" ]]; then
+            same_version_rebuilds=$((same_version_rebuilds + 1))
+        else
+            version_updates=$((version_updates + 1))
+        fi
     fi
 done < "${INDEX}"
 
@@ -179,8 +186,12 @@ fi
 log "published ${#assets[@]} packages to ${TARGET}"
 log "index serial ${new_serial}, $(sed -n 's/^# sowa-repo .*valid-until=\([^ ]*\).*/valid until \1/p' "${INDEX}" | head -1)"
 log "${copied} written, ${unchanged} already current, ${removed} withdrawn"
-if ((rebuilt > 0)); then
-    log "${rebuilt} package(s) have a new build id; installed systems will take them"
+if ((version_updates > 0)); then
+    log "${version_updates} installed package update(s) have a new version"
+fi
+if ((same_version_rebuilds > 0)); then
+    log "${same_version_rebuilds} archive build(s) changed at the same package version; installed systems will keep their current build"
+    log "bump each package's release in config/packages.conf when its rebuild should be an update"
 fi
 log "total $(du -sh "${TARGET}" | cut -f1)"
 log ""
