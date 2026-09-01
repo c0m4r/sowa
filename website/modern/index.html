@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sowa Linux</title>
+<meta name="description" content="Sowa is a small, inspectable x86_64 Linux system built from pinned upstream sources: its own SysV-style init, a signed package repository, live ISO, and disk images.">
+<meta name="color-scheme" content="dark light">
+<meta property="og:title" content="Sowa Linux">
+<meta property="og:description" content="A small, inspectable x86_64 Linux system built from source.">
+<meta property="og:type" content="website">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-head">
+  <div class="wrap head-inner">
+    <a class="brand" href="#top" aria-label="Sowa Linux, home">
+      <svg class="mark" viewBox="0 0 64 64" role="img" aria-hidden="true" focusable="false">
+        <defs>
+          <linearGradient id="owl" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#6bbf59"/>
+            <stop offset="1" stop-color="#3f8fbf"/>
+          </linearGradient>
+        </defs>
+        <path d="M32 3 51 11q6 13 4 27Q52 57 32 61 12 57 9 38Q7 24 13 11Z" fill="url(#owl)"/>
+        <circle cx="23" cy="27" r="9.5" fill="#f2f7f5"/>
+        <circle cx="41" cy="27" r="9.5" fill="#f2f7f5"/>
+        <circle cx="23" cy="27" r="5" fill="#e8942e"/>
+        <circle cx="41" cy="27" r="5" fill="#e8942e"/>
+        <circle cx="23" cy="27" r="2.4" fill="#10242c"/>
+        <circle cx="41" cy="27" r="2.4" fill="#10242c"/>
+        <path d="M32 33 36.5 42h-9Z" fill="#e8942e"/>
+      </svg>
+      <span class="brand-text">sowa<span class="brand-dim">linux</span></span>
+    </a>
+
+    <nav class="nav" aria-label="Primary">
+      <a href="#download">Download</a>
+      <a href="#system">System</a>
+      <a href="#build">Build</a>
+      <a href="#packages">Packages</a>
+      <a href="#docs">Docs</a>
+      <a href="https://github.com/c0m4r/sowa">Source</a>
+    </nav>
+
+    <button class="theme" type="button" id="theme-toggle" aria-label="Switch colour theme">
+      <span aria-hidden="true" data-theme-icon>◐</span>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="hero" id="top">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <p class="eyebrow">Release 0.1 &middot; x86_64 &middot; experimental</p>
+        <h1>A Linux system small enough to read.</h1>
+        <p class="lede">
+          Sowa builds an x86_64 cross toolchain, kernel, userspace, live ISO,
+          installable disk images and a signed binary package repository from
+          checksum-pinned upstream sources &mdash; without installing a single
+          file into the host it was built on.
+        </p>
+        <p class="cta-row">
+          <a class="btn btn-primary" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.iso">Download the live ISO</a>
+          <a class="btn" href="#download">All downloads</a>
+        </p>
+        <p class="hero-note">
+          Built for servers and headless machines. No desktop, no systemd,
+          no compatibility promises.
+        </p>
+      </div>
+
+      <div class="term" role="img" aria-label="Terminal session showing a Sowa install and package query">
+        <div class="term-bar"><span></span><span></span><span></span><em>root@sowa:~</em></div>
+<pre class="term-body"><code><span class="p">root@sowa</span>:<span class="d">~</span># sowa-setup
+<span class="c">... partitions the disk, installs GRUB for BIOS and UEFI</span>
+
+<span class="p">root@sowa</span>:<span class="d">~</span># sowa-pkg install nginx
+<span class="c">... verified against the signed repository</span>
+
+<span class="p">root@sowa</span>:<span class="d">~</span># cc hello.c -o hello &amp;&amp; ./hello
+hello from a system that can rebuild itself</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="strip" aria-label="Release facts">
+    <div class="wrap facts">
+      <div class="fact"><dt>Release</dt><dd>0.1</dd></div>
+      <div class="fact"><dt>Target</dt><dd>x86_64-sowa-linux-gnu</dd></div>
+      <div class="fact"><dt>Kernel</dt><dd>Linux 6.18.44</dd></div>
+      <div class="fact"><dt>libc</dt><dd>glibc 2.44</dd></div>
+      <div class="fact"><dt>Compiler</dt><dd>GCC 16.2.0</dd></div>
+      <div class="fact"><dt>Init</dt><dd>sowa-init</dd></div>
+      <div class="fact"><dt>Boot</dt><dd>BIOS &amp; UEFI</dd></div>
+      <div class="fact"><dt>Licence</dt><dd>GPL-3.0-or-later</dd></div>
+    </div>
+  </section>
+
+  <section id="system" class="band">
+    <div class="wrap">
+      <h2>What you actually get</h2>
+      <p class="section-lede">
+        Every component has a build stage, a package record and a file manifest.
+        Nothing arrives by autodetection, and nothing is copied in from the host.
+      </p>
+
+      <div class="cards">
+        <article class="card">
+          <h3>Its own init</h3>
+          <p>
+            <code>sowa-init</code> is a System V-style init and service framework
+            written for this system: <code>rc.d</code> scripts, a service command,
+            and an <code>rc.sysinit</code> that serves both the live medium and an
+            installed disk.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Signed packages</h3>
+          <p>
+            <code>sowa-pkg</code> installs from a self-hosted repository whose
+            metadata is signed. The release key that covers boot media is
+            deliberately separate from the online repository key.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Declarative networking</h3>
+          <p>
+            <code>nic</code> configures interfaces and firewall from
+            <code>/etc/nic.conf</code> over iproute2 and iptables. The default
+            drops inbound traffic and permits only ICMP and SSH.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Key-only root</h3>
+          <p>
+            OpenSSH is enabled out of the box, root login is strictly key-based,
+            and the root account ships with no password. Remote access stays
+            closed until you install a key.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Self-hosting toolchain</h3>
+          <p>
+            binutils and GCC are built a second time to run <em>on</em> Sowa, so
+            the installed image compiles C and C++ &mdash; headers, static
+            libraries, make, m4, autoconf and pkg-config included.
+          </p>
+        </article>
+        <article class="card">
+          <h3>A one-megabyte early boot</h3>
+          <p>
+            The live initramfs holds a single static program, <code>liveinit</code>,
+            which finds the medium, loop-mounts the squashfs, overlays a tmpfs and
+            <code>switch_root</code>s. There is no shell in it on purpose.
+          </p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section id="download" class="band alt">
+    <div class="wrap">
+      <h2>Download</h2>
+      <p class="section-lede">
+        Release 0.1 for x86_64, served from
+        <a href="https://sowa.wolfet.pl/">sowa.wolfet.pl</a>. Fetch the matching
+        <code>.sha256</code> where one is published, and verify the signed release
+        manifest for provenance &mdash; a mirror that can replace an image can
+        replace the checksum beside it.
+      </p>
+
+      <div class="dl-list">
+        <a class="dl" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.iso">
+          <span class="dl-kind">ISO</span>
+          <span class="dl-name">sowa-0.1-x86_64.iso</span>
+          <span class="dl-desc">Live medium. isohybrid, boots from optical or USB, on BIOS and UEFI. Run <code>sowa-setup</code> to install.</span>
+        </a>
+        <a class="dl" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.img.xz">
+          <span class="dl-kind">RAW</span>
+          <span class="dl-name">sowa-0.1-x86_64.img.xz</span>
+          <span class="dl-desc">Prebuilt partitioned disk. Write it with <code>dd</code> and boot &mdash; no installation step.</span>
+        </a>
+        <a class="dl" href="https://sowa.wolfet.pl/sowa-0.1-x86_64.qcow2.xz">
+          <span class="dl-kind">QCOW2</span>
+          <span class="dl-name">sowa-0.1-x86_64.qcow2.xz</span>
+          <span class="dl-desc">The same disk in QEMU's native format, for hypervisors that take one.</span>
+        </a>
+        <a class="dl" href="https://sowa.wolfet.pl/sowa-0.1-x86_64-rootfs.tar.xz">
+          <span class="dl-kind">ROOTFS</span>
+          <span class="dl-name">sowa-0.1-x86_64-rootfs.tar.xz</span>
+          <span class="dl-desc">The assembled root filesystem, for chroot, container and bootstrap workflows.</span>
+        </a>
+        <a class="dl" href="https://sowa.wolfet.pl/sowa-install">
+          <span class="dl-kind">INSTALLER</span>
+          <span class="dl-name">sowa-install</span>
+          <span class="dl-desc">The installers packed into one portable script, to be paired with the rootfs tarball.</span>
+        </a>
+      </div>
+
+      <div class="quickstart">
+        <h3>Try it in QEMU first</h3>
+        <div class="code" data-copy>
+<pre><code>make run-iso
+make disk-image run-disk-image</code></pre>
+        </div>
+        <p class="fine">Exit a headless QEMU session with <kbd>Ctrl-a</kbd> <kbd>x</kbd>. The live image starts on a passwordless root console.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="build" class="band">
+    <div class="wrap">
+      <h2>Or build the whole thing yourself</h2>
+      <p class="section-lede">
+        On a prepared x86_64 Linux host. Sources are pinned in
+        <code>config/sources.lock</code> and verified by SHA-256 whether the
+        primary URL or a mirror answers. The update check reports newer upstream
+        releases; it never rewrites the pins.
+      </p>
+
+      <div class="build-grid">
+        <div class="code" data-copy>
+<pre><code>make check
+make check-updates
+make fetch
+make all</code></pre>
+        </div>
+
+        <div class="chain">
+          <h3>The bootstrap chain is explicit</h3>
+<pre><code>cross binutils
+  -&gt; bootstrap GCC (C only, no libc)
+  -&gt; Linux UAPI headers
+  -&gt; glibc headers and start files
+  -&gt; target libgcc
+  -&gt; complete glibc
+  -&gt; final GCC (C and C++)
+  -&gt; Bash, ncurses, OpenSSL, zlib, curl, Python
+  -&gt; e2fsprogs, dosfstools, GRUB
+  -&gt; native binutils -&gt; native GCC
+  -&gt; kernel and sowa-init
+  -&gt; root filesystem
+  -&gt; squashfs + liveinit initramfs
+  -&gt; bootable ISO</code></pre>
+        </div>
+      </div>
+
+      <p class="fine">
+        A containerised build environment is available too:
+        <code>docker/sowa-env.sh run make all</code>. Outputs land in
+        <code>artifacts/</code>; <code>JOBS</code>, <code>WORK_DIR</code>,
+        <code>DOWNLOAD_DIR</code> and <code>ARTIFACT_DIR</code> control
+        parallelism and placement.
+      </p>
+    </div>
+  </section>
+
+  <section id="packages" class="band alt">
+    <div class="wrap">
+      <h2>Packages</h2>
+      <p class="section-lede">
+        The base image is a terminal-oriented administration and development
+        system: Bash, coreutils, Vim and nano, OpenSSL and curl, Git, Python and
+        Perl, iproute2 and iptables, OpenSSH, WireGuard and OpenVPN, BIND tools,
+        chrony, cron, syslog-ng, filesystem and boot tooling, and the native
+        C/C++ toolchain. Each is packaged separately, and the rootfs build
+        rejects any file without exactly one owner.
+      </p>
+
+      <h3 class="sub">Built, published, installed on request</h3>
+      <ul class="chips">
+        <li>docker</li>
+        <li>guix</li>
+        <li>nginx</li>
+        <li>haproxy</li>
+        <li>nmap</li>
+        <li>7zip</li>
+        <li>sowa-monitor</li>
+      </ul>
+
+      <div class="code" data-copy>
+<pre><code>sowa-pkg update
+sowa-pkg list --available
+sowa-pkg install nginx</code></pre>
+      </div>
+
+      <p class="fine">
+        Distribution is hybrid on purpose: some software ships as binaries built
+        from source through <code>sowa-pkg</code>, while others &mdash; Ollama,
+        Node.js, Go, Rust &mdash; use installers that pull straight from the
+        upstream vendor. Services from optional packages stay disabled until you
+        enable them.
+      </p>
+    </div>
+  </section>
+
+  <section id="docs" class="band">
+    <div class="wrap">
+      <h2>Documentation</h2>
+      <p class="section-lede">
+        The repository documentation covers the complete build and system. A
+        booted machine also carries manual pages and short guides under
+        <code>/root/sowa-howto/</code>.
+      </p>
+      <div class="doc-grid">
+        <a class="doc" href="https://github.com/c0m4r/sowa/blob/main/docs/building.md"><b>Building Sowa</b><span>Prerequisites, targets, artifacts, QEMU</span></a>
+        <a class="doc" href="https://github.com/c0m4r/sowa/blob/main/docs/architecture.md"><b>Bootstrap architecture</b><span>Toolchain, stages, trust, reproducibility</span></a>
+        <a class="doc" href="https://github.com/c0m4r/sowa/blob/main/docs/install.md"><b>Installing to disk</b><span>Guided, bootstrap, chroot, container</span></a>
+        <a class="doc" href="https://github.com/c0m4r/sowa/blob/main/docs/iso.md"><b>Live medium</b><span>ISO layout, boot process, kernel parameters</span></a>
+        <a class="doc" href="https://github.com/c0m4r/sowa/blob/main/docs/packages.md"><b>Packages and updates</b><span>Ownership model and repository behaviour</span></a>
+        <a class="doc" href="https://github.com/c0m4r/sowa/blob/main/docs/init.md"><b>Init and services</b><span>The rc framework and service lifecycle</span></a>
+        <a class="doc" href="https://github.com/c0m4r/sowa/blob/main/docs/networking.md"><b>Networking</b><span>nic, addresses, and the default firewall</span></a>
+        <a class="doc" href="https://github.com/c0m4r/sowa/blob/main/docs/releases.md"><b>Release authenticity</b><span>Signed manifests and key separation</span></a>
+        <a class="doc" href="https://github.com/c0m4r/sowa/tree/main/docs"><b>Full index</b><span>Every guide, in one page</span></a>
+      </div>
+    </div>
+  </section>
+
+  <section class="band honest">
+    <div class="wrap">
+      <div class="honest-inner">
+        <h2>Read this before you deploy it</h2>
+        <p>
+          Sowa is experimental and comes with no warranty. There is no fixed
+          release cycle, no update model and no backward-compatibility promise;
+          patches land on a best-effort basis. If you want a polished desktop or
+          a supported server platform, this is not it.
+        </p>
+        <p>
+          If you miss small Unix-like systems, want to see what every part of a
+          machine is doing, and are willing to be on your own &mdash; you are in
+          the right place.
+        </p>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-foot">
+  <div class="wrap foot-inner">
+    <p>
+      <strong>Sowa Linux</strong> &mdash; Sowa's own code is licensed
+      <a href="https://github.com/c0m4r/sowa/blob/main/LICENSE">GPL-3.0-or-later</a>.
+      Third-party components retain their own licences.
+    </p>
+    <p class="foot-links">
+      <a href="https://github.com/c0m4r/sowa">Source code</a>
+      <a href="https://github.com/c0m4r/sowa/tree/main/docs">Documentation</a>
+      <a href="https://github.com/c0m4r/sowa/issues">Issues</a>
+    </p>
+    <p class="fine">
+      Linux&reg; is the registered trademark of Linus Torvalds in the U.S. and
+      other countries.
+    </p>
+  </div>
+</footer>
+
+<script src="site.js"></script>
+</body>
+</html>

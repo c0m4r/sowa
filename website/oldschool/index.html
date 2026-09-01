@@ -4,8 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Sowa Linux — a small, inspectable Linux system built from source.">
+  <meta name="color-scheme" content="light dark">
+  <meta id="theme-color" name="theme-color" content="#f6f3e8">
   <title>Sowa Linux 0.1</title>
   <link rel="icon" href="data:,">
+  <script src="site.js"></script>
   <link rel="stylesheet" href="site.css">
 </head>
 <body>
@@ -13,10 +16,10 @@
 
   <header id="top">
     <pre class="owl" aria-hidden="true">
-       ___
-      (o,o)
-      {`"'}
-      -"-"-
+ ___
+(o,o)
+{`"'}
+-"-"-
     </pre>
 
     <pre class="wordmark" aria-label="Sowa Linux">
@@ -36,6 +39,16 @@
       [ <a href="https://github.com/c0m4r/sowa">SOURCE CODE</a> ]
       [ <a href="https://github.com/c0m4r/sowa/tree/main/docs">MANUAL</a> ]
     </p>
+
+    <div class="theme-control">
+      <label for="theme-select">[ THEME:</label>
+      <select id="theme-select" name="theme">
+        <option value="system">SYSTEM</option>
+        <option value="light">LIGHT</option>
+        <option value="dark">DARK</option>
+      </select>
+      <span aria-hidden="true">]</span>
+    </div>
   </header>
 
   <div class="ascii-rule" aria-hidden="true">================================================================================</div>
@@ -225,7 +238,7 @@ LAST UPDATED   : 29 August 2026
       [ <a href="https://sowa.wolfet.pl/">FILE MIRROR</a> ]
     </p>
     <p>Sowa Linux 0.1 / GPL-3.0-or-later / Linux is a registered trademark of Linus Torvalds.</p>
-    <p>This page contains 0 images, 0 cookies, 0 trackers, and 0 JavaScript.</p>
+    <p>This page contains 0 images, 0 cookies, and 0 trackers. JavaScript stores only your theme choice.</p>
     <p>Best viewed with any browser that can display plain text.</p>
     <pre aria-hidden="true">[EOF]</pre>
   </footer>
