@@ -5,13 +5,20 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import gzip
 import json
 import os
 import re
 import sys
+import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass
+import xml.etree.ElementTree as ET
+import zlib
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +48,33 @@ class Result:
     status: str
     release_page: str
     detail: str = ""
+
+
+@dataclass
+class NetworkStats:
+    requests: int = 0
+    wire_bytes: int = 0
+    uncompressed_bytes: int = 0
+    domain_requests: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    domain_wire: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def record(self, url: str, wire: int, uncompressed: int) -> None:
+        domain = urllib.parse.urlparse(url).netloc
+        with self.lock:
+            self.requests += 1
+            self.wire_bytes += wire
+            self.uncompressed_bytes += uncompressed
+            self.domain_requests[domain] += 1
+            self.domain_wire[domain] += wire
+
+
+def format_bytes(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KiB"
+    return f"{size / (1024 * 1024):.2f} MiB"
 
 
 def read_table(path: Path, fields: int) -> list[list[str]]:
@@ -79,15 +113,58 @@ def extract_version(match: re.Match[str]) -> str:
         return match.group(0)
 
 
-def request(url: str, timeout: float, github_token: str | None = None) -> bytes:
-    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+def request(
+    url: str,
+    timeout: float,
+    github_token: str | None = None,
+    stats: NetworkStats | None = None,
+) -> bytes:
+    headers = {
+        "Accept": "application/json, text/html, application/xml, */*",
+        "Accept-Encoding": "gzip, deflate",
+        "User-Agent": USER_AGENT,
+    }
     if github_token:
         headers["Authorization"] = f"Bearer {github_token}"
         headers["X-GitHub-Api-Version"] = "2022-11-28"
-    with urllib.request.urlopen(  # noqa: S310 - locations are repository data
-        urllib.request.Request(url, headers=headers), timeout=timeout
-    ) as response:
-        return response.read()
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
+            content = response.read()
+            encoding = response.headers.get("Content-Encoding", "").lower()
+            if encoding == "gzip" or content[:2] == b"\x1f\x8b":
+                decompressed = gzip.decompress(content)
+            elif encoding == "deflate":
+                decompressed = zlib.decompress(content)
+            else:
+                decompressed = content
+            if stats is not None:
+                stats.record(url, len(content), len(decompressed))
+            return decompressed
+    except urllib.error.HTTPError as error:
+        if stats is not None:
+            body = error.read() if hasattr(error, "read") else b""
+            stats.record(url, len(body), len(body))
+        raise
+
+
+def check_github_atom(
+    upstream: Upstream, timeout: float, stats: NetworkStats | None = None
+) -> list[str]:
+    feed_type = "releases" if upstream.method == "github-release" else "tags"
+    url = f"https://github.com/{upstream.location}/{feed_type}.atom"
+    content = request(url, timeout, stats=stats)
+    root = ET.fromstring(content)
+    ns = "{http://www.w3.org/2005/Atom}"
+    tags: list[str] = []
+    for entry in root.findall(f"{ns}entry"):
+        link = entry.find(f"{ns}link")
+        if link is not None:
+            href = link.attrib.get("href", "")
+            if f"/{feed_type}/" in href or "/tag/" in href:
+                tag = urllib.parse.unquote(href.split("/")[-1])
+                tags.append(tag)
+    return tags
 
 
 def newest(values: list[str], name: str) -> str:
@@ -102,36 +179,64 @@ def check_one(
     current: str,
     timeout: float,
     github_token: str | None,
+    stats: NetworkStats | None = None,
 ) -> str:
     if upstream.method == "bash":
-        body = request(upstream.location, timeout).decode("utf-8", "replace")
+        body = request(upstream.location, timeout, stats=stats).decode("utf-8", "replace")
         series = newest(
             re.findall(r"bash-([0-9]+[.][0-9]+)[.]tar[.]gz", body), upstream.name
         )
         patch_url = f"{upstream.location.rstrip('/')}/bash-{series}-patches/"
-        patch_body = request(patch_url, timeout).decode("utf-8", "replace")
+        patch_body = request(patch_url, timeout, stats=stats).decode("utf-8", "replace")
         compact_series = series.replace(".", "")
         patches = re.findall(rf"bash{re.escape(compact_series)}-([0-9]{{3}})", patch_body)
         return f"{series}.{max((int(patch) for patch in patches), default=0)}"
 
+    if upstream.method == "kernel-longterm":
+        data = json.loads(request(upstream.location, timeout, stats=stats))
+        releases = data.get("releases", [])
+        longterm_versions = [
+            rel["version"]
+            for rel in releases
+            if rel.get("moniker") == "longterm" and not rel.get("iseol", False)
+        ]
+        if upstream.pattern != "-":
+            matcher = re.compile(upstream.pattern)
+            longterm_versions = [
+                extract_version(m)
+                for v in longterm_versions
+                if (m := matcher.search(v))
+            ]
+        return newest(longterm_versions, upstream.name)
+
     matcher = re.compile(upstream.pattern)
     if upstream.method == "html":
-        body = request(upstream.location, timeout).decode("utf-8", "replace")
+        body = request(upstream.location, timeout, stats=stats).decode("utf-8", "replace")
         return newest([extract_version(match) for match in matcher.finditer(body)], upstream.name)
 
     if upstream.method in {"github-release", "github-tag"}:
-        if upstream.method == "github-release":
-            endpoint = f"https://api.github.com/repos/{upstream.location}/releases?per_page=100"
-            records = json.loads(request(endpoint, timeout, github_token))
-            tags = [
-                record["tag_name"]
-                for record in records
-                if not record.get("draft") and not record.get("prerelease")
-            ]
-        else:
-            endpoint = f"https://api.github.com/repos/{upstream.location}/tags?per_page=100"
-            records = json.loads(request(endpoint, timeout, github_token))
-            tags = [record["name"] for record in records]
+        tags: list[str] = []
+        try:
+            if upstream.method == "github-release":
+                endpoint = f"https://api.github.com/repos/{upstream.location}/releases?per_page=100"
+                records = json.loads(request(endpoint, timeout, github_token, stats=stats))
+                tags = [
+                    record["tag_name"]
+                    for record in records
+                    if not record.get("draft") and not record.get("prerelease")
+                ]
+            else:
+                endpoint = f"https://api.github.com/repos/{upstream.location}/tags?per_page=100"
+                records = json.loads(request(endpoint, timeout, github_token, stats=stats))
+                tags = [record["name"] for record in records]
+        except (urllib.error.HTTPError, urllib.error.URLError) as error:
+            # When GitHub rate limits unauthenticated API requests (HTTP 403 / 429),
+            # fall back to the public Atom feed which requires no authentication.
+            try:
+                tags = check_github_atom(upstream, timeout, stats=stats)
+            except Exception:
+                raise error from None
+
         return newest(
             [extract_version(match) for tag in tags if (match := matcher.fullmatch(tag))],
             upstream.name,
@@ -146,6 +251,12 @@ def classify(current: str, latest: str) -> str:
     if version_key(current) < version_key(latest):
         return "OUTDATED"
     return "ahead"
+
+
+def set_term_title(title: str) -> None:
+    if sys.stderr.isatty() and os.environ.get("TERM", "") not in {"", "dumb"}:
+        sys.stderr.write(f"\033]0;{title}\007")
+        sys.stderr.flush()
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -174,11 +285,41 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="exit with status 1 if a newer release is found",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="print detailed progress for each upstream check",
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="suppress progress messages on stderr",
+    )
+    parser.add_argument(
+        "--outdated",
+        action="store_true",
+        help="display only outdated sources",
+    )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="display network request count and bandwidth statistics on stderr",
+    )
     return parser.parse_args()
 
 
 def validate_metadata(locked: dict[str, str], upstreams: dict[str, Upstream]) -> None:
-    methods = {"alias", "bash", "github-release", "github-tag", "html", "manual"}
+    methods = {
+        "alias",
+        "bash",
+        "github-release",
+        "github-tag",
+        "html",
+        "kernel-longterm",
+        "manual",
+    }
     missing = sorted(set(locked) - set(upstreams))
     extra = sorted(set(upstreams) - set(locked))
     if missing:
@@ -206,6 +347,19 @@ def validate_metadata(locked: dict[str, str], upstreams: dict[str, Upstream]) ->
         elif upstream.method == "bash":
             if not upstream.location.startswith("https://") or upstream.pattern != "-":
                 raise ValueError(f"{upstream.name}: invalid bash release check")
+            automated += 1
+        elif upstream.method == "kernel-longterm":
+            if not upstream.location.startswith("https://"):
+                raise ValueError(f"{upstream.name}: check location must use HTTPS")
+            if upstream.pattern != "-":
+                try:
+                    matcher = re.compile(upstream.pattern)
+                except re.error as error:
+                    raise ValueError(f"{upstream.name}: invalid version pattern: {error}") from error
+                if "version" not in matcher.groupindex and matcher.groups != 1:
+                    raise ValueError(
+                        f"{upstream.name}: pattern needs one capture or a named version group"
+                    )
             automated += 1
         else:
             if upstream.method.startswith("github-"):
@@ -238,6 +392,7 @@ def main() -> int:
     if args.timeout <= 0:
         raise ValueError("--timeout must be greater than zero")
 
+    start_time = time.monotonic()
     locked = {row[0]: row[1] for row in read_table(LOCK_FILE, 6)}
     metadata_rows = read_table(UPSTREAMS_FILE, 5)
     all_upstreams: dict[str, Upstream] = {}
@@ -274,6 +429,10 @@ def main() -> int:
     results: dict[str, Result] = {}
     pending: dict[concurrent.futures.Future[str], Upstream] = {}
     github_token = os.environ.get("GITHUB_TOKEN")
+    stats = NetworkStats() if args.stats else None
+    show_progress = not args.quiet and not (args.json and sys.stdout.isatty())
+    interactive = sys.stderr.isatty() and show_progress and not args.verbose
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
         for upstream in upstreams.values():
             current = locked[upstream.name]
@@ -288,24 +447,40 @@ def main() -> int:
                 )
             elif upstream.method != "alias":
                 future = executor.submit(
-                    check_one, upstream, current, args.timeout, github_token
+                    check_one,
+                    upstream,
+                    current,
+                    args.timeout,
+                    github_token,
+                    stats,
                 )
                 pending[future] = upstream
 
+        total_pending = len(pending)
+        if show_progress:
+            sys.stderr.write(
+                f"==> checking {len(upstreams)} upstream sources ({args.jobs} workers)...\n"
+            )
+            sys.stderr.flush()
+            set_term_title(f"sowa check-updates: starting (0/{total_pending})")
+
+        completed = 0
         for future in concurrent.futures.as_completed(pending):
+            completed += 1
             upstream = pending[future]
             current = locked[upstream.name]
             try:
                 latest = future.result()
-                results[upstream.name] = Result(
+                res = Result(
                     upstream.name,
                     current,
                     latest,
                     classify(current, latest),
                     upstream.release_page,
                 )
+                results[upstream.name] = res
             except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
-                results[upstream.name] = Result(
+                res = Result(
                     upstream.name,
                     current,
                     "-",
@@ -313,6 +488,61 @@ def main() -> int:
                     upstream.release_page,
                     str(error),
                 )
+                results[upstream.name] = res
+
+            if show_progress:
+                set_term_title(f"sowa check-updates: [{completed}/{total_pending}] {res.name}")
+                if args.verbose:
+                    detail_str = f" ({res.detail})" if res.detail else ""
+                    sys.stderr.write(
+                        f"  [{completed:3d}/{total_pending:3d}] {res.name}: {res.latest} [{res.status}]{detail_str}\n"
+                    )
+                    sys.stderr.flush()
+                elif interactive:
+                    status_desc = f"{res.latest} ({res.status})" if res.latest != "-" else res.status
+                    msg = f"\r[{completed:3d}/{total_pending:3d}] checked {res.name}: {status_desc}"
+                    sys.stderr.write(f"{msg:<78}\033[K")
+                    sys.stderr.flush()
+                elif completed % 25 == 0 or completed == total_pending:
+                    sys.stderr.write(f"==> checked {completed}/{total_pending} sources...\n")
+                    sys.stderr.flush()
+
+        if show_progress:
+            elapsed = time.monotonic() - start_time
+            set_term_title("sowa check-updates: done")
+            if interactive:
+                sys.stderr.write(f"\r==> checked {total_pending} sources in {elapsed:.1f}s\033[K\n")
+                sys.stderr.flush()
+            elif not args.verbose:
+                sys.stderr.write(f"==> completed check of {total_pending} sources in {elapsed:.1f}s\n")
+                sys.stderr.flush()
+
+        if args.stats and stats is not None:
+            savings_pct = (
+                (1.0 - stats.wire_bytes / stats.uncompressed_bytes) * 100.0
+                if stats.uncompressed_bytes > 0
+                else 0.0
+            )
+            avg_wire = stats.wire_bytes / stats.requests if stats.requests > 0 else 0
+            sys.stderr.write(
+                f"==> network statistics:\n"
+                f"    requests:            {stats.requests}\n"
+                f"    wire transferred:    {format_bytes(stats.wire_bytes)} ({stats.wire_bytes:,} bytes)\n"
+                f"    uncompressed data:   {format_bytes(stats.uncompressed_bytes)} ({stats.uncompressed_bytes:,} bytes)\n"
+                f"    compression savings: {savings_pct:.1f}%\n"
+                f"    average per request: {format_bytes(int(avg_wire))}\n"
+            )
+            if args.verbose and stats.domain_wire:
+                sys.stderr.write("    top domains by traffic:\n")
+                sorted_domains = sorted(
+                    stats.domain_wire.items(), key=lambda item: item[1], reverse=True
+                )
+                for domain, wire in sorted_domains[:5]:
+                    req_count = stats.domain_requests[domain]
+                    sys.stderr.write(
+                        f"      {domain:<20} {req_count:2d} reqs, {format_bytes(wire)}\n"
+                    )
+            sys.stderr.flush()
 
     # Aliases are sources released in lockstep with another row (for example,
     # Git's source and manpage archives). Resolve them after network checks so
@@ -356,9 +586,14 @@ def main() -> int:
             break
 
     ordered = [results[name] for name in all_upstreams if name in selected]
+    if args.outdated:
+        ordered = [r for r in ordered if r.status == "OUTDATED"]
+
     if args.json:
         json.dump([asdict(result) for result in ordered], sys.stdout, indent=2)
         print()
+    elif not ordered and args.outdated:
+        print("all checked sources are current")
     else:
         widths = {
             "name": max([len("SOURCE"), *(len(result.name) for result in ordered)]),

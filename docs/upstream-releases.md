@@ -39,15 +39,23 @@ Useful narrower and machine-readable forms are:
 
 ```sh
 ./scripts/check-updates.py --source openssl --source curl
+./scripts/check-updates.py --outdated
+./scripts/check-updates.py --stats
+./scripts/check-updates.py --verbose
+./scripts/check-updates.py --quiet
 ./scripts/check-updates.py --json
 GITHUB_TOKEN=... ./scripts/check-updates.py --jobs 12
 ```
 
-The token is optional and only raises GitHub API rate limits. Checks run in
-parallel, default to a 20-second timeout per request, ignore GitHub drafts and
-prereleases, and constrain projects such as Perl, GLib and BIND to their stable
-release channels. An `ahead` result means the lock is newer than the
-discoverable upstream feed and deserves review just as much as `OUTDATED`.
+The token is optional and raises GitHub API rate limits (unauthenticated
+requests automatically fall back to public Atom feeds if the rate limit is
+reached). Checks run in parallel with real-time terminal progress, default to a
+20-second timeout per request, ignore drafts and prereleases, track long-term
+kernel releases via `kernel-longterm`, report network request and bandwidth
+telemetry with `--stats`, and constrain projects such as Nginx, Python, ncdu
+(1.x branch), Perl, GLib and BIND to their stable release channels.
+An `ahead` result means the lock is newer than the discoverable upstream feed
+and deserves review just as much as `OUTDATED`.
 
 Some rows say `manual`: those upstreams publish no dependable structured feed,
 or the row is one file in a set already covered by an aggregate check. Their
