@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512"
+     viewBox="0 0 512 512" role="img" aria-labelledby="sowa-title sowa-desc">
+  <title id="sowa-title">Sowa Linux</title>
+  <desc id="sowa-desc">A blue and green owl with amber eyes shelters a small
+    penguin in its breast. Swept feathers and a two-tone circular frame
+    complete the emblem. The background is transparent.</desc>
+  <defs>
+    <linearGradient id="sowa-ring" x1="128" y1="32" x2="366" y2="480"
+                    gradientUnits="userSpaceOnUse">
+      <stop stop-color="#91b957"/>
+      <stop offset="1" stop-color="#288578"/>
+    </linearGradient>
+    <linearGradient id="sowa-leaf" x1="152" y1="116" x2="340" y2="400"
+                    gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8bb54f"/>
+      <stop offset="0.52" stop-color="#559d64"/>
+      <stop offset="1" stop-color="#278575"/>
+    </linearGradient>
+    <linearGradient id="sowa-ocean" x1="162" y1="112" x2="314" y2="412"
+                    gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3488a6"/>
+      <stop offset="1" stop-color="#174b67"/>
+    </linearGradient>
+    <linearGradient id="sowa-breast" x1="200" y1="230" x2="293" y2="400"
+                    gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f7faf7"/>
+      <stop offset="1" stop-color="#b7d6dc"/>
+    </linearGradient>
+    <linearGradient id="sowa-amber" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#f3b544"/>
+      <stop offset="1" stop-color="#e69228"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Paired rings keep the badge open on both light and dark backgrounds. -->
+  <g id="sowa-frame" fill="none">
+    <circle cx="256" cy="256" r="232" stroke="url(#sowa-ring)" stroke-width="8"/>
+    <circle cx="256" cy="256" r="225.5" stroke="#256c88" stroke-width="5"/>
+  </g>
+
+  <g id="sowa-owl">
+    <!-- The crown and body share one continuous silhouette. -->
+    <path fill="url(#sowa-leaf)" d="M136 244V188
+      C136 141 180 104 244 104S352 141 352 188V270
+      C352 346 314 398 249 412C181 412 136 366 136 298Z"/>
+    <path fill="url(#sowa-ocean)" d="M244 104
+      C308 104 352 141 352 188V245
+      C309 238 271 224 244 216Z"/>
+
+    <!-- Broad facial discs leave the eyes readable at small sizes. -->
+    <path fill="#3c9170" d="M150 151
+      C132 177 132 214 150 237C169 260 205 258 226 236
+      L244 216L231 174Z"/>
+    <path fill="#3c9170" d="M338 151
+      C356 177 356 214 338 237C319 260 283 258 262 236
+      L244 216L257 174Z"/>
+    <circle cx="190" cy="198" r="48" fill="#fbfcf7"/>
+    <circle cx="298" cy="198" r="48" fill="#dce9e6"/>
+    <ellipse cx="295" cy="196" rx="44" ry="46" fill="#f6faf7"/>
+    <g fill="url(#sowa-amber)">
+      <circle cx="190" cy="198" r="22"/>
+      <circle cx="298" cy="198" r="22"/>
+    </g>
+    <g fill="#17465e">
+      <circle cx="190" cy="198" r="11.5"/>
+      <circle cx="298" cy="198" r="11.5"/>
+    </g>
+    <g fill="#fff">
+      <circle cx="186" cy="191" r="4.5"/>
+      <circle cx="294" cy="191" r="4.5"/>
+    </g>
+
+    <!-- The ear tufts flow into the brows and meet above the beak. -->
+    <path fill="url(#sowa-ocean)" d="M244 219
+      C235 183 217 169 187 162C151 155 130 144 136 88
+      C145 111 166 120 194 126C230 134 241 161 244 190Z"/>
+    <path fill="#4596b0" d="M136 88
+      C145 111 166 120 194 126C230 134 241 161 244 190
+      C227 154 207 149 180 142C154 135 141 119 136 88Z"/>
+    <path fill="url(#sowa-ocean)" d="M244 219
+      C253 183 271 169 301 162C337 155 358 144 352 88
+      C343 111 322 120 294 126C258 134 247 161 244 190Z"/>
+    <path fill="url(#sowa-leaf)" d="M352 88
+      C343 119 324 129 296 136C267 143 252 163 244 203
+      C247 161 258 134 294 126C322 120 343 111 352 88Z"/>
+
+    <!-- A pale breast provides a quiet field for the nested penguin. -->
+    <path fill="url(#sowa-breast)" d="M244 220
+      C229 246 205 261 192 295C179 334 201 391 244 406
+      C294 394 323 341 302 293C288 262 259 243 244 220Z"/>
+    <path fill="#8db950" d="M244 220
+      C237 230 230 237 230 244C230 254 238 264 244 273Z"/>
+    <path fill="#256b88" d="M244 220
+      C251 230 258 237 258 244C258 254 250 264 244 273Z"/>
+
+    <!-- The short left wing balances the long, enclosing right wing. -->
+    <path fill="#f6faf4" d="M136 244
+      C174 241 201 263 207 297C213 338 178 371 136 376Z"/>
+    <path fill="url(#sowa-leaf)" d="M136 252
+      C171 253 191 275 196 302C202 335 175 365 136 369Z"/>
+    <path fill="url(#sowa-ocean)" d="M136 276
+      C159 279 180 296 181 319C183 344 162 363 136 369Z"/>
+    <path fill="#82b7c5" d="M164 297
+      C176 323 163 342 136 350V340C158 332 168 318 164 297Z"/>
+
+    <g id="sowa-penguin">
+      <path fill="url(#sowa-ocean)" d="M213 318
+        C217 306 211 294 221 282C231 269 253 269 264 282
+        C274 294 269 307 277 322L299 364
+        C287 362 280 351 276 342C283 369 269 391 247 396
+        C224 400 206 384 205 363C204 354 206 347 208 341
+        L189 367C189 349 204 330 213 318Z"/>
+      <path fill="#b6d3dd" d="M222 324
+        C212 343 210 364 222 380C234 397 264 390 273 374
+        C282 357 269 337 259 321Z"/>
+      <path fill="#fff" d="M243 299
+        C243 283 225 283 224 298C223 311 225 315 220 329
+        C215 342 211 353 218 365C224 375 233 380 244 380
+        C255 380 266 374 271 364C277 353 271 340 266 329
+        C260 315 261 310 262 298C263 283 245 283 245 299Z"/>
+      <g fill="#17465e">
+        <ellipse cx="234" cy="299" rx="3.8" ry="4.8"/>
+        <ellipse cx="253" cy="299" rx="3.8" ry="4.8"/>
+      </g>
+      <path fill="url(#sowa-amber)" d="M244 304L256 312L244 322L232 312Z"/>
+      <path fill="url(#sowa-amber)" d="M212 392
+        C221 387 231 391 239 402L227 411H204
+        C204 402 207 396 212 392Z"/>
+      <path fill="url(#sowa-amber)" d="M255 401
+        C263 390 273 390 280 397L286 408H251Z"/>
+    </g>
+
+    <!-- A single sweeping feather wraps the penguin and becomes the tail. -->
+    <path fill="url(#sowa-ocean)" d="M236 412
+      C282 394 310 373 352 374C382 375 402 376 414 366
+      C410 396 392 412 364 412Z"/>
+    <path fill="url(#sowa-leaf)" d="M253 408
+      C291 382 314 374 351 374C382 375 402 376 414 366
+      C403 389 379 393 350 391C308 388 280 400 253 408Z"/>
+    <path fill="#f6faf4" d="M352 239
+      C314 241 305 269 298 305C290 352 271 386 231 412
+      H250C312 389 352 340 352 268Z"/>
+    <path fill="url(#sowa-leaf)" d="M352 247
+      C322 251 317 276 309 314C300 358 280 390 246 410
+      C312 389 352 340 352 268Z"/>
+    <path fill="#83b44f" d="M352 247
+      C328 263 331 294 318 327C305 363 283 391 246 410
+      C280 390 300 358 309 314C317 276 322 251 352 247Z"/>
+  </g>
+</svg>
