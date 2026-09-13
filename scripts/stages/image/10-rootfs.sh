@@ -190,6 +190,23 @@ done
 # site rather than fetching one URL.
 [[ -x "${ROOTFS_DIR}/usr/bin/wget" ]] || die "wget is missing from the target sysroot"
 [[ -f "${ROOTFS_DIR}/etc/wgetrc" ]] || die "the wget configuration is missing"
+for rsync_program in rsync rsync-ssl; do
+    [[ -x "${ROOTFS_DIR}/usr/bin/${rsync_program}" ]] \
+        || die "${rsync_program} is missing from the target sysroot"
+done
+for rsync_page in man1/rsync.1 man1/rsync-ssl.1 man5/rsyncd.conf.5; do
+    [[ -s "${ROOTFS_DIR}/usr/share/man/${rsync_page}" ]] \
+        || die "the ${rsync_page} manual page is missing"
+done
+[[ -f "${ROOTFS_DIR}/usr/share/bash-completion/completions-core/rsync.bash" ]] \
+    || die "the rsync Bash completion is missing"
+[[ -x "${ROOTFS_DIR}/etc/rc.d/init.d/rsyncd" ]] || die "the rsyncd init script is missing"
+[[ -f "${ROOTFS_DIR}/etc/rsyncd.conf" ]] || die "the rsyncd configuration is missing"
+grep -qx 'address = 127.0.0.1' "${ROOTFS_DIR}/etc/rsyncd.conf" \
+    || die "rsyncd must initially listen only on loopback"
+if grep -qE '^[[:space:]]*\[' "${ROOTFS_DIR}/etc/rsyncd.conf"; then
+    die "rsyncd must not export a module by default"
+fi
 # The two VPNs. OpenVPN is a daemon and a directory of tunnel configurations;
 # WireGuard is in the kernel, so all that is here is the pair of programs that
 # configure it. Both directories hold key material and must not be readable by
@@ -417,7 +434,7 @@ grep -q '/usr/bin/m4' "${ROOTFS_DIR}/usr/bin/autom4te" \
 # system, and a stage that quietly stopped installing its program is caught here
 # rather than by whoever types the name on a booted machine.
 for base_command in cat ls cp mv rm mkdir ln date grep sed awk find xargs diff cmp \
-    mount umount kill dmesg lsblk curl wget \
+    mount umount kill dmesg lsblk curl wget rsync \
     nano man strings less file ping hostname \
     locale localedef iconv \
     login passwd \
@@ -885,7 +902,7 @@ grep -qE '^[[:space:]]*swapon -a\b' "${ROOTFS_DIR}/etc/rc.d/rc.sysinit" \
 
 # The services the image starts, and the links that start them. A dangling link
 # is a service that silently does not run.
-for service in sshd crond chronyd network syslog-ng openvpn wg-quick zram growroot; do
+for service in sshd crond chronyd network syslog-ng openvpn wg-quick rsyncd zram growroot; do
     [[ -x "${ROOTFS_DIR}/etc/rc.d/init.d/${service}" ]] \
         || die "the ${service} init script is missing or not executable"
     grep -qE '^# chkconfig: ' "${ROOTFS_DIR}/etc/rc.d/init.d/${service}" \
@@ -900,12 +917,9 @@ grep -qE '^[[:space:]]*"[$][{]program[}]" -D$' \
 if grep -q -- '-D -e' "${ROOTFS_DIR}/etc/rc.d/init.d/sshd"; then
     die "sshd sends authentication records to stderr instead of /var/log/secure"
 fi
-# The two VPN services are installed and switched off. An image ships no
-# tunnels, so starting them at boot would at best be a no-op and at worst would
-# bring up a tunnel nobody asked for; "chkconfig openvpn on" is how a machine
-# says otherwise. They still get a K link on every path to a stopped system, so
-# a tunnel started by hand is taken down before the network goes.
-for service in openvpn wg-quick; do
+# VPN tunnels and the rsync daemon are installed and switched off. They still
+# get K links so a service started by hand stops before the network goes down.
+for service in openvpn wg-quick rsyncd; do
     grep -qE '^# chkconfig: - ' "${ROOTFS_DIR}/etc/rc.d/init.d/${service}" \
         || die "the ${service} service must default to off; its chkconfig header enables it"
     for level in 2 3 4 5; do

@@ -26,6 +26,7 @@ README. Start with [Building Sowa](building.md) for a local build or
 - [Accounts](accounts.md)
 - [Networking](networking.md)
 - [OpenSSH](ssh.md)
+- [File transfers with rsync](rsync.md)
 - [VPNs](vpn.md)
 - [Swap and zram](swap.md)
 - [Landlock sandboxing](sandboxing.md)

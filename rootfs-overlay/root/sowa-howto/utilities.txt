@@ -10,6 +10,24 @@ else.
 Downloads have two programs, and they are both the real ones: curl fetches a
 URL, and GNU wget walks a site with -r, -m and -np.
 
+rsync makes incremental local copies and transfers over SSH:
+
+    rsync -a --dry-run --itemize-changes source/ backup/
+    rsync -a source/ backup/
+    rsync -az source/ user@host:/path/to/backup/
+
+The trailing slash copies the contents of source/ into the destination. Both
+machines need rsync for SSH transfers. Add -H for hard links and -X for extended
+attributes; -a alone includes neither. zlib and Zstandard compression are
+available; ACL preservation (-A), LZ4 and xxHash are not built in.
+
+Local and SSH copies need no daemon. The optional rsyncd service is disabled,
+binds only to 127.0.0.1, and exports no directories. Configure a module in
+/etc/rsyncd.conf before "service rsyncd start"; "chkconfig rsyncd on" enables
+it at boot. Plain rsync:// transfers are unencrypted. rsync-ssl is also shipped
+for connecting to a separately configured TLS endpoint through OpenSSL.
+See man rsync, man rsync-ssl, and man rsyncd.conf.
+
 Storage has the matching administration suites: e2fsprogs, xfsprogs and
 btrfs-progs for filesystems, mdadm/mdmon for Linux software RAID, and LVM2 plus
 dmsetup for logical volumes. See storage.txt for the boot behavior and first

@@ -51,7 +51,7 @@ including:
 - Bash, completion, nano, Vim, less, and mandoc;
 - coreutils, grep, sed, gawk, findutils, diffutils, util-linux, procps-ng,
   shadow, sudo, and common archive tools;
-- OpenSSL, a pinned CA bundle, curl, Wget, Git, GnuPG, Python, and Perl;
+- OpenSSL, a pinned CA bundle, curl, Wget, rsync, Git, GnuPG, Python, and Perl;
 - ext filesystem, FAT, partitioning, and GRUB tools for installation;
 - iproute2, iptables, OpenSSH, WireGuard, OpenVPN, BIND tools, tcpdump, and
   network diagnostics;

@@ -85,6 +85,7 @@ gnupg|2.5.21|gnupg-2.5.21.tar.bz2|https://gnupg.org/ftp/gcrypt/gnupg/gnupg-2.5.2
 git|2.55.0|git-2.55.0.tar.xz|https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz|457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357|git-2.55.0
 git-manpages|2.55.0|git-manpages-2.55.0.tar.xz|https://www.kernel.org/pub/software/scm/git/git-manpages-2.55.0.tar.xz|a32d432f80df46a14a05d1104c72d5a13fe27e9feba9aa0f017e54131db6b982|-
 wget|1.25.0|wget-1.25.0.tar.gz|https://ftp.icm.edu.pl/packages/gnu/wget/wget-1.25.0.tar.gz|766e48423e79359ea31e41db9e5c289675947a7fcf2efdcedb726ac9d0da3784|wget-1.25.0
+rsync|3.5.0|rsync-3.5.0.tar.gz|https://download.samba.org/pub/rsync/src/rsync-3.5.0.tar.gz|c7ffd1ef653e99540f661e47cb00b7f9cad1ee6b972399b16f93d672656e0d33|rsync-3.5.0
 libcap-ng|0.9.3|libcap-ng-0.9.3.tar.gz|https://codeload.github.com/stevegrubb/libcap-ng/tar.gz/refs/tags/v0.9.3|fe11ebbb55904763b3532f19069f13ec319042634620180a03bd4653d301563e|libcap-ng-0.9.3
 openvpn|2.7.6|openvpn-2.7.6.tar.gz|https://build.openvpn.net/downloads/releases/openvpn-2.7.6.tar.gz|10e24a9385f23cc38cc5cf448f3ca0769f939bc4cbecc4f4647d7e006e52db74|openvpn-2.7.6
 wireguard-tools|1.0.20260223|wireguard-tools-1.0.20260223.tar.xz|https://cdimage.debian.org/mirror/slackware.com/slackware-current/source/n/wireguard-tools/wireguard-tools-1.0.20260223.tar.xz|af459827b80bfd31b83b08077f4b5843acb7d18ad9a33a2ef532d3090f291fbf|wireguard-tools-1.0.20260223

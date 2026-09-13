@@ -155,7 +155,7 @@ openssl_package() {
         "${STAMP_DIR}/packages/openssh.done" \
         "${STAMP_DIR}/packages/nginx.done" \
         "${STAMP_DIR}/packages/haproxy.done" "${STAMP_DIR}/packages/git.done" \
-        "${STAMP_DIR}/packages/wget.done" \
+        "${STAMP_DIR}/packages/wget.done" "${STAMP_DIR}/packages/rsync.done" \
         "${STAMP_DIR}/packages/openvpn.done" \
         "${STAMP_DIR}/packages/bind.done" "${STAMP_DIR}/packages/nmap.done" \
         "${STAMP_DIR}/packages/syslog-ng.done"
@@ -185,6 +185,7 @@ zlib_package() {
         "${STAMP_DIR}/packages/haproxy.done" \
         "${STAMP_DIR}/packages/gnupg.done" "${STAMP_DIR}/packages/git.done" \
         "${STAMP_DIR}/packages/wget.done" "${STAMP_DIR}/packages/mandoc.done" \
+        "${STAMP_DIR}/packages/rsync.done" \
         "${STAMP_DIR}/packages/binutils.done" \
         "${STAMP_DIR}/packages/gcc.done" "${STAMP_DIR}/packages/file.done" \
         "${STAMP_DIR}/packages/zstd.done" "${STAMP_DIR}/packages/nmap.done" \
@@ -525,6 +526,14 @@ wget_package() {
     run_rootfs_package_stage packages/wget wget
 }
 
+rsync_package() {
+    bash_package
+    ca_certificates_package
+    openssh_package
+    zstd_package
+    run_rootfs_package_stage packages/rsync rsync
+}
+
 # libcap-ng is in the image because OpenVPN 2.7 will not configure without it -
 # the check is unconditional on Linux - so a rebuilt libcap-ng has to invalidate
 # the package that links it.
@@ -575,6 +584,7 @@ zstd_package() {
     xz_package
     run_rootfs_package_stage packages/zstd zstd \
         "${STAMP_DIR}/packages/file.done" \
+        "${STAMP_DIR}/packages/rsync.done" \
         "${STAMP_DIR}/packages/plocate.done" \
         "${STAMP_DIR}/packages/btrfs-progs.done"
 }
@@ -887,6 +897,7 @@ rootfs() {
     gnupg_package
     git_package
     wget_package
+    rsync_package
     libcap_ng_package
     openvpn_package
     wireguard_package
@@ -1079,6 +1090,7 @@ case "${GOAL}" in
     gnupg) gnupg_package ;;
     git) git_package ;;
     wget) wget_package ;;
+    rsync) rsync_package ;;
     libcap-ng) libcap_ng_package ;;
     openvpn) openvpn_package ;;
     wireguard) wireguard_package ;;
@@ -1123,5 +1135,5 @@ case "${GOAL}" in
     rootfs-tarball) rootfs_tarball ;;
     disk-image) disk_image ;;
     all) image ;;
-    *) die "usage: $0 [toolchain|kernel|init|bash|bash-completion|ncurses|nano|openssl|ca-certificates|vim|htop|zlib|inih|libaio|curl|python|sowa-monitor|custom-installers|util-linux|e2fsprogs|xfsprogs|btrfs-progs (brfs-progs)|mdadm|lvm2|dosfstools|grub|libxcrypt|openssh|cron|iproute2|iptables|nginx|docker|coreutils|grep|sed|gawk|findutils|diffutils|make|perl|chrony|nic|shadow|tar|gzip|bzip2|xz|zstd|zip|unzip|7zip|procps|pciutils|lshw|gnupg|git|wget|libcap-ng|openvpn|wireguard|less|mandoc|binutils|gcc|m4|autoconf|pkgconf|file|inetutils|mtr|whois|libuv|liburcu|libcap|bind|which|plocate|libpcap|tcpdump|nmap|strace|landlock|ncdu|netbase|tzdata|locales|pcre2|glib|json-c|syslog-ng|logrotate|haproxy|guix|rootfs|image|iso|rootfs-tarball|disk-image|all]" ;;
+    *) die "usage: $0 [toolchain|kernel|init|bash|bash-completion|ncurses|nano|openssl|ca-certificates|vim|htop|zlib|inih|libaio|curl|python|sowa-monitor|custom-installers|util-linux|e2fsprogs|xfsprogs|btrfs-progs (brfs-progs)|mdadm|lvm2|dosfstools|grub|libxcrypt|openssh|cron|iproute2|iptables|nginx|docker|coreutils|grep|sed|gawk|findutils|diffutils|make|perl|chrony|nic|shadow|tar|gzip|bzip2|xz|zstd|zip|unzip|7zip|procps|pciutils|lshw|gnupg|git|wget|rsync|libcap-ng|openvpn|wireguard|less|mandoc|binutils|gcc|m4|autoconf|pkgconf|file|inetutils|mtr|whois|libuv|liburcu|libcap|bind|which|plocate|libpcap|tcpdump|nmap|strace|landlock|ncdu|netbase|tzdata|locales|pcre2|glib|json-c|syslog-ng|logrotate|haproxy|guix|rootfs|image|iso|rootfs-tarball|disk-image|all]" ;;
 esac

@@ -1,0 +1,61 @@
+#!/bin/bash
+#
+# chkconfig: - 45 55
+# description: rsync file transfer daemon
+#
+# Local and SSH transfers need no daemon. Enable this service only after
+# configuring modules in /etc/rsyncd.conf; the shipped policy exports nothing.
+
+. /etc/rc.d/init.d/functions
+
+name=rsyncd
+program=/usr/bin/rsync
+pidfile=/run/rsyncd.pid
+logfile=/var/log/rsyncd.log
+
+# rsync is also the client. Never let the rc helpers' process-name fallback
+# mistake a user's transfer for this daemon when its pid file is absent/stale.
+# shellcheck disable=SC2329 # Called by daemon(), killproc() and status().
+pids_running() {
+    return 1
+}
+
+# shellcheck disable=SC2329 # Called by killproc() and status() from functions.
+pidofproc() {
+    local pid=""
+    [[ -r "$1" ]] || return 1
+    read -r pid < "$1" || return 1
+    checkpid "${pid}" && [[ "$(program_of "${pid}")" == "$2" ]] || return 1
+    # A reused pid must not turn a later client process into the daemon either.
+    grep -zqx -- '--daemon' "/proc/${pid}/cmdline" 2>/dev/null || return 1
+    printf '%s\n' "${pid}"
+}
+
+case "${1:-}" in
+    start)
+        begin "Starting ${name}"
+        if pidofproc "${pidfile}" "${program}" > /dev/null; then
+            skipped
+            exit 0
+        fi
+        daemon --name "${name}" --pidfile "${pidfile}" --log "${logfile}" -- \
+            "${program}" --daemon --no-detach --config=/etc/rsyncd.conf
+        result $?
+        ;;
+    stop)
+        begin "Stopping ${name}"
+        killproc --name "${name}" --pidfile "${pidfile}" "${program}"
+        result $?
+        ;;
+    restart)
+        "$0" stop
+        "$0" start
+        ;;
+    status)
+        status --pidfile "${pidfile}" "${program}"
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|status}\n' "$0" >&2
+        exit 2
+        ;;
+esac

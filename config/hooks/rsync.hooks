@@ -1,0 +1,3 @@
+post-upgrade|service-restart|rsyncd
+pre-remove|service-stop|rsyncd
+pre-remove|service-disable|rsyncd

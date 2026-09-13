@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
 .PHONY: help check selftest stage-key fetch check-updates toolchain kernel init bash bash-completion ncurses nano openssl ca-certificates vim htop zlib curl python util-linux e2fsprogs dosfstools grub libxcrypt openssh cron iproute2 iptables sowa-monitor custom-installers nginx docker \
-	coreutils grep sed gawk findutils diffutils make perl chrony nic shadow tar gzip bzip2 xz zstd zip unzip 7zip procps pciutils lshw gnupg git wget libcap-ng openvpn wireguard less mandoc binutils gcc m4 autoconf pkgconf file inetutils mtr whois libuv liburcu libcap bind which plocate libpcap tcpdump nmap strace landlock ncdu netbase tzdata locales pcre2 glib json-c syslog-ng logrotate haproxy guix \
+	coreutils grep sed gawk findutils diffutils make perl chrony nic shadow tar gzip bzip2 xz zstd zip unzip 7zip procps pciutils lshw gnupg git wget rsync libcap-ng openvpn wireguard less mandoc binutils gcc m4 autoconf pkgconf file inetutils mtr whois libuv liburcu libcap bind which plocate libpcap tcpdump nmap strace landlock ncdu netbase tzdata locales pcre2 glib json-c syslog-ng logrotate haproxy guix \
 	rootfs image iso recovery-image rootfs-tarball disk-image installer-bundle docker-image docker-run docker-push \
 	packages repo-key publish-repo release-key release-manifest verify-release \
 	run-qemu run-recovery run-iso run-install run-disk run-disk-uefi run-disk-image run-disk-image-uefi all clean distclean
@@ -240,6 +240,10 @@ git:
 ## make wget        - build GNU Wget, the recursive downloader
 wget:
 	@./scripts/build.sh wget
+
+## make rsync       - build rsync with SSH transfers and zlib/Zstandard compression
+rsync:
+	@./scripts/build.sh rsync
 
 ## make libcap-ng   - build libcap-ng and the pscap, netcap and filecap tools
 libcap-ng:
